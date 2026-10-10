@@ -2305,7 +2305,7 @@ async def parse_chat_messages_async(
     return conversation, mm_data, mm_uuids
 
 
-_KIMI_MODEL_TYPES = ("kimi_k2", "kimi_k25", "kimi_k3")
+_KIMI_MODEL_TYPES = ("kimi_k2", "kimi_k25", "kimi_k3", "kimi_k31")
 
 
 def get_tool_call_id_type(model_config: ModelConfig) -> str:

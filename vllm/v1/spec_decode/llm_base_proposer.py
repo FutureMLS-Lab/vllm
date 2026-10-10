@@ -1010,6 +1010,7 @@ class SpecDecodeBaseProposer:
                     "DeepseekV32MTPModel",
                     "Glm5NextMTPModel",
                     "KimiK3MTPModel",
+                    "KimiK3FlashMTPModel",
                 }.intersection(architectures)
             )
         return self.method not in ("mtp", "draft_model", "dflash")
@@ -1377,6 +1378,8 @@ class SpecDecodeBaseProposer:
             elif self.get_model_name(target_model) in (
                 "KimiK25ForConditionalGeneration",
                 "KimiK3ForConditionalGeneration",
+                "KimiK3FlashForConditionalGeneration",
+                "KimiK31ForConditionalGeneration",
             ):
                 self.model.config.image_token_index = (
                     target_model.config.media_placeholder_token_id

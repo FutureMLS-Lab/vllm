@@ -39,6 +39,7 @@ from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 from ..common.mtp import fused_mtp_input
 from .low_latency_gemm import enable_kimi_k3_low_latency_gemm
 from .model import (
+    _DSA_RENAME_PARAMS_MAPPING,
     KimiDecoderLayer,
     KimiMoE,
     get_spec_layer_idx_from_weight_name,
@@ -283,6 +284,13 @@ class KimiK3MTP(nn.Module):
                     (".fused_qkv_a_proj", ".q_a_proj", 0),
                     (".fused_qkv_a_proj", ".kv_a_proj_with_mqa", 1),
                 ]
+            if self.config.dsa_config is not None and self.config.mla_use_output_gate:
+                # DSA layers have no fused_qkv_a_g_proj param; fall back to
+                # the plain fused_qkv_a_proj mapping.
+                stacked_params_mapping += [
+                    (".fused_qkv_a_proj", ".q_a_proj", 0),
+                    (".fused_qkv_a_proj", ".kv_a_proj_with_mqa", 1),
+                ]
 
         use_mega_moe = any(
             module.use_mega_moe
@@ -374,6 +382,13 @@ class KimiK3MTP(nn.Module):
                     name = name_mapped
                     break
                 else:
+                    # Rename draft indexer checkpoint names before the param
+                    # lookup below (same mapping as the main model).
+                    if self.config.dsa_config is not None:
+                        for param_name, weight_name in _DSA_RENAME_PARAMS_MAPPING:
+                            if weight_name in name:
+                                name = name.replace(weight_name, param_name)
+                                break
                     if name.endswith(".bias") and name not in params_dict:
                         continue
                     remapped_name = maybe_remap_kv_scale_name(name, params_dict)

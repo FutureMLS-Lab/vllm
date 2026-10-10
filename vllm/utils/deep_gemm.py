@@ -684,6 +684,17 @@ def get_paged_mqa_logits_metadata(
         return _missing()
     next_n = context_lens.shape[1] if context_lens.dim() == 2 else 1
     num_slots = _paged_mqa_logits_schedule_slots(num_sms, next_n)
+    capturing = context_lens.is_cuda and torch.cuda.is_current_stream_capturing()
+    if not capturing and not bool(context_lens.any()):
+        # DeepGEMM's SM90 metadata kernel binary-searches a shared-memory
+        # prefix sum of ceil(context_len / block_size); when every context
+        # length is zero (profile dummy runs, or a DCP rank that owns no KV
+        # for the whole batch) the search converges to batch_size and reads
+        # one past the prefix-sum allocation. All-zero metadata gives every
+        # SM an empty work range, the correct semantics for an empty batch.
+        return torch.zeros(
+            (num_slots + 1, 2), dtype=torch.int32, device=context_lens.device
+        )
     kwargs = {} if indices is None else {"indices": indices}
     return _get_paged_mqa_logits_metadata_impl(
         context_lens, block_size, num_slots, **kwargs

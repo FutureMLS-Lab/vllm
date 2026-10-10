@@ -80,6 +80,23 @@ def _assert_cutedsl_dcp_merge_supported(
         )
 
 
+def _assert_topk_valid_counts(
+    topk_indices: torch.Tensor,
+    avail_lens: torch.Tensor,
+    topk_tokens: int,
+) -> None:
+    """DSA indexer sanity (VLLM_DSA_INDEXER_ASSERTS): every query row must
+    hold exactly min(avail, topk) valid (>=0) indices -- an all -1 row means
+    the indexer silently produced nothing, and a short row means a DCP merge
+    or gather dropped candidates (both invisible from outputs). Device-side
+    check without host sync; skipped during CUDA graph capture."""
+    if torch.cuda.is_current_stream_capturing():
+        return
+    valid = (topk_indices >= 0).sum(dim=-1, dtype=torch.int32)
+    expected = avail_lens.reshape(-1).to(torch.int32).clamp(max=topk_tokens)
+    torch._assert_async((valid == expected).all())
+
+
 def _merge_dcp_topk_global(
     logits: torch.Tensor,
     topk_indices: torch.Tensor,
@@ -639,6 +656,10 @@ def sparse_attn_indexer(
                     cp_kv_cache_interleave_size,
                     row_starts=chunk.cu_seqlen_ks,
                 )
+                if envs.VLLM_DSA_INDEXER_ASSERTS:
+                    _assert_topk_valid_counts(
+                        topk_indices, cu_seqlen_ke - cu_seqlen_ks, topk_tokens
+                    )
 
     if has_decode:
         decode_metadata = attn_metadata_narrowed.decode
@@ -779,6 +800,10 @@ def sparse_attn_indexer(
             attn_metadata_narrowed.max_seq_len,
         )
 
+        if envs.VLLM_DSA_INDEXER_ASSERTS:
+            # Per-rank local top-k counts before the DCP merge.
+            _assert_topk_valid_counts(topk_indices, seq_lens, topk_tokens)
+
         if decode_metadata.global_seq_lens is not None:
             _merge_dcp_topk_global(
                 logits,
@@ -788,6 +813,12 @@ def sparse_attn_indexer(
                 dcp_world_size,
                 cp_kv_cache_interleave_size,
             )
+            if envs.VLLM_DSA_INDEXER_ASSERTS:
+                # Per-query global counts after the merge; only checked when
+                # the expanded per-row lens line up with the index rows.
+                global_lens = decode_metadata.global_seq_lens.reshape(-1)
+                if global_lens.numel() == topk_indices.shape[0]:
+                    _assert_topk_valid_counts(topk_indices, global_lens, topk_tokens)
 
         if needs_padded_path:
             # if padded, we need to unpack

@@ -179,6 +179,22 @@ class SparseMLACommonMetadataBuilder(AttentionMetadataBuilder[T]):
         self.model_config = vllm_config.model_config
         self.mla_dims = get_mla_dims(self.model_config)
         self.topk_tokens: int = vllm_config.model_config.hf_text_config.index_topk
+        # A dense MTP draft layer substitutes a fake indexer that fills
+        # full-range candidates (width = max_model_len, not index_topk).
+        # Read topk_tokens from the layer's indexer so the group's scheduler
+        # metadata matches the actual indices width; real indexers report
+        # the same value as the config.
+        static_ctx = getattr(
+            vllm_config.compilation_config, "static_forward_context", None
+        )
+        if static_ctx:
+            for name in layer_names:
+                module = static_ctx.get(name)
+                layer_topk = getattr(
+                    getattr(module, "indexer", None), "topk_tokens", None
+                )
+                if layer_topk is not None and layer_topk > self.topk_tokens:
+                    self.topk_tokens = layer_topk
         self.req_id_per_token_buffer = torch.empty(
             (vllm_config.scheduler_config.max_num_batched_tokens,),
             dtype=torch.int32,

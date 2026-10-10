@@ -18,9 +18,11 @@ from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.v1.attention.backend import (
+    AttentionBackend,
     AttentionCGSupport,
     CommonAttentionMetadata,
 )
+from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerBackend
 from vllm.v1.attention.backends.utils import create_fast_prefill_custom_backend
 from vllm.v1.hisparse.binding import (
     init_hisparse_kv_cache,
@@ -31,6 +33,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheSpec,
     MambaSpec,
+    MergedMLAIndexerSpec,
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.worker.gpu.model_states.interface import ModelSpecificAttnMetadata
@@ -137,6 +140,12 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
     for layer_name, attn_module in attn_layers.items():
         if getattr(attn_module, "kv_sharing_target_layer_name", None):
             # This layer will use KV cache of the sharing target layer.
+            continue
+        if getattr(attn_module, "merged_into_mla_cache", False):
+            # Merged DSA cache mode (MergedMLAIndexerSpec): the indexer's bytes
+            # ride in the parent MLA layer's merged spec; the indexer itself
+            # registers no spec here (its metadata-only AttentionGroup is
+            # added separately in init_attn_backend).
             continue
         # Skip modules that don't need KV cache (eg encoder-only attention)
         if spec := attn_module.get_kv_cache_spec(vllm_config):
@@ -254,6 +263,32 @@ def init_attn_backend(
                 group_order.append(key)
             else:
                 group_map[key].layer_names.append(layer_name)
+
+        # Merged DSA cache mode (MergedMLAIndexerSpec): the indexer modules
+        # registered no spec (their bytes ride in the MLA layer's merged
+        # cache), so Phase 1 never sees them -- but their forward still
+        # needs a metadata builder. Append a metadata-only indexer
+        # AttentionGroup to the merged MLA group.
+        if isinstance(kv_cache_group_spec.kv_cache_spec, MergedMLAIndexerSpec):
+            indexer_names = [
+                attn_layers[name].ds_indexer_layer_name
+                for name in layer_names
+                if getattr(attn_layers[name], "ds_indexer_layer_name", None)
+            ]
+            if indexer_names:
+                backend = cast(type[AttentionBackend], DeepseekV32IndexerBackend)
+                key = (
+                    backend.full_cls_name(),
+                    kv_cache_group_spec.kv_cache_spec,
+                    0,
+                )
+                group_map[key] = AttentionGroup(
+                    backend,
+                    indexer_names,
+                    kv_cache_group_spec.kv_cache_spec,
+                    kv_cache_group_id,
+                )
+                group_order.append(key)
 
         attn_groups.append([group_map[key] for key in group_order])
 

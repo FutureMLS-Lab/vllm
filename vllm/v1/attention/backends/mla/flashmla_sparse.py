@@ -363,6 +363,13 @@ class FlashMLASparseMetadataBuilder(
         self.use_fp8_kv_cache = (
             cache_config.cache_dtype in QUANTIZED_DS_MLA_CACHE_FORMATS
         )
+        # Merged MergedMLAIndexerSpec cache mode (Kimi-K3.1): config-driven -- KDA
+        # hybrid models with DSA merge the indexer cache into the MLA cache.
+        hf_text_config = getattr(self.model_config, "hf_text_config", None)
+        self.use_merged_cache = (
+            getattr(hf_text_config, "dsa_config", None) is not None
+            and getattr(hf_text_config, "linear_attn_config", None) is not None
+        )
         max_num_seqs = vllm_config.scheduler_config.max_num_seqs
         # Shape: [max_num_seqs], all elements = topk_tokens (constant for full-CG)
         self.topk_tokens_tensor = torch.full(

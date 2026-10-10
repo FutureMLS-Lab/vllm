@@ -35,6 +35,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheLayout,
     KVCacheSpec,
     MambaSpec,
+    MergedMLAIndexerSpec,
     MLAAttentionSpec,
     UniformTypeKVCacheSpecs,
     create_kv_cache_views,
@@ -162,6 +163,11 @@ class KVBlockZeroer:
             assert spec.block_size % kernel_bs == 0
             for layer_name in group.layer_names:
                 if layer_name in runner_only_attn_layers:
+                    continue
+                if layer_name not in static_forward_context:
+                    # Dense MTP draft's indexer facade: registered in the
+                    # merged group's metadata-only indexer AttentionGroup
+                    # but not a real module -- nothing to zero.
                     continue
                 kv = static_forward_context[layer_name].kv_cache
                 if not isinstance(kv, torch.Tensor):
@@ -650,6 +656,73 @@ def add_kv_sharing_layers_to_kv_cache_groups(
             runner_only_attn_layers.add(layer_name)
 
 
+def _split_merged_dsa_cache_views(
+    kv_caches: dict[str, torch.Tensor],
+    forward_context: dict[str, Attention],
+    kv_cache_groups: Sequence[KVCacheGroupSpec] | None,
+) -> None:
+    """Bind each merged (MergedMLAIndexerSpec) layer's MLA/indexer section views.
+
+    The indexer module registered no spec of its own, so its section view is
+    created here; both views are plain dense-row views at the (padded) unit
+    stride.
+    """
+    if kv_cache_groups is None:
+        return
+    for group in kv_cache_groups:
+        spec = group.kv_cache_spec
+        if not isinstance(spec, MergedMLAIndexerSpec):
+            continue
+        mla_bytes = spec.mla_bytes_per_token
+        index_head_size = spec.index_head_size
+        unit_tokens = spec.kernel_block_size
+        for layer_name in group.layer_names:
+            if layer_name not in kv_caches:
+                continue  # PP: this layer lives on another stage
+            module = forward_context.get(layer_name)
+            indexer_name = getattr(module, "ds_indexer_layer_name", None)
+            assert indexer_name is not None, (
+                f"merged-cache MLA layer {layer_name} is missing ds_indexer_layer_name"
+            )
+            raw = kv_caches[layer_name]
+            num_units = raw.shape[0]
+            unit_stride = raw.stride(0)
+            expected_unit = spec.padded_unit_bytes or unit_tokens * (
+                mla_bytes + index_head_size
+            )
+            assert unit_stride == expected_unit, (
+                f"merged cache unit stride {unit_stride} != spec "
+                f"{expected_unit} for {layer_name}"
+            )
+            assert raw.shape[-1] == mla_bytes + index_head_size, (
+                f"merged cache width {raw.shape[-1]} != spec "
+                f"{mla_bytes + index_head_size} for {layer_name}"
+            )
+            mla_view = torch.as_strided(
+                raw,
+                size=(num_units, 1, unit_tokens, mla_bytes),
+                stride=(unit_stride, mla_bytes, mla_bytes, 1),
+            )
+            if spec.cache_dtype_str == "fp8_ds_mla":
+                mla_view = mla_view.view(current_platform.fp8_dtype())
+            kv_caches[layer_name] = mla_view
+            if indexer_name not in forward_context:
+                # Dense MTP draft (DenseDraftMergedMLAIndexerSpec): its
+                # indexer facade is not a registered layer, so nothing
+                # consumes the indexer section; skip creating its view
+                # (bind below would KeyError on the unregistered name).
+                continue
+            # Indexer envelope: [data | scale] section split is derived by
+            # the kernels from the shape; the row stride is bookkeeping
+            # (same contract as kv_cache_as_quant_view).
+            kv_caches[indexer_name] = torch.as_strided(
+                raw,
+                size=(num_units, 1, unit_tokens, index_head_size),
+                stride=(unit_stride, index_head_size, index_head_size, 1),
+                storage_offset=raw.storage_offset() + unit_tokens * mla_bytes,
+            )
+
+
 def bind_kv_cache(
     kv_caches: dict[str, torch.Tensor],
     forward_context: dict[str, Attention],
@@ -678,6 +751,10 @@ def bind_kv_cache(
     """
     # Bind kv_caches to ModelRunner
     assert len(runner_kv_caches) == 0
+
+    # Merged DSA cache mode (MergedMLAIndexerSpec): split each merged layer's
+    # cache into the MLA/indexer section views before binding.
+    _split_merged_dsa_cache_views(kv_caches, forward_context, kv_cache_groups)
 
     # Convert kv_caches dict to a list of tensors in the order of layer_index.
     index2name = defaultdict(list)

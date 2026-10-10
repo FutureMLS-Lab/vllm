@@ -141,6 +141,7 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         use_rope: bool = False,
         non_causal_multi_token_decode: bool = False,
         run_gemm_rs_ar: bool = False,
+        attn_backend: type[AttentionBackend] | None = None,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -317,14 +318,20 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
             self.kv_cache_dtype = "auto"
 
         dtype = torch.get_default_dtype()
-        self.attn_backend = get_attn_backend(
-            self.head_size,
-            dtype,
-            self.kv_cache_dtype,
-            use_mla=True,
-            use_sparse=False,
-            num_heads=self.num_local_heads,
-        )
+        if attn_backend is not None:
+            assert attn_backend.is_mla(), (
+                f"attn_backend must be an MLA backend, got {attn_backend.get_name()}"
+            )
+            self.attn_backend = attn_backend
+        else:
+            self.attn_backend = get_attn_backend(
+                self.head_size,
+                dtype,
+                self.kv_cache_dtype,
+                use_mla=True,
+                use_sparse=False,
+                num_heads=self.num_local_heads,
+            )
         _init_kv_cache_quant(self, quant_config, prefix)
         # Unit (1.0) scale for the fused fp8 prefill path: q/k/v are cast
         # unscaled to match forward_mha (the prefill flash path does not

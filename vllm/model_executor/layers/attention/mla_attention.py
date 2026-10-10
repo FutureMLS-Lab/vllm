@@ -301,6 +301,7 @@ from vllm.v1.attention.ops.pcp import (
 )
 from vllm.v1.attention.selector import get_attn_backend
 from vllm.v1.kv_cache_interface import (
+    DS_MLA_STATE_CONTENT_BYTES,
     AttentionSpec,
     KVCacheSpec,
     KVQuantMode,
@@ -598,6 +599,21 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             if isinstance(index_group, HiSparseMLAIndexGroup)
             else None
         )
+        # Sparse (DSA) layers must be served by a sparse attention impl;
+        # a dense impl silently ignores top-k indices and runs full attention,
+        # which is not externally detectable. Fail loudly instead.
+        if use_sparse and not self.impl.is_sparse:
+            raise RuntimeError(
+                f"{prefix}: sparse (DSA) attention layer requires a sparse "
+                f"attention backend, but got {self.attn_backend.get_name()}. "
+                "Serving with it would silently run full attention."
+            )
+        if use_sparse:
+            logger.info_once(
+                "Sparse (DSA) attention active: backend=%s, impl=%s",
+                self.attn_backend.get_name(),
+                type(self.impl).__name__,
+            )
         self.q_pad_num_heads = getattr(self.impl, "q_pad_num_heads", None)
         self.is_amx_bmm_enabled = getattr(self.impl, "uses_amx_bmm", False)
         # AMX reads kv_b_proj's weight directly and never calls it live; the
@@ -743,10 +759,18 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             )
 
             row_width = self.kv_cache.shape[-1]
-            assert self.kv_cache.stride(0) % row_width == 0
+            if self.kv_cache.stride(0) % row_width == 0:
+                block_stride_rows = self.kv_cache.stride(0) // row_width
+            else:
+                # Merged DSA cache (MergedMLAIndexerSpec): the block stride spans
+                # the indexer sections, so it is not a whole number of MLA
+                # rows. The fp8 index-conversion path never passes
+                # BLOCK_STRIDE_ROWS, so the kernel addresses the cache in
+                # logical per-block token slots -- warm it up with that.
+                block_stride_rows = self.kv_cache.shape[1]
             _CONVERT_REQ_INDEX_TO_GLOBAL_INDEX_KERNEL.register_warmup(
                 self._vllm_config,
-                block_stride_rows=self.kv_cache.stride(0) // row_width,
+                block_stride_rows=block_stride_rows,
             )
 
     def _uses_flat_kv_cache(self) -> bool:
@@ -1362,14 +1386,67 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             # ds_mla layouts pack NoPE + RoPE + scales into one opaque per-token
             # blob, so the size is not derivable from head_size.
             # See flashmla_sparse.py.
-            state_content_bytes={"fp8_ds_mla": 656, "nvfp4_ds_mla": 352}.get(
-                self.kv_cache_dtype
-            ),
+            state_content_bytes=DS_MLA_STATE_CONTENT_BYTES.get(self.kv_cache_dtype),
         )
+        if getattr(self, "ds_index_head_size", 0):
+            # Merged DSA cache mode (MergedMLAIndexerSpec): the DSA indexer's
+            # per-token bytes ride in this layer's merged spec instead of a
+            # separately registered indexer cache. The markers
+            # (ds_index_head_size/dim, ds_indexer_layer_name) are set by the
+            # host attention module when merged mode is active.
+            from vllm.v1.kv_cache_interface import (
+                DenseDraftMergedMLAIndexerSpec,
+                MergedMLAIndexerSpec,
+            )
+
+            # The merged per-unit layout (MLA section + indexer section +
+            # TMA tail pad) is only understood by the FlashMLA sparse kernels;
+            # any other backend addresses the cache as dense MLA pages and
+            # would silently read wrong offsets. Fail at startup instead.
+            backend_name = self.attn_backend.get_name()
+            if backend_name != "FLASHMLA_SPARSE":
+                raise RuntimeError(
+                    f"{self.layer_name}: the MergedMLAIndexerSpec merged KV cache "
+                    f"requires the FLASHMLA_SPARSE attention backend, got "
+                    f"{backend_name}. Other backends address the cache as "
+                    "dense MLA pages and would silently read wrong addresses. "
+                    "Serve with VLLM_ATTENTION_BACKEND=FLASHMLA_SPARSE."
+                )
+            spec_cls: type[MergedMLAIndexerSpec] = MergedMLAIndexerSpec
+            if getattr(getattr(self, "indexer", None), "dense_draft", False):
+                # Dense MTP draft: marker subclass so the draft forms its own
+                # attention group (same merged layout; the marker subclass
+                # prevents merging into the target's group).
+                spec_cls = DenseDraftMergedMLAIndexerSpec
+            return spec_cls.from_mla_and_indexer(
+                block_size=vllm_config.cache_config.block_size,
+                mla_head_size=self.head_size,
+                mla_dtype=kv_cache_dtype,
+                cache_dtype_str=self.kv_cache_dtype,
+                index_head_size=self.ds_index_head_size,
+                index_head_dim=self.ds_index_head_dim,
+                # The sparse-attention kernels (FlashMLA sparse decode,
+                # DeepGEMM paged logits) address the cache in 64-token
+                # blocks, so the merged unit is built per 64 tokens.
+                kernel_block_size=64,
+            )
         if self.sliding_window is not None:
             return SlidingWindowMLASpec(
                 **common_kwargs,
                 sliding_window=self.sliding_window,
+            )
+        if getattr(getattr(self, "indexer", None), "dense_draft", False):
+            # Dense MTP draft on a DSA target: marker subclass so the draft
+            # forms its own attention group instead of sharing one with the
+            # target's sparse layers. The group's per-step sched_meta
+            # requires a consistent topk across calls; the draft's
+            # full-range candidates (max_model_len wide) are incompatible
+            # with the target's index_topk on a shared instance.
+            from vllm.v1.kv_cache_interface import DenseDraftMLASpec
+
+            return DenseDraftMLASpec(
+                **common_kwargs,
+                non_causal_multi_token_decode=self.non_causal_multi_token_decode,
             )
         spec = MLAAttentionSpec(
             **common_kwargs,
