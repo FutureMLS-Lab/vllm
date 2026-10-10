@@ -40,6 +40,7 @@ from vllm.v1.worker.gpu.model_states.interface import ModelSpecificAttnMetadata
 from vllm.v1.worker.ubatch_utils import get_num_ubatches
 from vllm.v1.worker.utils import (
     AttentionGroup,
+    _split_merged_dsa_cache_views,
     add_kv_sharing_layers_to_kv_cache_groups,
     allocate_kv_cache,
     bind_kv_cache_to_layers,
@@ -447,6 +448,11 @@ def init_kv_cache(
     bindable_caches = {
         name: cache for name, cache in kv_caches.items() if name in forward_context
     }
+    # Merged DSA cache mode (MergedMLAIndexerSpec): split each merged layer's
+    # cache into the MLA/indexer section views before binding.
+    _split_merged_dsa_cache_views(
+        bindable_caches, forward_context, kv_cache_config.kv_cache_groups
+    )
     bind_kv_cache_to_layers(
         bindable_caches,
         forward_context,

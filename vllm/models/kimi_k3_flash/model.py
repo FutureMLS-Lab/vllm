@@ -903,6 +903,7 @@ class KimiK3FlashDSAIndexer(nn.Module):
             self.topk_indices_buffer,
             False,  # skip_k_cache_insert
             self.use_pcp,
+            self._parallel_config.pcp_shard_decode_requests,
             _encode_layer_name(""),  # dense_mha_metadata_layer_name
             False,  # use_fp4_cache
             self.dcp_rank,
