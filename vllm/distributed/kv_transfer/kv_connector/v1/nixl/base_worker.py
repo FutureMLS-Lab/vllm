@@ -1696,7 +1696,16 @@ class NixlBaseConnectorWorker:
                     ]
                 else:
                     segment_bytes = num_blocks * block_stride
-                    if cache.nbytes % segment_bytes != 0:
+                    # Measure the view by its block stride, not cache.nbytes: a
+                    # block can be padded past its payload (e.g. DSA latent +
+                    # indexer rows inside a hybrid page), and nbytes drops that
+                    # padding, so it is never a multiple of the segment size.
+                    view_bytes = (
+                        cache.shape[0] * block_stride
+                        if cache.ndim > 1
+                        else cache.nbytes
+                    )
+                    if view_bytes % segment_bytes != 0:
                         raise AssertionError(
                             "KV cache view cannot be partitioned into NIXL regions: "
                             f"layer={layer_name}, cache_nbytes={cache.nbytes}, "
@@ -1705,7 +1714,7 @@ class NixlBaseConnectorWorker:
                             f"cache_shape={tuple(cache.shape)}, "
                             f"cache_stride={tuple(cache.stride())}"
                         )
-                    num_segments = cache.nbytes // segment_bytes
+                    num_segments = view_bytes // segment_bytes
                     region_block_len = (
                         block_stride if num_segments > 1 else physical_page_size
                     )
