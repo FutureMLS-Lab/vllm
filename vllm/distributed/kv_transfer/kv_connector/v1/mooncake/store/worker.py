@@ -56,6 +56,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (  
     StoreShardId,
     TailKeyBoundary,
     TPShardedStoreLayout,
+    group_compact_kernel_blocks,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.protocol import (  # noqa: E501
     LOOKUP_MSG,
@@ -85,7 +86,6 @@ from vllm.v1.kv_cache_interface import (
     MLAAttentionSpec,
     SlidingWindowMLASpec,
     UniformTypeKVCacheSpecs,
-    group_kernel_blocks,
 )
 from vllm.v1.kv_cache_layout import KVCacheLayout
 
@@ -1501,6 +1501,14 @@ class MooncakeStoreWorker:
         self.block_size, self.hash_block_size = resolve_kv_cache_block_sizes(
             kv_cache_config, vllm_config
         )
+        # Request.block_hashes use the engine core's hash unit, which it
+        # resolved from its own config and passes down here. Re-resolving from
+        # the worker's config can disagree: platform hooks that run only in
+        # worker processes may set prefix_match_unit (Kimi K3.1 sets 64 while
+        # the core hashes per 1088-token block), and every key and chunk
+        # boundary would then index the wrong hash.
+        if kv_cache_config.hash_block_size is not None:
+            self.hash_block_size = kv_cache_config.hash_block_size
         self.num_layers = model_config.get_num_layers(parallel_config)
 
         self.num_kv_head = model_config.get_total_num_kv_heads()
@@ -1873,7 +1881,7 @@ class MooncakeStoreWorker:
             }
             seen_storage_ptrs: set[int] = set()
             cache_tensors = [
-                group_kernel_blocks(_repr_tensor(cache), self.num_blocks)
+                _repr_tensor(cache)
                 for layer_name, cache in kv_caches.items()
                 if layer_name in store_layer_names
             ]
@@ -1926,7 +1934,7 @@ class MooncakeStoreWorker:
                     assert num_blocks is not None
                 else:
                     num_blocks = self._kv_cache_config.num_blocks
-                cache = group_kernel_blocks(cache, num_blocks)
+                cache, block_compact = group_compact_kernel_blocks(cache, num_blocks)
                 cache_storage = cache.untyped_storage()
                 if is_host_resident:
                     base_addr = cache.data_ptr()
@@ -1957,7 +1965,7 @@ class MooncakeStoreWorker:
                     )
 
                 regions: list[tuple[int, int]] = []
-                if not is_non_overlapping_and_dense(cache[0]):
+                if not block_compact:
                     for head_idx in range(cache.shape[1]):
                         head_cache = cache[:, head_idx]
                         assert is_non_overlapping_and_dense(head_cache[0])

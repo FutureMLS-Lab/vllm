@@ -23,8 +23,25 @@ from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     BlockHashListWithBlockSize,
 )
+from vllm.v1.kv_cache_interface import group_kernel_blocks
 
 logger = init_logger(__name__)
+
+
+def group_compact_kernel_blocks(
+    cache: torch.Tensor, num_blocks: int
+) -> tuple[torch.Tensor, bool]:
+    """Group a layer cache to ``num_blocks`` manager blocks and report whether
+    each manager block is one gapless byte run (moves as one region).
+
+    Decided on the kernel-block view, before grouping: a manager block is a run
+    of consecutive kernel blocks, so it is compact whenever each kernel block
+    is. The grouped ``cache[0]`` alone cannot tell: a merged DSA cache (Kimi
+    K3.1) pads every 64-token kernel block, which makes it non-dense although
+    no other block's data sits in the gaps.
+    """
+    compact = is_non_overlapping_and_dense(cache[0])
+    return group_kernel_blocks(cache, num_blocks), compact
 
 
 class BlobBlockHashes(Sequence[BlockHash]):
@@ -274,10 +291,11 @@ class RankLocalStoreLayout(StoreLayout):
         base_addrs: list[int] = []
         block_lens: list[int] = []
         for cache in kv_caches:
+            cache, block_compact = group_compact_kernel_blocks(cache, num_blocks)
             storage = cache.untyped_storage()
             storage_addr = storage.data_ptr()
             storage_len = storage.nbytes()
-            if not is_non_overlapping_and_dense(cache[0]):
+            if not block_compact:
                 for head_idx in range(cache.shape[1]):
                     head_cache = cache[:, head_idx]
                     assert is_non_overlapping_and_dense(head_cache[0])
