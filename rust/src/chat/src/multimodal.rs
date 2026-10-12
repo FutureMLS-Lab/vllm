@@ -108,6 +108,14 @@ impl MmLimitSpec {
     }
 }
 
+/// `(model_type, target model_type)` pairs for checkpoints that reuse another
+/// family's `llm-multimodal` spec unchanged. Drop an entry once `llm-multimodal`
+/// matches its model type itself.
+const SPEC_MODEL_TYPE_ALIASES: &[(&str, &str)] = &[
+    // Kimi K3.1 ships K3's vision tower and preprocessing unchanged.
+    ("kimi_k31", "kimi_k3"),
+];
+
 /// Model metadata and tokenizer access shared by all multimodal specs.
 #[derive(Clone)]
 struct MultimodalModelContext {
@@ -131,9 +139,26 @@ impl MultimodalModelContext {
     }
 
     /// Resolve a static model processor spec for one loaded model.
+    ///
+    /// Model types in [`SPEC_MODEL_TYPE_ALIASES`] look up their target's spec;
+    /// the spec itself still sees this model's own metadata.
     fn resolve_model_spec(&self) -> Option<&'static dyn ModelProcessorSpec> {
         static REGISTRY: LazyLock<ModelRegistry> = LazyLock::new(ModelRegistry::new);
-        REGISTRY.lookup(&self.metadata())
+        let metadata = self.metadata();
+        let target = metadata.config_model_type().and_then(|model_type| {
+            SPEC_MODEL_TYPE_ALIASES
+                .iter()
+                .find_map(|&(alias, target)| (alias == model_type).then_some(target))
+        });
+        let Some(target) = target else {
+            return REGISTRY.lookup(&metadata);
+        };
+        let mut config = self.config.clone();
+        config["model_type"] = target.into();
+        REGISTRY.lookup(&ModelMetadata {
+            config: &config,
+            ..metadata
+        })
     }
 
     /// Build a vision preprocessor for one loaded model and modality.
@@ -1215,6 +1240,25 @@ mod tests {
             .with_regular_token("<｜deepseek_image｜>", DEEPSEEK_V41_IMAGE_ID)
             .with_regular_token("<|place_holder_mm_span_0436|>", DEEPSEEK_V41_IMAGE_PAD_ID);
         test_info("deepseek_v41", config, tokenizer)
+    }
+
+    #[test]
+    fn kimi_k31_resolves_kimi_k3_image_support_by_model_type() {
+        const KIMI_MEDIA_PAD_ID: u32 = 163605;
+        let config = serde_json::json!({
+            "model_type": "kimi_k31",
+            "media_placeholder_token_id": KIMI_MEDIA_PAD_ID,
+        });
+        let tokenizer = TestTokenizer::new().with_regular_token("<|media_pad|>", KIMI_MEDIA_PAD_ID);
+        // The test model ID (`kimi_k31-test`) does not contain `kimi-k3`, so
+        // only the model type can select the K3 spec.
+        let info = test_info("kimi_k31", config, tokenizer);
+
+        assert_eq!(
+            info.placeholder_token(Modality::Image),
+            Some("<|media_pad|>")
+        );
+        assert_eq!(info.placeholder_token(Modality::Video), None);
     }
 
     #[test]
