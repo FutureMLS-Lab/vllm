@@ -109,6 +109,10 @@ HANDSHAKE_TIMEOUT_MINS = 5
 _R = TypeVar("_R")  # Return type for collective_rpc
 
 
+def _get_prefix_match_unit(worker) -> int | None:
+    return worker.vllm_config.cache_config.prefix_match_unit
+
+
 class EngineCore:
     """Inner loop of vLLM's Engine."""
 
@@ -352,6 +356,15 @@ class EngineCore:
             update_kv_cache_capacity(vllm_config, scheduler_kv_cache_config)
 
         vllm_config.validate_block_size()
+
+        if vllm_config.cache_config.prefix_match_unit is None:
+            # Platform.update_block_size_for_backend() runs in the workers and
+            # may set prefix_match_unit (Kimi K3.1's merged DSA cache sets 64).
+            # Under a multi-process executor that only reaches the workers'
+            # config; adopt it so the scheduler hashes at the same unit.
+            units = set(self.collective_rpc(_get_prefix_match_unit))
+            assert len(units) == 1, f"workers disagree on prefix_match_unit: {units}"
+            vllm_config.cache_config.prefix_match_unit = units.pop()
 
         scheduler_block_size, hash_block_size = resolve_kv_cache_block_sizes(
             scheduler_kv_cache_config, vllm_config
