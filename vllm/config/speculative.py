@@ -56,7 +56,6 @@ MTPModelTypes = Literal[
     "bailing_hybrid_mtp",
     "mtp",
     "kimi_k3_mtp",
-    "kimi_k3_flash_mtp",
     "pangu_ultra_moe_mtp",
     "step3p5_mtp",
     "hy_v3_mtp",
@@ -721,16 +720,6 @@ class SpeculativeConfig:
             hf_config.model_type = "kimi_k3_mtp"
             hf_config.update(
                 {"n_predict": n_predict, "architectures": ["KimiK3MTPModel"]}
-            )
-
-        if hf_config.model_type == "kimi_k3_flash":
-            # kimi_k3_flash keeps the text-model fields (incl. the MTP layer
-            # count) nested under ``text_config`` (a KimiK3FlashTextConfig).
-            text_config = getattr(hf_config, "text_config", hf_config)
-            n_predict = getattr(text_config, "num_nextn_predict_layers", None)
-            hf_config.model_type = "kimi_k3_flash_mtp"
-            hf_config.update(
-                {"n_predict": n_predict, "architectures": ["KimiK3FlashMTPModel"]}
             )
 
         if hf_config.architectures[0] == "MiMoForCausalLM":

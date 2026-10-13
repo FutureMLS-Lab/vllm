@@ -1076,41 +1076,6 @@ class LongcatFlashNgramForCausalLMConfig(VerifyAndUpdateConfig):
             compilation_config.cudagraph_mode = CUDAGraphMode.FULL
 
 
-class KimiK3FlashForCausalLMConfig(VerifyAndUpdateConfig):
-    @classmethod
-    def verify_and_update_config(cls, vllm_config: "VllmConfig") -> None:
-        """Default the kv-cache dtype to the custom "fp8_ds_mla" format for
-        Kimi K3 Flash DSA models.
-
-        The FlashMLASparse builder only constructs fp8 metadata when
-        cache_config.cache_dtype == "fp8_ds_mla" (flashmla_sparse.py), and
-        the runner resolves kv_cache_dtype from cache_config at init time --
-        long before the model is built -- so the normalization must happen
-        here at config-verification time rather than in the model.
-        """
-        hf_config = vllm_config.model_config.hf_config
-        # Multimodal composite configs (KimiK3FlashForConditionalGeneration)
-        # carry dsa_config on text_config; text-only models have it at the
-        # top level.
-        hf_text_config = getattr(hf_config, "text_config", hf_config)
-        if getattr(hf_text_config, "dsa_config", None) is None:
-            return
-        cache_config = vllm_config.cache_config
-        if cache_config.cache_dtype == "auto" or cache_config.cache_dtype.startswith(
-            "fp8"
-        ):
-            cache_config.cache_dtype = "fp8_ds_mla"
-            logger.info("Using custom fp8 kv-cache format for Kimi K3 Flash DSA")
-        elif getattr(hf_text_config, "linear_attn_config", None) is not None:
-            raise ValueError(
-                "The MergedMLAIndexerSpec merged KV cache of hybrid (KDA + MLA) "
-                "DSA models only supports fp8_ds_mla; explicit cache_dtype="
-                f"{cache_config.cache_dtype!r} is not servable (a dense MLA "
-                "cannot address the flat merged layout). Use "
-                "--kv-cache-dtype fp8_ds_mla or auto."
-            )
-
-
 MODELS_CONFIG_MAP: dict[str, type[VerifyAndUpdateConfig]] = {
     "ColBERTJinaRobertaModel": JinaRobertaModelConfig,
     "ColQwen3_5": ColQwen3_5Config,
@@ -1121,9 +1086,6 @@ MODELS_CONFIG_MAP: dict[str, type[VerifyAndUpdateConfig]] = {
     "DiffusionGemmaForBlockDiffusion": DiffusionGemmaModelForBlockDiffusionConfig,  # noqa: E501
     "EmbeddingGemma2Model": EmbeddingGemma2ModelConfig,
     "Ernie4_5_VLMoeForConditionalGeneration": Ernie4_5_VLMoeForConditionalGenerationConfig,  # noqa: E501
-    "KimiK3FlashForCausalLM": KimiK3FlashForCausalLMConfig,
-    "KimiK3FlashForConditionalGeneration": KimiK3FlashForCausalLMConfig,
-    "KimiK3FlashMTPModel": KimiK3FlashForCausalLMConfig,
     "FalconMambaForCausalLM": MambaModelConfig,
     "Gemma3TextModel": Gemma3TextModelConfig,
     "Gemma4ForCausalLM": Gemma4Config,

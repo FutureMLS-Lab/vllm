@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Dense (non-DSA) MTP draft support for Kimi K3 Flash (DSA target).
+"""Dense (non-DSA) MTP draft support for Kimi K3.1 (DSA target).
 
 The draft layer has no indexer weights, and no SM100 dense MLA kernel can
 read the globally enforced fp8_ds_mla cache. Instead of a real dense
@@ -41,7 +41,7 @@ def _fill_full_range_(rows: torch.Tensor, valid_lens: torch.Tensor) -> None:
     rows.copy_(torch.where(ar.unsqueeze(0) < valid, ar.unsqueeze(0), -1))
 
 
-class KimiK3FlashDenseDraftIndexer(nn.Module):
+class KimiK3DenseDraftIndexer(nn.Module):
     """Indexer replacement for a dense MTP draft layer on a DSA target.
 
     Duck-typed to the ``MLAModules`` indexer contract (``topk_tokens``) and

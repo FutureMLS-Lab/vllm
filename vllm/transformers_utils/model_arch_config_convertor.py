@@ -326,7 +326,6 @@ class ModelArchConfigConvertorBase:
             "glm4_moe_lite",
             "glm4_moe_lite_mtp",
             "kimi_k2",
-            "kimi_k3_flash_text",
             "kimi_linear",
             "longcat_flash",
             "pangu_ultra_moe",

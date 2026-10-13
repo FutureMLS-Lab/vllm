@@ -42,7 +42,7 @@ from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
 # Importing registers the torch.ops.vllm.index_rope custom op (side effect)
 # and binds the directly-called index_rope python entry point. Only used
 # when dsa_config.index_rope_dim > 0 (Kimi-K3.1 is NoPE with index_rope_dim 0).
-from vllm.models.kimi_k3_flash.index_rope import index_rope
+from vllm.models.kimi_k3.nvidia.index_rope import index_rope
 from vllm.platforms import current_platform
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 from vllm.utils.torch_utils import _encode_layer_name
@@ -565,12 +565,12 @@ class KimiK3DSAAttention(nn.Module):
             # candidates (mathematically exact dense attention); its k_cache
             # facade keeps the merged-cache spec registration byte-identical
             # to the target's (the indexer section is simply never touched).
-            from vllm.models.kimi_k3_flash.dense_draft import (
-                KimiK3FlashDenseDraftIndexer,
+            from vllm.models.kimi_k3.nvidia.dense_draft import (
+                KimiK3DenseDraftIndexer,
             )
 
             dcp_world_size = vllm_config.parallel_config.decode_context_parallel_size
-            self.dsa_indexer = KimiK3FlashDenseDraftIndexer(
+            self.dsa_indexer = KimiK3DenseDraftIndexer(
                 max_model_len=vllm_config.model_config.max_model_len,
                 max_num_batched_tokens=(
                     vllm_config.scheduler_config.max_num_batched_tokens

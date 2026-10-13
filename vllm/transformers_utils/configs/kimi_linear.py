@@ -17,8 +17,8 @@ class KimiLinearDSAConfig:
     """Configuration class for DSA (DeepSeek Sparse Attention).
 
     Kimi-K3.1 puts DSA on every full-attention (MLA) layer; KDA layers
-    are unaffected. Field semantics match KimiK3FlashDSAConfig; the converted
-    checkpoint exports this as a nested ``dsa_config`` sub-structure.
+    are unaffected. The converted checkpoint exports this as a nested
+    ``dsa_config`` sub-structure.
     """
 
     dsa_layers: list[int]

@@ -137,7 +137,6 @@ _TEXT_GENERATION_MODELS = {
     "IQuestLoopCoderForCausalLM": ("iquest_loopcoder", "IQuestLoopCoderForCausalLM"),
     "JambaForCausalLM": ("jamba", "JambaForCausalLM"),
     "K2HorizonForCausalLM": ("k2_horizon", "K2HorizonForCausalLM"),
-    "KimiK3FlashForCausalLM": ("vllm.models.kimi_k3_flash", "KimiK3FlashForCausalLM"),
     "KimiLinearForCausalLM": (
         "vllm.models.kimi_k3",
         "KimiLinearForCausalLM",
@@ -469,10 +468,6 @@ _MULTIMODAL_MODELS = {
     ),
     "KimiVLForConditionalGeneration": ("kimi_vl", "KimiVLForConditionalGeneration"),
     "KimiK25ForConditionalGeneration": ("kimi_k25", "KimiK25ForConditionalGeneration"),
-    "KimiK3FlashForConditionalGeneration": (
-        "vllm.models.kimi_k3_flash",
-        "KimiK3FlashForConditionalGeneration",
-    ),
     "KimiK3ForConditionalGeneration": (
         "vllm.models.kimi_k3",
         "KimiK3ForConditionalGeneration",
@@ -703,7 +698,6 @@ _SPECULATIVE_DECODING_MODELS = {
     "HYV3MTPModel": ("hy_v3_mtp", "HYV3MTP"),
     "HYV4MTPModel": ("vllm.models.hy_v4", "HYV4MTP"),
     "KimiK3MTPModel": ("vllm.models.kimi_k3", "KimiK3MTP"),
-    "KimiK3FlashMTPModel": ("vllm.models.kimi_k3_flash", "KimiK3FlashMTP"),
     # Temporarily disabled.
     # # TODO(woosuk): Re-enable this once the MLP Speculator is supported in V1.
     # "MLPSpeculatorPreTrainedModel": ("mlp_speculator", "MLPSpeculator"),
