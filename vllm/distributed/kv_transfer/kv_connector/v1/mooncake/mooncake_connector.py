@@ -1789,17 +1789,17 @@ class MooncakeConnectorWorker:
                     f"{self.block_size} (producer) and {meta.kernel_block_size} "
                     "(consumer)."
                 )
-            # A hybrid model's logical block fits its per-rank Mamba state, so
-            # it differs across TP sizes. The consumer then asks only for the
-            # blocks after its prefix-cache hit, which cannot be lined up with
-            # ours without knowing the hit length.
-            if self.kv_cache_config.has_mamba_layers and meta.prefix_caching:
+            # With different logical block sizes (e.g. a hybrid model's block
+            # fits its per-rank Mamba state, so it differs across TP sizes),
+            # a consumer with prefix caching asks only for the blocks after
+            # its hit, which cannot be lined up with ours without knowing the
+            # hit length.
+            if meta.prefix_caching:
                 return (
                     "Mooncake transfers between different logical block sizes "
                     f"({local_ppl * self.block_size} tokens on the producer, "
-                    f"{remote_ppl * self.block_size} on the consumer) of a "
-                    "hybrid model require the consumer to run with "
-                    "--no-enable-prefix-caching."
+                    f"{remote_ppl * self.block_size} on the consumer) require "
+                    "the consumer to run with --no-enable-prefix-caching."
                 )
         if (
             self.kv_cache_config.has_mamba_layers

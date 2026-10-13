@@ -405,15 +405,6 @@ class CudaPlatformBase(Platform):
                     "Attention backend %s is unavailable", backend.name, exc_info=True
                 )
                 invalid_reasons_i = [f"{type(e).__name__}: {e}"]
-            # Sparse (DSA) models must not silently fall back to a dense
-            # backend: that would run full attention with no externally
-            # visible failure. Only allow backends that declare is_sparse().
-            if (
-                not invalid_reasons_i
-                and attn_selector_config.use_sparse
-                and not backend_class.is_sparse()
-            ):
-                invalid_reasons_i = ["not a sparse attention backend"]
             if invalid_reasons_i:
                 invalid_reasons[backend] = (priority, invalid_reasons_i)
             else:

@@ -599,9 +599,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             if isinstance(index_group, HiSparseMLAIndexGroup)
             else None
         )
-        # Sparse (DSA) layers must be served by a sparse attention impl;
-        # a dense impl silently ignores top-k indices and runs full attention,
-        # which is not externally detectable. Fail loudly instead.
+        # A dense impl would silently ignore the top-k indices.
         if use_sparse and not self.impl.is_sparse:
             raise RuntimeError(
                 f"{prefix}: sparse (DSA) attention layer requires a sparse "
@@ -762,11 +760,8 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             if self.kv_cache.stride(0) % row_width == 0:
                 block_stride_rows = self.kv_cache.stride(0) // row_width
             else:
-                # Merged DSA cache (MergedMLAIndexerSpec): the block stride spans
-                # the indexer sections, so it is not a whole number of MLA
-                # rows. The fp8 index-conversion path never passes
-                # BLOCK_STRIDE_ROWS, so the kernel addresses the cache in
-                # logical per-block token slots -- warm it up with that.
+                # MergedMLAIndexerSpec: the block stride also spans the
+                # indexer section; the kernel addresses per-block token slots.
                 block_stride_rows = self.kv_cache.shape[1]
             _CONVERT_REQ_INDEX_TO_GLOBAL_INDEX_KERNEL.register_warmup(
                 self._vllm_config,
@@ -1389,20 +1384,13 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             state_content_bytes=DS_MLA_STATE_CONTENT_BYTES.get(self.kv_cache_dtype),
         )
         if getattr(self, "ds_index_head_size", 0):
-            # Merged DSA cache mode (MergedMLAIndexerSpec): the DSA indexer's
-            # per-token bytes ride in this layer's merged spec instead of a
-            # separately registered indexer cache. The markers
-            # (ds_index_head_size/dim, ds_indexer_layer_name) are set by the
-            # host attention module when merged mode is active.
+            # Merged DSA cache: the indexer's bytes live in this layer's spec.
             from vllm.v1.kv_cache_interface import (
                 DenseDraftMergedMLAIndexerSpec,
                 MergedMLAIndexerSpec,
             )
 
-            # The merged per-unit layout (MLA section + indexer section +
-            # TMA tail pad) is only understood by the FlashMLA sparse kernels;
-            # any other backend addresses the cache as dense MLA pages and
-            # would silently read wrong offsets. Fail at startup instead.
+            # Only the FlashMLA sparse kernels understand the merged layout.
             backend_name = self.attn_backend.get_name()
             if backend_name != "FLASHMLA_SPARSE":
                 raise RuntimeError(
@@ -1414,9 +1402,6 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 )
             spec_cls: type[MergedMLAIndexerSpec] = MergedMLAIndexerSpec
             if getattr(getattr(self, "indexer", None), "dense_draft", False):
-                # Dense MTP draft: marker subclass so the draft forms its own
-                # attention group (same merged layout; the marker subclass
-                # prevents merging into the target's group).
                 spec_cls = DenseDraftMergedMLAIndexerSpec
             return spec_cls.from_mla_and_indexer(
                 block_size=vllm_config.cache_config.block_size,
@@ -1425,9 +1410,8 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 cache_dtype_str=self.kv_cache_dtype,
                 index_head_size=self.ds_index_head_size,
                 index_head_dim=self.ds_index_head_dim,
-                # The sparse-attention kernels (FlashMLA sparse decode,
-                # DeepGEMM paged logits) address the cache in 64-token
-                # blocks, so the merged unit is built per 64 tokens.
+                # FlashMLA sparse decode and DeepGEMM paged logits use
+                # 64-token blocks.
                 kernel_block_size=64,
             )
         if self.sliding_window is not None:
@@ -1436,12 +1420,6 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 sliding_window=self.sliding_window,
             )
         if getattr(getattr(self, "indexer", None), "dense_draft", False):
-            # Dense MTP draft on a DSA target: marker subclass so the draft
-            # forms its own attention group instead of sharing one with the
-            # target's sparse layers. The group's per-step sched_meta
-            # requires a consistent topk across calls; the draft's
-            # full-range candidates (max_model_len wide) are incompatible
-            # with the target's index_topk on a shared instance.
             from vllm.v1.kv_cache_interface import DenseDraftMLASpec
 
             return DenseDraftMLASpec(

@@ -40,11 +40,11 @@ from vllm.v1.worker.gpu.model_states.interface import ModelSpecificAttnMetadata
 from vllm.v1.worker.ubatch_utils import get_num_ubatches
 from vllm.v1.worker.utils import (
     AttentionGroup,
-    _split_merged_dsa_cache_views,
     add_kv_sharing_layers_to_kv_cache_groups,
     allocate_kv_cache,
     bind_kv_cache_to_layers,
     prepare_kernel_block_sizes,
+    split_merged_dsa_cache_views,
 )
 
 if TYPE_CHECKING:
@@ -143,10 +143,7 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
             # This layer will use KV cache of the sharing target layer.
             continue
         if getattr(attn_module, "merged_into_mla_cache", False):
-            # Merged DSA cache mode (MergedMLAIndexerSpec): the indexer's bytes
-            # ride in the parent MLA layer's merged spec; the indexer itself
-            # registers no spec here (its metadata-only AttentionGroup is
-            # added separately in init_attn_backend).
+            # Its bytes live in the parent MLA layer's MergedMLAIndexerSpec.
             continue
         # Skip modules that don't need KV cache (eg encoder-only attention)
         if spec := attn_module.get_kv_cache_spec(vllm_config):
@@ -265,11 +262,8 @@ def init_attn_backend(
             else:
                 group_map[key].layer_names.append(layer_name)
 
-        # Merged DSA cache mode (MergedMLAIndexerSpec): the indexer modules
-        # registered no spec (their bytes ride in the MLA layer's merged
-        # cache), so Phase 1 never sees them -- but their forward still
-        # needs a metadata builder. Append a metadata-only indexer
-        # AttentionGroup to the merged MLA group.
+        # Merged-cache indexers registered no spec but still need a metadata
+        # builder: add a metadata-only indexer group.
         if isinstance(kv_cache_group_spec.kv_cache_spec, MergedMLAIndexerSpec):
             indexer_names = [
                 attn_layers[name].ds_indexer_layer_name
@@ -450,7 +444,7 @@ def init_kv_cache(
     }
     # Merged DSA cache mode (MergedMLAIndexerSpec): split each merged layer's
     # cache into the MLA/indexer section views before binding.
-    _split_merged_dsa_cache_views(
+    split_merged_dsa_cache_views(
         bindable_caches, forward_context, kv_cache_config.kv_cache_groups
     )
     bind_kv_cache_to_layers(

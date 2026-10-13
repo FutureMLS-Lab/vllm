@@ -28,9 +28,7 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 # ds_mla layouts pack NoPE + RoPE + scales into one opaque per-token blob,
-# so the page size is not derivable from head_size. Single source of truth,
-# shared by the spec creation in mla_attention.py, the merged-cache spec
-# below, and the mamba/attention block anchor in vllm/platforms/interface.py.
+# so the page size is not derivable from head_size.
 DS_MLA_STATE_CONTENT_BYTES = {"fp8_ds_mla": 656, "nvfp4_ds_mla": 352}
 
 _SpecT = TypeVar("_SpecT", bound="KVCacheSpec")
@@ -346,10 +344,8 @@ def compute_layout_strides(
         and kernel_block_size is None
         and getattr(spec, "padded_unit_bytes", 0) != 0
     ):
-        # MergedMLAIndexerSpec pads each 64-token merged unit, not the page tail;
-        # its page_size_bytes property already includes the pads. Only the
-        # manager-block-level strides need the bump; kernel-block splitting
-        # is handled in create_kv_cache_views.
+        # MergedMLAIndexerSpec pads each 64-token unit, not the page tail;
+        # page_size_bytes already includes the pads.
         padded_page_size = spec.page_size_bytes
     if padded_page_size is not None:
         assert kernel_block_size is None or kernel_block_size == spec.block_size, (
@@ -394,12 +390,10 @@ def create_kv_cache_views(
     )
     ratio = shape_bytes[0] // num_blocks
     if ratio > 1:
-        # Kernel blocks subdivide a manager block into `ratio` equal pieces,
-        # so they sit a constant stride apart only if the manager block packs
-        # exactly `ratio` uniform kernel blocks: no page-tail padding and no
-        # other layer's page before the next block. MergedMLAIndexerSpec pads each
-        # 64-token merged unit's tail instead of the page tail, so there its
-        # kernel-block stride is the padded unit, not the dense one.
+        # Kernel blocks subdivide a manager block into `ratio` equal pieces, so
+        # they sit a constant stride apart only if a block is one uniform page:
+        # no page-tail padding, and no other layer's page before the next block.
+        # MergedMLAIndexerSpec pads each unit, so its stride is the padded unit.
         dense_page_size = prod(compute_layer_kv_cache_shape_bytes(spec, 1)[1:])
         padded_unit = getattr(spec, "padded_unit_bytes", 0)
         expected = ratio * padded_unit if padded_unit else dense_page_size
@@ -778,7 +772,7 @@ class DenseDraftMLASpec(MLAAttentionSpec):
 
 @dataclass(frozen=True, kw_only=True)
 class MergedMLAIndexerSpec(MLAAttentionSpec):
-    """MLA + DSA indexer merged per-layer KV cache spec (Kimi-K3.1).
+    """MLA + DSA indexer merged per-layer KV cache spec (KDA-hybrid DSA models).
 
     The MLA KV (fp8_ds_mla, 656 bytes/token) and the DSA indexer data
     (132 bytes/token: 128 fp8 + 4 fp32 scale) live in one flat uint8 cache
@@ -887,12 +881,8 @@ class MergedMLAIndexerSpec(MLAAttentionSpec):
 
     @classmethod
     def merge(cls, specs: list[Self]) -> Self:
-        # Exact-class match (not isinstance): DenseDraftMergedMLAIndexerSpec,
-        # the dense-MTP-draft marker subclass, must NOT merge into the
-        # target's group -- the group's scheduler metadata takes one topk
-        # for all layers, and the draft fills max_model_len-wide candidates
-        # while the target layers produce index_topk-wide ones. Per-class
-        # groups (all-target or all-draft) still merge fine.
+        # Exact class: DenseDraftMergedMLAIndexerSpec must not merge into the
+        # target's group (different top-k width).
         assert all(type(spec) is cls for spec in specs), (
             "All attention layers in the same KV cache group must be "
             "MergedMLAIndexerSpec."
@@ -938,8 +928,8 @@ class MergedMLAIndexerSpec(MLAAttentionSpec):
 
 @dataclass(frozen=True, kw_only=True)
 class DenseDraftMergedMLAIndexerSpec(MergedMLAIndexerSpec):
-    """Marker spec for a dense (non-DSA) MTP draft layer of a KDA-hybrid
-    (Kimi-K3.1) DSA model.
+    """Marker spec for a dense (non-DSA) MTP draft layer of a KDA-hybrid DSA
+    model.
 
     Field-identical to MergedMLAIndexerSpec (same merged page layout, so
     page unification with the target is unaffected); the subclass only

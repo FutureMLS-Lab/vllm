@@ -791,3 +791,23 @@ def test_validate_hetero_layout():
     worker._mamba_conv_split = None
     err = worker._validate_hetero_layout(meta())
     assert err is not None and "VLLM_SSM_CONV_STATE_LAYOUT=DS" in err
+
+    # Attention-only models with different logical block sizes need the
+    # whole prompt from the consumer too.
+    attn_only = KVCacheConfig(
+        num_blocks=16,
+        kv_cache_tensors=[],
+        kv_cache_groups=kv_cache_config.kv_cache_groups[:1],
+    )
+    worker = _hetero_transfer_worker(attn_only, tp_rank=0, tp_size=1)
+    worker._physical_blocks_per_logical_kv_block = 2
+    assert worker._validate_hetero_layout(meta()) is None
+    err = worker._validate_hetero_layout(meta(prefix_caching=True))
+    assert err is not None and "--no-enable-prefix-caching" in err
+    # Same logical block size: prefix caching hits line up.
+    assert (
+        worker._validate_hetero_layout(
+            meta(prefix_caching=True, physical_blocks_per_logical=2)
+        )
+        is None
+    )

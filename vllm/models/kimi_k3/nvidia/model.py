@@ -918,28 +918,14 @@ class KimiDecoderLayer(nn.Module):
             assert v_head_dim is not None
             assert kv_lora_rank is not None
             assert mla_use_nope, "Kimi-K3 MLA (MultiHeadLatentAttention) is NoPE-only"
-            if config.is_dsa_layer(layer_idx):
-                self.self_attn = KimiK3DSAAttention(
-                    config=config,
-                    hidden_size=self.hidden_size,
-                    num_heads=config.num_attention_heads,
-                    qk_nope_head_dim=qk_nope_head_dim,
-                    qk_rope_head_dim=qk_rope_head_dim,
-                    v_head_dim=v_head_dim,
-                    q_lora_rank=config.q_lora_rank,
-                    kv_lora_rank=kv_lora_rank,
-                    cache_config=cache_config,
-                    quant_config=quant_config,
-                    prefix=f"{prefix}.self_attn",
-                    topk_indices_buffer=topk_indices_buffer,
-                )
-            elif (
+            is_dsa_layer = config.is_dsa_layer(layer_idx)
+            # A dense (non-DSA) MTP draft of a DSA model has no indexer weights
+            # and no SM100 dense MLA kernel reads the fp8_ds_mla cache, so it
+            # runs the sparse form with a full-range dense-draft indexer.
+            is_dense_draft = (
                 config.dsa_config is not None and layer_idx >= config.num_hidden_layers
-            ):
-                # Dense (non-DSA) MTP draft of a DSA model: no indexer
-                # weights and no SM100 dense MLA kernel reads the enforced
-                # fp8_ds_mla cache, so build the sparse form with a
-                # DenseDraftIndexer (full-range fill == exact dense).
+            )
+            if is_dsa_layer or is_dense_draft:
                 self.self_attn = KimiK3DSAAttention(
                     config=config,
                     hidden_size=self.hidden_size,
@@ -953,7 +939,7 @@ class KimiDecoderLayer(nn.Module):
                     quant_config=quant_config,
                     prefix=f"{prefix}.self_attn",
                     topk_indices_buffer=topk_indices_buffer,
-                    dense_draft=True,
+                    dense_draft=not is_dsa_layer,
                 )
             # q_lora_rank may be None (Kimi-Linear): the MLA layer then uses an
             # uncompressed q_proj instead of the fused q-LoRA front-end.
@@ -974,7 +960,6 @@ class KimiDecoderLayer(nn.Module):
                     aux_stream=aux_stream,
                     run_gemm_rs_ar=run_gemm_rs_ar,
                 )
-            self._self_attn_writes_output = False
 
         if self.use_sequence_parallel:
             self.self_attn.o_proj.reduce_results = False
@@ -1252,7 +1237,8 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
             # A DSA layer silently built as dense MLA would be invisible in
             # outputs; check the wiring matches dsa_config.
             n_dsa_built = sum(
-                isinstance(layer.self_attn, KimiK3DSAAttention) for layer in self.layers
+                isinstance(layer.self_attn, KimiK3DSAAttention)
+                for layer in self.layers[self.start_layer : self.end_layer]
             )
             n_dsa_expected = sum(
                 config.is_dsa_layer(layer_idx)

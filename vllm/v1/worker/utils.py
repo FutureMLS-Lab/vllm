@@ -656,7 +656,7 @@ def add_kv_sharing_layers_to_kv_cache_groups(
             runner_only_attn_layers.add(layer_name)
 
 
-def _split_merged_dsa_cache_views(
+def split_merged_dsa_cache_views(
     kv_caches: dict[str, torch.Tensor],
     forward_context: dict[str, Attention],
     kv_cache_groups: Sequence[KVCacheGroupSpec] | None,
@@ -754,7 +754,7 @@ def bind_kv_cache(
 
     # Merged DSA cache mode (MergedMLAIndexerSpec): split each merged layer's
     # cache into the MLA/indexer section views before binding.
-    _split_merged_dsa_cache_views(kv_caches, forward_context, kv_cache_groups)
+    split_merged_dsa_cache_views(kv_caches, forward_context, kv_cache_groups)
 
     # Convert kv_caches dict to a list of tensors in the order of layer_index.
     index2name = defaultdict(list)
