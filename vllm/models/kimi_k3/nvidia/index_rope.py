@@ -16,9 +16,7 @@ Two pairing layouts (same frequencies, different dim pairing):
 
 import torch
 
-from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
-from vllm.utils.torch_utils import direct_register_custom_op
 
 
 @triton.jit
@@ -118,25 +116,3 @@ def index_rope(
         INTERLEAVE=interleave,
         num_warps=1 if half <= 32 else 2,
     )
-
-
-def _index_rope_fake(
-    index_q: torch.Tensor,
-    index_k: torch.Tensor,
-    positions: torch.Tensor,
-    cos_sin_cache: torch.Tensor,
-    rope_dim: int,
-    interleave: bool,
-) -> None:
-    # mutates-only op: the fake needs no allocation, keeping it a single
-    # custom op node when traced by torch.compile (use_inductor=False).
-    return None
-
-
-direct_register_custom_op(
-    op_name="index_rope",
-    op_func=index_rope,
-    mutates_args=["index_q", "index_k"],
-    fake_impl=_index_rope_fake,
-    dispatch_key=current_platform.dispatch_key,
-)

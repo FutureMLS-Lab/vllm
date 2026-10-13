@@ -38,10 +38,6 @@ from vllm.model_executor.layers.quantization.utils.fp8_utils import (
 )
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
-
-# Importing registers the torch.ops.vllm.index_rope custom op (side effect)
-# and binds the directly-called index_rope python entry point. Only used
-# when dsa_config.index_rope_dim > 0 (Kimi-K3.1 is NoPE with index_rope_dim 0).
 from vllm.models.kimi_k3.nvidia.index_rope import index_rope
 from vllm.platforms import current_platform
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
@@ -238,27 +234,14 @@ class KimiK3DSAIndexer(nn.Module):
         Uses the neox/half-split pairing (dim i pairs with dim i+half),
         matching the pair-permuted checkpoint conversion.
         """
-        if torch.compiler.is_compiling():
-            # Raw Triton launches are not traceable: go through the
-            # registered custom op when compiling.
-            torch.ops.vllm.index_rope(
-                index_q,
-                index_k,
-                positions.view(-1),
-                rotary_emb.cos_sin_cache,
-                self.index_rope_dim,
-                False,  # interleave: neox/half-split
-            )
-        else:
-            # Non-compiled path: call directly, saving custom-op dispatch.
-            index_rope(
-                index_q,
-                index_k,
-                positions.view(-1),
-                rotary_emb.cos_sin_cache,
-                self.index_rope_dim,
-                False,  # interleave: neox/half-split
-            )
+        index_rope(
+            index_q,
+            index_k,
+            positions.view(-1),
+            rotary_emb.cos_sin_cache,
+            self.index_rope_dim,
+            False,  # interleave: neox/half-split
+        )
         return index_q, index_k
 
     def _quantize_index_q_and_weights(
