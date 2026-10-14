@@ -14,15 +14,15 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::Path;
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 
 use itertools::{Either, izip};
 use llm_multimodal::registry::ModelRegistryError;
 use llm_multimodal::{
     AsyncMultiModalTracker, AudioClip, AudioPreProcessor, EncoderFieldLayouts, FieldLayout,
     ImageFrame, MediaConnector, MediaConnectorConfig, MediaContentPart, Modality, ModelMetadata,
-    ModelProcessorSpec, ModelRegistry, PreProcessorConfig, PreprocessedEncoderInputs,
-    PromptReplacement, Tokenizer as TokenResolver, TrackedMedia, VideoClip, VisionPreProcessor,
+    ModelProcessorSpec, PreProcessorConfig, PreprocessedEncoderInputs, PromptReplacement,
+    Tokenizer as TokenResolver, TrackedMedia, VideoClip, VisionPreProcessor,
     VisionPreprocessingContext,
 };
 use serde::{Deserialize, Serialize};
@@ -42,6 +42,7 @@ mod expand;
 mod image;
 mod input;
 mod item;
+mod models;
 mod preprocessed;
 mod tensor;
 mod timing;
@@ -108,14 +109,6 @@ impl MmLimitSpec {
     }
 }
 
-/// `(model_type, target model_type)` pairs for checkpoints that reuse another
-/// family's `llm-multimodal` spec unchanged. Drop an entry once `llm-multimodal`
-/// matches its model type itself.
-const SPEC_MODEL_TYPE_ALIASES: &[(&str, &str)] = &[
-    // Kimi K3.1 ships K3's vision tower and preprocessing unchanged.
-    ("kimi_k31", "kimi_k3"),
-];
-
 /// Model metadata and tokenizer access shared by all multimodal specs.
 #[derive(Clone)]
 struct MultimodalModelContext {
@@ -139,26 +132,8 @@ impl MultimodalModelContext {
     }
 
     /// Resolve a static model processor spec for one loaded model.
-    ///
-    /// Model types in [`SPEC_MODEL_TYPE_ALIASES`] look up their target's spec;
-    /// the spec itself still sees this model's own metadata.
     fn resolve_model_spec(&self) -> Option<&'static dyn ModelProcessorSpec> {
-        static REGISTRY: LazyLock<ModelRegistry> = LazyLock::new(ModelRegistry::new);
-        let metadata = self.metadata();
-        let target = metadata.config_model_type().and_then(|model_type| {
-            SPEC_MODEL_TYPE_ALIASES
-                .iter()
-                .find_map(|&(alias, target)| (alias == model_type).then_some(target))
-        });
-        let Some(target) = target else {
-            return REGISTRY.lookup(&metadata);
-        };
-        let mut config = self.config.clone();
-        config["model_type"] = target.into();
-        REGISTRY.lookup(&ModelMetadata {
-            config: &config,
-            ..metadata
-        })
+        models::lookup_spec(&self.metadata())
     }
 
     /// Build a vision preprocessor for one loaded model and modality.
