@@ -468,6 +468,10 @@ class KimiK3ForConditionalGenerationConfig(VerifyAndUpdateConfig):
                 "cannot address the flat merged layout). Use "
                 "--kv-cache-dtype fp8_ds_mla or auto."
             )
+        if vllm_config.speculative_config is not None:
+            from vllm.models.kimi_k3.nvidia.dense_draft import configure_dense_draft
+
+            configure_dense_draft(vllm_config.speculative_config, hf_text_config)
 
 
 class GptOssForCausalLMConfig(VerifyAndUpdateConfig):

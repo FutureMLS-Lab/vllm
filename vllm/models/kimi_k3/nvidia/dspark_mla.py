@@ -26,6 +26,7 @@ from vllm.model_executor.models.utils import (
     maybe_prefix,
 )
 from vllm.models.common.ops.fused_allreduce_rms_norm import fused_allreduce_rms_norm
+from vllm.models.kimi_k3.nvidia.dense_draft import place_dense_draft_in_merged_cache
 from vllm.models.kimi_k3.nvidia.mla import MultiHeadLatentAttention
 from vllm.models.kimi_k3.nvidia.model import KimiMLP
 from vllm.utils.torch_utils import is_quantized_kv_cache
@@ -87,6 +88,7 @@ class K3DSparkDecoderLayer(nn.Module):
             use_rope=True,
             non_causal_multi_token_decode=True,
         )
+        place_dense_draft_in_merged_cache(self.self_attn, vllm_config)
         # Both row-parallel outputs stay un-reduced; their all-reduces are fused
         # into the RMSNorm that follows via fused_allreduce_rms_norm.
         self.self_attn.o_proj.reduce_results = False

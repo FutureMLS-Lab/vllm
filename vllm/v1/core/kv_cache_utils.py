@@ -2246,6 +2246,7 @@ def _uses_trailing_mtp_layers(vllm_config: VllmConfig) -> bool:
 
     MTP drafters register their KV layers after the target layers, without a
     distinguishing spec marker. DeepseekV4/V4.1 do this with ``dspark`` too.
+    Kimi-K3.1's EAGLE3 and DSpark drafters do too (they register the target's spec).
     The annotator separately checks that the groups partition the layers exactly.
     """
     spec_config = vllm_config.speculative_config
@@ -2257,6 +2258,7 @@ def _uses_trailing_mtp_layers(vllm_config: VllmConfig) -> bool:
     return model_config is not None and model_config.hf_config.model_type in (
         "deepseek_v4",
         "deepseek_v41",
+        "kimi_k31",
     )
 
 

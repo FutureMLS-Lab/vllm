@@ -681,9 +681,8 @@ def split_merged_dsa_cache_views(
                 continue  # PP: this layer lives on another stage
             module = forward_context.get(layer_name)
             indexer_name = getattr(module, "ds_indexer_layer_name", None)
-            assert indexer_name is not None, (
-                f"merged-cache MLA layer {layer_name} is missing ds_indexer_layer_name"
-            )
+            if indexer_name is None:
+                continue  # no indexer (a dense draft): the layer binds its own view
             raw = kv_caches[layer_name]
             num_units = raw.shape[0]
             unit_stride = raw.stride(0)

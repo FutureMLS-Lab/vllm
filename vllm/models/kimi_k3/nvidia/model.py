@@ -19,6 +19,7 @@ from vllm.distributed import (
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul, SituAndMul
+from vllm.model_executor.layers.attention.mla_attention import MLAAttention
 from vllm.model_executor.layers.fused_moe import (
     FusedMoEFactory,
     fused_moe_make_expert_params_mapping,
@@ -100,6 +101,7 @@ from vllm.models.deepseek_v4.nvidia.model import (
     DeepseekV4MLP,
 )
 from vllm.models.deepseek_v4.nvidia.ops.prepare_megamoe import prepare_megamoe_inputs
+from vllm.models.kimi_k3.nvidia.dense_draft import place_dense_draft_in_merged_cache
 from vllm.models.kimi_k3.nvidia.dsa import KimiK3DSAAttention
 from vllm.models.kimi_k3.nvidia.kda import KimiK3DeltaAttention
 from vllm.models.kimi_k3.nvidia.latent_moe_runner import (
@@ -2251,3 +2253,10 @@ class KimiK3ForConditionalGeneration(
 
     def process_weights_after_loading(self) -> None:
         self.language_model.process_weights_after_loading()
+
+    def adapt_drafter(self, drafter: nn.Module, vllm_config: VllmConfig) -> None:
+        """Let a dense MLA drafter (EAGLE3) share this model's merged DSA pages
+        (Kimi-K3.1; a no-op on Kimi-K3)."""
+        for module in drafter.modules():
+            if isinstance(module, MLAAttention):
+                place_dense_draft_in_merged_cache(module, vllm_config)
