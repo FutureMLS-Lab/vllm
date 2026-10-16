@@ -863,6 +863,9 @@ class MergedMLAIndexerSpec(MLAAttentionSpec):
             index_head_dim=index_head_dim,
             mla_head_size=mla_head_size,
             kernel_block_size=kernel_block_size,
+            # The kernels address storage in kernel_block_size units even
+            # when the (mamba-anchored) manager block spans several of them.
+            storage_block_size=kernel_block_size,
             padded_unit_bytes=(
                 padded_unit_bytes if padded_unit_bytes != dense_unit_bytes else 0
             ),

@@ -70,6 +70,7 @@ from vllm.model_executor.models.utils import (
     make_layers,
     maybe_prefix,
 )
+from vllm.models.kimi_k3.amd.dsa import KimiK3DSAAttention
 from vllm.models.kimi_k3.amd.kda import KimiK3DeltaAttention
 from vllm.models.kimi_k3.amd.latent_moe_runner import ROCmLatentMoERunner
 from vllm.models.kimi_k3.amd.mla import KimiK3MultiHeadLatentAttentionWrapper
@@ -79,6 +80,18 @@ from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 from vllm.utils.math_utils import cdiv
 
 logger = init_logger(__name__)
+
+
+# DSA indexer weight rename mapping. Specific rules must come before the
+# generic ".self_attn.indexer." rule: the loop breaks on the first match.
+_DSA_RENAME_PARAMS_MAPPING = [
+    (".self_attn.dsa_indexer.wq_index.", ".self_attn.indexer.wq_b."),
+    (".self_attn.dsa_indexer.wk_index.", ".self_attn.indexer.wk."),
+    (".self_attn.dsa_indexer.wv_index.", ".self_attn.indexer.weights_proj."),
+    (".self_attn.dsa_indexer.k_index_norm.", ".self_attn.indexer.k_norm."),
+    # Generic fallback for already-nested indexer names
+    (".self_attn.dsa_indexer.", ".self_attn.indexer."),
+]
 
 
 class KimiMLP(nn.Module):
@@ -517,6 +530,7 @@ class KimiDecoderLayer(nn.Module):
         config: KimiLinearConfig,
         vllm_config: VllmConfig,
         prefix: str = "",
+        topk_indices_buffer: torch.Tensor | None = None,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -555,23 +569,50 @@ class KimiDecoderLayer(nn.Module):
             assert qk_rope_head_dim is not None
             assert v_head_dim is not None
             assert kv_lora_rank is not None
-            assert mla_use_nope is not None
-            self.self_attn = KimiMLAAttention(
-                layer_idx=layer_idx,
-                hidden_size=self.hidden_size,
-                num_heads=config.num_attention_heads,
-                quant_config=quant_config,
-                cache_config=cache_config,
-                model_config=model_config,
-                prefix=f"{prefix}.self_attn",
-                config=config,
-                qk_nope_head_dim=qk_nope_head_dim,
-                qk_rope_head_dim=qk_rope_head_dim,
-                v_head_dim=v_head_dim,
-                q_lora_rank=config.q_lora_rank,
-                kv_lora_rank=kv_lora_rank,
-                use_nope=mla_use_nope,
+            assert mla_use_nope, "Kimi-K3 MLA (MultiHeadLatentAttention) is NoPE-only"
+            is_dsa_layer = config.is_dsa_layer(layer_idx)
+            # A dense (non-DSA) MTP draft of a DSA model has no indexer
+            # weights; on ROCm only the target model's DSA layers are
+            # supported.
+            is_dense_draft = (
+                config.dsa_config is not None and layer_idx >= config.num_hidden_layers
             )
+            if is_dense_draft:
+                raise NotImplementedError(
+                    "Kimi-K3.1 DSA MTP draft layers are not supported on ROCm yet."
+                )
+            if is_dsa_layer:
+                self.self_attn = KimiK3DSAAttention(
+                    config=config,
+                    hidden_size=self.hidden_size,
+                    num_heads=config.num_attention_heads,
+                    qk_nope_head_dim=qk_nope_head_dim,
+                    qk_rope_head_dim=qk_rope_head_dim,
+                    v_head_dim=v_head_dim,
+                    q_lora_rank=config.q_lora_rank,
+                    kv_lora_rank=kv_lora_rank,
+                    cache_config=cache_config,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.self_attn",
+                    topk_indices_buffer=topk_indices_buffer,
+                )
+            else:
+                self.self_attn = KimiMLAAttention(
+                    layer_idx=layer_idx,
+                    hidden_size=self.hidden_size,
+                    num_heads=config.num_attention_heads,
+                    quant_config=quant_config,
+                    cache_config=cache_config,
+                    model_config=model_config,
+                    prefix=f"{prefix}.self_attn",
+                    config=config,
+                    qk_nope_head_dim=qk_nope_head_dim,
+                    qk_rope_head_dim=qk_rope_head_dim,
+                    v_head_dim=v_head_dim,
+                    q_lora_rank=config.q_lora_rank,
+                    kv_lora_rank=kv_lora_rank,
+                    use_nope=mla_use_nope,
+                )
 
         if (
             self.is_moe
@@ -745,11 +786,29 @@ class KimiLinearModel(nn.Module, EagleModelMixin):
         else:
             self.embed_tokens = PPMissingLayer()
 
+        # Single model-level top-k buffer shared by all DSA layers; required
+        # by KimiK3DSAAttention.
+        self.topk_indices_buffer: torch.Tensor | None = None
+        if config.dsa_config is not None and any(
+            config.is_dsa_layer(layer_idx)
+            for layer_idx in range(config.num_hidden_layers)
+        ):
+            topk_buffer_device = "cuda" if torch.cuda.is_available() else "cpu"
+            self.topk_indices_buffer = torch.empty(
+                (
+                    vllm_config.scheduler_config.max_num_batched_tokens,
+                    config.dsa_config.index_topk,
+                ),
+                dtype=torch.int32,
+                device=topk_buffer_device,
+            )
+
         def get_layer(prefix: str):
             return KimiDecoderLayer(
                 config,
                 vllm_config,
                 prefix,
+                topk_indices_buffer=self.topk_indices_buffer,
             )
 
         self.start_layer, self.end_layer, self.layers = make_layers(
@@ -757,6 +816,22 @@ class KimiLinearModel(nn.Module, EagleModelMixin):
             get_layer,
             prefix=f"{prefix}.layers",
         )
+
+        if config.dsa_config is not None:
+            # A DSA layer silently built as dense MLA would be invisible in
+            # outputs; check the wiring matches dsa_config.
+            n_dsa_built = sum(
+                isinstance(layer.self_attn, KimiK3DSAAttention)
+                for layer in self.layers[self.start_layer : self.end_layer]
+            )
+            n_dsa_expected = sum(
+                config.is_dsa_layer(layer_idx)
+                for layer_idx in range(self.start_layer, self.end_layer)
+            )
+            assert n_dsa_built == n_dsa_expected, (
+                f"DSA wiring broken: built {n_dsa_built} DSA attention layers "
+                f"but dsa_config expects {n_dsa_expected}."
+            )
 
         if get_pp_group().is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -1032,6 +1107,28 @@ class KimiLinearModel(nn.Module, EagleModelMixin):
                     )
                     break
                 else:
+                    if self.config.dsa_config is not None:
+                        for param_name, weight_name in _DSA_RENAME_PARAMS_MAPPING:
+                            if weight_name in name:
+                                name = name.replace(weight_name, param_name)
+                                break
+                    # The bf16 indexer projections (wk/wv) cannot take an fp8
+                    # checkpoint weight: default_weight_loader would cast it
+                    # and silently drop the companion weight_scale_inv. (Only
+                    # wq_index is fp8-capable, via quant_config.)
+                    if name.endswith(
+                        (".dsa_indexer.wk_index.weight", ".dsa_indexer.wv_index.weight")
+                    ) and loaded_weight.dtype in (
+                        torch.float8_e4m3fn,
+                        torch.float8_e4m3fnuz,
+                        torch.float8_e5m2,
+                        torch.float8_e5m2fnuz,
+                    ):
+                        raise ValueError(
+                            f"{name}: fp8 indexer wk/wv checkpoint weights are "
+                            "not supported (bf16 projections; the scale would "
+                            "be dropped). Convert the checkpoint to bf16."
+                        )
                     # Skip loading extra bias for GPTQ models.
                     if (
                         name.endswith(".bias")

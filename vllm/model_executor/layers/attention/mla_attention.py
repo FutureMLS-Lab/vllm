@@ -1390,15 +1390,17 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 MergedMLAIndexerSpec,
             )
 
-            # Only the FlashMLA sparse kernels understand the merged layout.
+            # Only the FlashMLA sparse (NVIDIA) and ROCm AITER sparse MLA
+            # kernels understand the merged layout.
             backend_name = self.attn_backend.get_name()
-            if backend_name != "FLASHMLA_SPARSE":
+            if backend_name not in ("FLASHMLA_SPARSE", "ROCM_AITER_MLA_SPARSE"):
                 raise RuntimeError(
                     f"{self.layer_name}: the MergedMLAIndexerSpec merged KV cache "
-                    f"requires the FLASHMLA_SPARSE attention backend, got "
-                    f"{backend_name}. Other backends address the cache as "
-                    "dense MLA pages and would silently read wrong addresses. "
-                    "Serve with VLLM_ATTENTION_BACKEND=FLASHMLA_SPARSE."
+                    "requires the FLASHMLA_SPARSE or ROCM_AITER_MLA_SPARSE "
+                    f"attention backend, got {backend_name}. Other backends "
+                    "address the cache as dense MLA pages and would silently "
+                    "read wrong addresses. Set VLLM_ATTENTION_BACKEND to one of "
+                    "the supported backends."
                 )
             spec_cls: type[MergedMLAIndexerSpec] = MergedMLAIndexerSpec
             if getattr(getattr(self, "indexer", None), "dense_draft", False):
