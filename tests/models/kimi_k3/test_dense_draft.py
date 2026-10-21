@@ -10,7 +10,7 @@ import torch
 from vllm.model_executor.models.config import KimiK3ForConditionalGenerationConfig
 from vllm.models.kimi_k3.nvidia.dense_draft import place_dense_draft_in_merged_cache
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
-from vllm.v1.core.kv_cache_utils import get_kv_cache_groups
+from vllm.v1.core.kv_cache_planning import get_kv_cache_groups
 from vllm.v1.kv_cache_interface import KVCacheGroupSpec, MambaSpec, MergedMLAIndexerSpec
 from vllm.v1.worker.utils import split_merged_dsa_cache_views
 
@@ -82,8 +82,8 @@ def test_dense_draft_shares_the_target_mla_group_and_pages():
     )
     assert draft_spec == mla
 
-    # So it joins the target's MLA group: K3.1 keeps its 4 groups, and the
-    # group holding the draft is flagged.
+    # So it joins the target's MLA group: K3.1 keeps its 4 groups. (That group
+    # takes the EAGLE block drop through the draft layer's is_draft tag.)
     kda = MambaSpec(
         block_size=1088,
         shapes=((2, 512), (3, 32, 32)),
@@ -98,9 +98,8 @@ def test_dense_draft_shares_the_target_mla_group_and_pages():
     specs["draft.layers.0"] = draft_spec
     groups = get_kv_cache_groups(vllm_config, specs)
     assert len(groups) == 4
-    (draft_group,) = [g for g in groups if g.is_eagle_group]
+    (draft_group,) = [g for g in groups if "draft.layers.0" in g.layer_names]
     assert len(draft_group.layer_names) == 25
-    assert "draft.layers.0" in draft_group.layer_names
 
     # In its own pages it binds 64 plain fp8 MLA rows of 576 B at the head of
     # each unit, at the unit stride; the merged-view split leaves it alone.

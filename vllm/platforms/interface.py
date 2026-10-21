@@ -1138,9 +1138,14 @@ class Platform:
         if merged_unit_bytes is not None:
             # Merged DSA cache (MergedMLAIndexerSpec): the attention page is a
             # whole number of padded 64-token units, so anchor the block
-            # size in units and skip the per-token formula entirely.
+            # size in units and skip the per-token formula entirely. The
+            # padded unit is only 16 B aligned, but FlashInfer's KDA decode
+            # needs the shared page stride 16-element (64 B fp32) aligned.
             attn_block_size = 64 * cdiv(mamba_page_size, merged_unit_bytes)
-            backend_block_alignment = lcm(backend_block_alignment, 64)
+            backend_block_alignment = lcm(
+                backend_block_alignment,
+                64 * (64 // math.gcd(merged_unit_bytes, 64)),
+            )
         else:
             # Use minimum block size that satisfies both backend alignment
             # and mamba page size compatibility

@@ -828,7 +828,8 @@ def split_merged_dsa_cache_views(
     if kv_cache_groups is None:
         return
     for group in kv_cache_groups:
-        spec = group.kv_cache_spec
+        # Callers may pass layer-name-only groups (no spec): nothing merged.
+        spec = getattr(group, "kv_cache_spec", None)
         if not isinstance(spec, MergedMLAIndexerSpec):
             continue
         mla_bytes = spec.mla_bytes_per_token
