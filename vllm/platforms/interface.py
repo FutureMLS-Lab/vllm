@@ -1099,12 +1099,6 @@ class Platform:
         if mamba_page_size == 0:
             return
 
-        if merged_unit_bytes is not None and cache_config.prefix_match_unit is None:
-            # Merged DSA cache (MergedMLAIndexerSpec): hash prefixes at the
-            # 64-token kernel-block granularity so APC hit boundaries are
-            # not quantized up to the mamba-anchored manager block.
-            cache_config.prefix_match_unit = 64
-
         # Get kernel block alignment from the backend's supported sizes
         with set_current_vllm_config(vllm_config):
             kernel_block_alignment_size = max(
