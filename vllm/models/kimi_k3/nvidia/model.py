@@ -100,6 +100,7 @@ from vllm.models.common.ops.sequence_parallel import (
 )
 from vllm.models.kimi_k3.nvidia.dense_draft import place_dense_draft_in_merged_cache
 from vllm.models.kimi_k3.nvidia.dsa import KimiK3DSAAttention
+from vllm.models.kimi_k3.nvidia.gqa_draft import GQADraftKVCacheGrouping
 from vllm.models.kimi_k3.nvidia.kda import KimiK3DeltaAttention
 from vllm.models.kimi_k3.nvidia.latent_moe_runner import (
     LatentMoERunner,
@@ -1687,6 +1688,7 @@ class KimiK3ForConditionalGeneration(
     HasInnerState,
     IsHybrid,
     SupportsReplaySSM,
+    GQADraftKVCacheGrouping,
 ):
     """Kimi-K3 model with Kimi-K2.5 vision and KimiLinear text."""
 

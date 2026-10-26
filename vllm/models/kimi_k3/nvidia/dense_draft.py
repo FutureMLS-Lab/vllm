@@ -162,19 +162,28 @@ class KimiK3DenseDraftIndexer(nn.Module):
 
 
 def configure_dense_draft(spec_config: SpeculativeConfig, text_config: Any) -> None:
-    """Default a dense MLA EAGLE3 or DSpark draft of a KDA-hybrid DSA target
-    (``text_config``) to FLASHINFER_MLA on a plain fp8 cache, the setup that shares
-    the target's merged pages, and reject anything else. MTP keeps the sparse path."""
+    """Default an EAGLE3/DSpark draft's attention backend and KV dtype on a
+    KDA-hybrid DSA target: FLASHINFER_MLA + fp8 for MLA drafts (in the target's
+    pages), FLASH_ATTN + model dtype for GQA drafts (own cache). MTP is unchanged."""
     if (
         spec_config.method not in ("eagle3", "dspark")
         or getattr(text_config, "linear_attn_config", None) is None
     ):
         return
-    backend = AttentionBackendEnum.FLASHINFER_MLA
+    draft_text_config = spec_config.draft_model_config.hf_text_config
+    is_mla_draft = getattr(draft_text_config, "kv_lora_rank", None) is not None
+    if is_mla_draft:
+        # MLA draft: fp8 rows inside the target's merged pages; bf16 would not fit.
+        backend, kv_cache_dtype = AttentionBackendEnum.FLASHINFER_MLA, "fp8"
+    else:
+        # GQA draft: its own cache, not the target's sparse backend or fp8_ds_mla.
+        backend, kv_cache_dtype = AttentionBackendEnum.FLASH_ATTN, "auto"
     spec_config.attention_backend = spec_config.attention_backend or backend
-    spec_config.kv_cache_dtype = spec_config.kv_cache_dtype or "fp8"
+    spec_config.kv_cache_dtype = spec_config.kv_cache_dtype or kv_cache_dtype
     fp8_draft_cache = spec_config.kv_cache_dtype in ("fp8", "fp8_e4m3")
-    if spec_config.attention_backend != backend or not fp8_draft_cache:
+    if is_mla_draft and (
+        spec_config.attention_backend != backend or not fp8_draft_cache
+    ):
         raise ValueError(
             "A dense MLA draft on a hybrid (KDA + MLA) DSA target needs "
             f"FLASHINFER_MLA on an fp8 KV cache, got {spec_config.attention_backend} "
