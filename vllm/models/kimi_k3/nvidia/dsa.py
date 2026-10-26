@@ -7,7 +7,8 @@ The DSA indexer uses the native upstream facilities
 sparse MLA layers go through ``MultiHeadLatentAttentionWrapper`` with
 ``MLAModules(is_sparse=True)``. Checkpoints name indexer weights
 ``self_attn.indexer.{wq_b,wk,weights_proj,k_norm}``; the module tree keeps
-``self_attn.dsa_indexer.*`` and load_weights renames into it.
+``self_attn.dsa_indexer.*``; load_weights renames into it and stacks ``wk``
+and ``weights_proj`` into the merged ``wkv_index``.
 """
 
 import math
@@ -33,12 +34,13 @@ from vllm.model_executor.layers.mla import (
     MultiHeadLatentAttentionWrapper,
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
-from vllm.model_executor.layers.quantization.utils.fp8_utils import (
-    per_token_group_quant_fp8,
-)
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
 from vllm.models.kimi_k3.nvidia.index_rope import index_rope
+from vllm.models.kimi_k3.nvidia.ops.dsa_indexer import (
+    indexer_k_norm_quant_insert,
+    indexer_q_quant_fold_weights,
+)
 from vllm.platforms import current_platform
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 from vllm.utils.torch_utils import _encode_layer_name
@@ -78,7 +80,7 @@ class KimiK3DSAIndexerKNorm(nn.Module):
 
 
 class KimiK3DSAIndexer(nn.Module):
-    """wq/wk/wv indexer projections + native ``DeepseekV32IndexerCache``.
+    """wq / wkv indexer projections + native ``DeepseekV32IndexerCache``.
 
     Forward quantizes the indexer query, folds the scales into the per-head
     weights and drives ``torch.ops.vllm.sparse_attn_indexer`` directly (the
@@ -132,21 +134,14 @@ class KimiK3DSAIndexer(nn.Module):
             prefix=f"{prefix}.wq_index",
         )
         # The indexer query projection (wq_index) may be quantized in fp8
-        # checkpoints, while the shared-key (wk_index) and per-head weights
-        # (wv_index) projections are stored in bf16.
-        self.wk_index = ReplicatedLinear(
+        # checkpoints; wk and weights_proj are bf16 and share one GEMM.
+        self.wkv_index = MergedColumnParallelLinear(
             hidden_size,
-            self.index_head_dim,
+            [self.index_head_dim, self.index_num_heads],
             bias=False,
             quant_config=None,
-            prefix=f"{prefix}.wk_index",
-        )
-        self.wv_index = ReplicatedLinear(
-            hidden_size,
-            self.index_num_heads,
-            bias=False,
-            quant_config=None,
-            prefix=f"{prefix}.wv_index",
+            disable_tp=True,
+            prefix=f"{prefix}.wkv_index",
         )
         self.k_index_norm: nn.Module
         if index_k_norm_type == "layernorm":
@@ -197,6 +192,15 @@ class KimiK3DSAIndexer(nn.Module):
         # (sparse_attn_indexer.py): enable the allgather-k path when prefill
         # context parallelism is configured.
         self.use_pcp = vllm_config.parallel_config.prefill_context_parallel_size > 1
+        # Set by KimiK3DSAAttention to skip scoring dense-MHA prefills.
+        self.dense_mha_metadata_layer_name = ""
+        self.topk_backend = vllm_config.kernel_config.sparse_indexer_topk_backend
+        # PCP gathers the unquantized key inside the op.
+        self.use_fused_k_insert = (
+            not self.use_pcp
+            and index_k_norm_type == "layernorm"
+            and index_rope_dim == 0
+        )
         # DCP wiring, same as the upstream SparseAttnIndexer: the op merges
         # each rank's local top-K into the global top-K only when these are
         # passed through (sparse_attn_indexer.py:_merge_dcp_topk_global).
@@ -244,44 +248,27 @@ class KimiK3DSAIndexer(nn.Module):
         )
         return index_q, index_k
 
-    def _quantize_index_q_and_weights(
-        self,
-        index_q: torch.Tensor,
-        index_weights: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """FP8-quantize the indexer query and fold scales into the weights.
-
-        Same quant layout as the upstream Indexer.forward (ue8m0 per-group
-        scales folded into fp32 weights with the softmax scale; index_v
-        already carries the 1/sqrt(num_heads) factor from forward) and the
-        same head padding policy (DeepGEMM supports 32/64 index heads).
-        """
-        q_flat = index_q.reshape(-1, self.index_head_dim).contiguous()
-        q_fp8, q_scale = per_token_group_quant_fp8(
-            q_flat,
-            self.quant_block_size,
-            column_major_scales=False,
-            use_ue8m0=True,
+    def _fused_k_insert(self, index_k: torch.Tensor, num_tokens: int) -> None:
+        attn_metadata = get_forward_context().attn_metadata
+        kv_cache = self.k_cache.kv_cache
+        # Dummy / profiling run: the op leaves the cache and top-k buffer
+        # alone too.
+        if not isinstance(attn_metadata, dict) or kv_cache.numel() == 0:
+            return
+        metadata = attn_metadata[self.k_cache.prefix]
+        assert isinstance(metadata, v32_indexer.DeepseekV32IndexerMetadata)
+        assert self.topk_indices_buffer is not None
+        norm = cast(KimiK3DSAIndexerKNorm, self.k_index_norm)
+        indexer_k_norm_quant_insert(
+            index_k,
+            norm.weight,
+            norm.bias,
+            norm.eps,
+            metadata.slot_mapping,
+            kv_cache,
+            self.topk_indices_buffer,
+            num_tokens,
         )
-        q_fp8 = q_fp8.view(index_q.shape)
-        q_scale = q_scale.view(index_q.shape[0], self.index_num_heads, -1)
-        weights = (
-            (index_weights.float().unsqueeze(-1) * q_scale * self.index_softmax_scale)
-            .squeeze(-1)
-            .contiguous()
-        )
-        if self.padded_index_num_heads != self.index_num_heads:
-            padded_q = q_fp8.new_zeros(
-                (index_q.shape[0], self.padded_index_num_heads, self.index_head_dim)
-            )
-            padded_weights = weights.new_zeros(
-                (index_q.shape[0], self.padded_index_num_heads)
-            )
-            padded_q[:, : self.index_num_heads, :] = q_fp8
-            padded_weights[:, : self.index_num_heads] = weights
-            q_fp8 = padded_q
-            weights = padded_weights
-        return q_fp8, weights
 
     def forward(
         self,
@@ -297,18 +284,29 @@ class KimiK3DSAIndexer(nn.Module):
         index_q = self.wq_index(index_q_input)[0].view(
             -1, self.index_num_heads, self.index_head_dim
         )
-        index_k = self.k_index_norm(self.wk_index(hidden_states)[0])
-        if self.index_rope_dim > 0:
-            assert positions is not None and rotary_emb is not None, (
-                "index_rope_dim > 0 requires positions and the main "
-                "attention rotary_emb (mla_use_nope models cannot enable "
-                "indexer rope)"
-            )
-            index_q, index_k = self._apply_index_rope(
-                index_q, index_k, positions, rotary_emb
-            )
-        index_v = self.wv_index(hidden_states)[0] * self.indexer_weight_scale
-        q_fp8, weights = self._quantize_index_q_and_weights(index_q, index_v)
+        index_k, index_weights = self.wkv_index(hidden_states)[0].split(
+            [self.index_head_dim, self.index_num_heads], dim=-1
+        )
+        if self.use_fused_k_insert:
+            self._fused_k_insert(index_k, hidden_states.shape[0])
+            index_k = None
+        else:
+            index_k = self.k_index_norm(index_k)
+            if self.index_rope_dim > 0:
+                assert positions is not None and rotary_emb is not None, (
+                    "index_rope_dim > 0 requires positions and the main "
+                    "attention rotary_emb (mla_use_nope models cannot enable "
+                    "indexer rope)"
+                )
+                index_q, index_k = self._apply_index_rope(
+                    index_q, index_k, positions, rotary_emb
+                )
+        q_fp8, weights = indexer_q_quant_fold_weights(
+            index_q,
+            index_weights,
+            self.index_softmax_scale * self.indexer_weight_scale,
+            self.padded_index_num_heads,
+        )
         # Writes the fp8 index-k cache and the top-k indices into the shared
         # model-level buffer (same call as SparseAttnIndexer.forward_cuda:
         # under a dummy run kv_cache is an empty placeholder and the op takes
@@ -329,14 +327,16 @@ class KimiK3DSAIndexer(nn.Module):
             self.max_model_len,
             self.max_total_seq_len,
             self.topk_indices_buffer,
-            False,  # skip_k_cache_insert
+            self.use_fused_k_insert,  # skip_k_cache_insert
             self.use_pcp,
             self._parallel_config.pcp_shard_decode_requests,
-            _encode_layer_name(""),  # dense_mha_metadata_layer_name
+            _encode_layer_name(self.dense_mha_metadata_layer_name),
             False,  # use_fp4_cache
             self.dcp_rank,
             self.dcp_world_size,
             self.cp_kv_cache_interleave_size,
+            skip_topk_buffer_clear=self.use_fused_k_insert,
+            topk_backend=self.topk_backend,
         )
 
 
@@ -626,6 +626,15 @@ class KimiK3DSAAttention(nn.Module):
             quant_config,
             prefix,
         )
+
+        # Dense-MHA prefills never read the top-k indices (PCP excluded, as
+        # upstream).
+        if not dense_draft:
+            indexer = cast(KimiK3DSAIndexer, self.dsa_indexer)
+            if not indexer.use_pcp:
+                indexer.dense_mha_metadata_layer_name = (
+                    self.mla_attn.mla_attn.layer_name
+                )
 
         # Merged cache mode (MergedMLAIndexerSpec): the registered MLA layer is
         # the wrapper's inner mla_attn; mark it with the indexer geometry so

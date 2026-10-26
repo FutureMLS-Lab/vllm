@@ -954,12 +954,16 @@ class KimiDecoderLayer(nn.Module):
         return hidden_states, prefix_sum, residual
 
 
+# (param_name, shard_name, shard_id) for the merged DSA wkv_index.
+_DSA_STACKED_PARAMS_MAPPING = [
+    (".self_attn.dsa_indexer.wkv_index.", ".self_attn.indexer.wk.", 0),
+    (".self_attn.dsa_indexer.wkv_index.", ".self_attn.indexer.weights_proj.", 1),
+]
+
 # DSA indexer weight rename mapping. Specific rules must come before the
 # generic ".self_attn.indexer." rule: the loop breaks on the first match.
 _DSA_RENAME_PARAMS_MAPPING = [
     (".self_attn.dsa_indexer.wq_index.", ".self_attn.indexer.wq_b."),
-    (".self_attn.dsa_indexer.wk_index.", ".self_attn.indexer.wk."),
-    (".self_attn.dsa_indexer.wv_index.", ".self_attn.indexer.weights_proj."),
     (".self_attn.dsa_indexer.k_index_norm.", ".self_attn.indexer.k_norm."),
     # Generic fallback for already-nested indexer names
     (".self_attn.dsa_indexer.", ".self_attn.indexer."),
@@ -1366,6 +1370,8 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
                     (".fused_qkv_a_proj", ".q_a_proj", 0),
                     (".fused_qkv_a_proj", ".kv_a_proj_with_mqa", 1),
                 ]
+        if self.config.dsa_config is not None:
+            stacked_params_mapping += _DSA_STACKED_PARAMS_MAPPING
         use_mega_moe = any(
             module.use_mega_moe
             for module in self.modules()

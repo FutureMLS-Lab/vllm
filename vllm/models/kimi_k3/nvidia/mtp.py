@@ -40,6 +40,7 @@ from ..common.mtp import fused_mtp_input
 from .low_latency_gemm import enable_kimi_k3_low_latency_gemm
 from .model import (
     _DSA_RENAME_PARAMS_MAPPING,
+    _DSA_STACKED_PARAMS_MAPPING,
     KimiDecoderLayer,
     KimiMoE,
     get_spec_layer_idx_from_weight_name,
@@ -291,6 +292,8 @@ class KimiK3MTP(nn.Module):
                     (".fused_qkv_a_proj", ".q_a_proj", 0),
                     (".fused_qkv_a_proj", ".kv_a_proj_with_mqa", 1),
                 ]
+        if self.config.dsa_config is not None:
+            stacked_params_mapping += _DSA_STACKED_PARAMS_MAPPING
 
         use_mega_moe = any(
             module.use_mega_moe
