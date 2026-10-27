@@ -11,13 +11,14 @@ import numpy as np
 import torch
 
 from vllm import _custom_ops as ops
-from vllm.config import get_current_vllm_config
+from vllm.config import get_current_vllm_config, get_layers_from_vllm_config
 from vllm.distributed import (
     get_dcp_group,
     get_tensor_model_parallel_world_size,
 )
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.mla_attention import (
+    MLAAttention,
     MLACommonBaseImpl,
     MLACommonDecodeMetadata,
     MLACommonMetadata,
@@ -184,19 +185,16 @@ class SparseMLACommonMetadataBuilder(AttentionMetadataBuilder[T]):
         self.device = device
         self.model_config = vllm_config.model_config
         self.mla_dims = get_mla_dims(self.model_config)
-        self.topk_tokens: int = vllm_config.model_config.hf_text_config.index_topk
         # A dense MTP draft's indexer fills max_model_len-wide candidates.
-        static_ctx = getattr(
-            vllm_config.compilation_config, "static_forward_context", None
+        layers = get_layers_from_vllm_config(vllm_config, MLAAttention, layer_names)
+        self.topk_tokens: int = max(
+            [self.model_config.hf_text_config.index_topk]
+            + [
+                layer.indexer.topk_tokens  # type: ignore[attr-defined]
+                for layer in layers.values()
+                if layer.indexer is not None
+            ]
         )
-        if static_ctx:
-            for name in layer_names:
-                module = static_ctx.get(name)
-                layer_topk = getattr(
-                    getattr(module, "indexer", None), "topk_tokens", None
-                )
-                if layer_topk is not None and layer_topk > self.topk_tokens:
-                    self.topk_tokens = layer_topk
         self.req_id_per_token_buffer = torch.empty(
             (vllm_config.scheduler_config.max_num_batched_tokens,),
             dtype=torch.int32,
