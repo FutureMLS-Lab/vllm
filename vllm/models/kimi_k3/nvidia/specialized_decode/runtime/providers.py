@@ -13,6 +13,8 @@ from vllm.model_executor.kernels.linear.cute_dsl.skinny_gemm import (
 )
 from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
 
+from ..cutedsl.dsa.index import DIM, HEADS
+from ..cutedsl.dsa.prepared import QUERY_HEADS, PreparedDsa
 from ..cutedsl.gemm.projection import PreparedProjection
 from ..cutedsl.kda.prepared import PreparedKda
 from ..cutedsl.mla.dcp import DcpBox
@@ -62,20 +64,55 @@ def scratch(runtime, name, shape, dtype=torch.bfloat16):
     return runtime.buffers[name]
 
 
+def pack_dsa_projection(attention):
+    """One [q_a | kv_a | gate | wk | wv] weight for a K3.1 DSA layer; the stock
+    projections become views of it."""
+    packed = getattr(attention, "packed_projection", None)
+    if packed is not None:
+        return packed
+    linears = (
+        attention.fused_qkv_a_proj,
+        attention.g_proj,
+        attention.dsa_indexer.wkv_index,
+    )
+    packed = torch.cat([linear.weight.data for linear in linears])
+    row = 0
+    for linear in linears:
+        rows = linear.weight.shape[0]
+        linear.weight.data = packed[row : row + rows]
+        row += rows
+    attention.packed_projection = packed
+    return packed
+
+
+def attention_kind(attention):
+    if hasattr(attention, "in_proj_qkvgfab"):
+        return "kda"
+    return "dsa" if hasattr(attention, "dsa_indexer") else "mla"
+
+
 class Attention:
-    """Input projection -> KDA/MLA core -> o-projection with its fused AttnRes."""
+    """Input projection -> KDA/MLA/DSA core -> o-projection with its fused AttnRes."""
 
     def __init__(self, decoder, runtime, prefetch, mailbox, small_batch, twoshot=None):
         attention, tp = decoder.self_attn, runtime.tp
-        self.kind = kind = "kda" if hasattr(attention, "in_proj_qkvgfab") else "mla"
-        name = "in_proj_qkvgfab" if kind == "kda" else "fused_qkv_a_g_proj"
-        weight = getattr(attention, name).weight
+        self.kind = kind = attention_kind(attention)
+        if kind == "dsa":
+            weight = pack_dsa_projection(attention)
+        else:
+            name = "in_proj_qkvgfab" if kind == "kda" else "fused_qkv_a_g_proj"
+            weight = getattr(attention, name).weight
         pitch = weight.shape[0]
         policies = projection_policies(tp, pitch, runtime.batches)
         split_k = PreparedProjection(weight, policies).prepare()
         self.projection = SkinnyProjection(weight, split_k)
-        self.core: Any  # PreparedKda or PreparedMla
-        if kind == "kda":
+        self.core: Any  # PreparedKda, PreparedMla or PreparedDsa
+        if kind == "dsa":
+            pitches = {b: pitch for b in runtime.batches}
+            rows = dsa_scratch(runtime)
+            policy = dict(queries=runtime.queries, core=runtime.dsa_core)
+            self.core = PreparedDsa(attention, pitches, rows, **policy)
+        elif kind == "kda":
             mode = lambda b: (1 if b == 1 else 2 if b <= 8 else 0) if tp == 8 else 0
             policies = {b: (pitch, mode(b)) for b in runtime.batches}
             q = runtime.q  # verify steps: B requests x q tokens
@@ -100,7 +137,7 @@ class Attention:
             front = small_batch.front_views[parity], small_batch.hint_views[parity]
             front += (small_batch.batches,)
         self.output = PreparedOproj(
-            decoder, mailbox, runtime.batches, kind == "mla", front, twoshot
+            decoder, mailbox, runtime.batches, kind != "kda", front, twoshot
         )
         projected = scratch(runtime, kind + ".projected", (64, pitch))
         local = scratch(runtime, "attention.local", (64, 12288 // tp))
@@ -113,11 +150,21 @@ class Attention:
         else:
             self.core.prepare_cache(caches[0])
 
+    def run_dsa(self, projected, local, caches, metadata, slot_mapping, q):
+        layer = self.layer.self_attn.mla_attn.mla_attn
+        slots = slot_mapping[layer.layer_name]
+        self.core.run(
+            projected, local, cache=caches[0], slots=slots, metadata=metadata, q=q
+        )
+        self.prefetch.fork("attention_moe", self.layer.layer_idx, projected.shape[0])
+
     def run(self, x, out, prefix, blocks, caches, metadata, slot_mapping, q=1):
         b = x.shape[0]
         projected, local = self.storage[b]
         projected = self.projection.run(x, projected)
-        if self.kind == "kda":
+        if self.kind == "dsa":
+            self.run_dsa(projected, local, caches, metadata, slot_mapping, q)
+        elif self.kind == "kda":
             self.prefetch.fork("attention_moe", self.layer.layer_idx, b)
             if q > 1:  # uniform q-token verify rows
                 slots = metadata.spec_state_indices_tensor
@@ -145,6 +192,25 @@ class Attention:
         self.output.run(local, prefix, blocks, out)
         self.prefetch.fork("oproj_down", self.layer.layer_idx, b)
         return out
+
+
+def dsa_scratch(runtime):
+    """The DSA layers' shared rows: the BF16 query (heads past the local ones stay
+    zero), the normalized q_c, the indexer projection, FP8 query and head weights,
+    and the sparse core's latent."""
+    if "dsa.query" not in runtime.buffers:
+        shape = (PREPARED_MAX, QUERY_HEADS, 576)
+        runtime.buffers["dsa.query"] = torch.zeros(
+            shape, device=runtime.device, dtype=torch.bfloat16
+        )
+    return (
+        runtime.buffers["dsa.query"],
+        scratch(runtime, "dsa.qc", (PREPARED_MAX, 1536)),
+        scratch(runtime, "dsa.iq", (PREPARED_MAX, HEADS * DIM)),
+        scratch(runtime, "dsa.q_fp8", (PREPARED_MAX, HEADS, DIM), torch.uint8),
+        scratch(runtime, "dsa.weights", (PREPARED_MAX, HEADS), torch.float32),
+        scratch(runtime, "dsa.latent", (PREPARED_MAX, QUERY_HEADS, 512)),
+    )
 
 
 def dcp_box(runtime, heads):

@@ -49,6 +49,11 @@ NEXT_ATTENTION = {8: "1:96.100,2-3:96,4-7:64,8:32", 16: "1-8:1024"}
 
 def attention_weights(attention):
     """Next-attention weights in their consumption order."""
+    packed = getattr(attention, "packed_projection", None)
+    if packed is not None:  # K3.1 DSA
+        layer, wq = attention.mla_attn.mla_attn, attention.dsa_indexer.wq_index
+        query = (packed, attention.q_b_proj.weight, layer.W_UK_T, wq.weight)
+        return (*query, layer.W_UV, attention.o_proj.weight)
     names = (
         *("in_proj_qkvgfab", "fused_qkv_a_g_proj", "fused_qkv_a_proj", "q_proj"),
         *("kv_a_proj_with_mqa", "f_b_proj", "q_b_proj", "g_proj"),

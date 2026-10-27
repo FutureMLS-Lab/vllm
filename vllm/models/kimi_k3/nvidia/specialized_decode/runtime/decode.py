@@ -26,7 +26,14 @@ from ..cutedsl.moe.small_batch import chain as small_batch_chain
 from ..cutedsl.moe.tail_runtime import MoeTailBox, PreparedTail
 from ..cutedsl.oproj.prepared import OprojMailbox
 from .prefetch import PrefetchController
-from .providers import BATCHES, PREPARED_MAX, Attention, pack_front
+from .providers import (
+    BATCHES,
+    PREPARED_MAX,
+    Attention,
+    attention_kind,
+    pack_dsa_projection,
+    pack_front,
+)
 
 
 class Step(NamedTuple):
@@ -35,7 +42,14 @@ class Step(NamedTuple):
     slot_mapping: Any
 
 
+def attention_layer(module):
+    """The registered attention layer of a decoder's attention: a K3.1 DSA layer's
+    inner sparse MLA layer, else the module itself."""
+    return module.mla_attn.mla_attn if hasattr(module, "dsa_indexer") else module
+
+
 def layer_name(module):
+    module = attention_layer(module)
     return getattr(module, "prefix", getattr(module, "layer_name", None))
 
 
@@ -66,7 +80,7 @@ def is_uniform_verify(md, q, b):
 
 
 def caches_of(attention):
-    cache = getattr(attention, "kv_cache", ())
+    cache = getattr(attention_layer(attention), "kv_cache", ())
     return [cache] if isinstance(cache, torch.Tensor) else list(cache)
 
 
@@ -85,6 +99,7 @@ class SpecializedDecode:
         self.queries = (1, q) if q > 1 else (1,)
         # The longest sequence the deployment serves bounds the MLA split count.
         self.max_context, self.mla_core = config.max_context, config.mla_core
+        self.dsa_core = config.dsa_core
         # Decode context parallel over the TP ranks: MLA KV is sequence-sharded.
         self.dcp, self.dcp_box, self.mla_layers = config.dcp, None, 0
         group = get_tp_group()
@@ -134,6 +149,9 @@ class SpecializedDecode:
         packed = {
             d.layer_idx: pack_front(d.mlp, rank, tp) for d in layers if d.is_moe_layer
         }
+        for d in layers:  # before the prefetch tables take the weight addresses
+            if attention_kind(d.self_attn) == "dsa":
+                pack_dsa_projection(d.self_attn)
         prefetch = self.prefetch = PrefetchController(self, layers, packed)
         state = MoEScratch(tp, device, batches)
         mailbox, tail_box, moe_layers = (

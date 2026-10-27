@@ -10,6 +10,7 @@ from dataclasses import dataclass
 class DecodeConfig:
     max_context: int
     mla_core: str
+    dsa_core: str
     dcp: int
     # Tokens per request in a verify step (1 + draft tokens; 1 without speculation).
     q: int
@@ -32,6 +33,7 @@ def specialized_decode_config(vllm_config) -> DecodeConfig | None:
     return DecodeConfig(
         max_context=vllm_config.model_config.max_model_len,
         mla_core=extra.get("mla_core", "auto"),
+        dsa_core=extra.get("dsa_core", "auto"),
         dcp=vllm_config.parallel_config.decode_context_parallel_size,
         q=1 + spec.num_speculative_tokens if spec is not None else 1,
         capture_sizes=tuple(
@@ -76,6 +78,8 @@ def unsupported(vllm_config) -> str | None:
     )
     compilation = vllm_config.compilation_config
     graphs = compilation.cudagraph_mode
+    # Kimi K3.1: sparse (DSA) MLA layers over the merged fp8_ds_mla + indexer cache.
+    dsa = getattr(text, "dsa_config", None) is not None
     checks = (
         (not current_platform.is_device_capability_family(100), "this GPU (SM100/103)"),
         (
@@ -130,6 +134,14 @@ def unsupported(vllm_config) -> str | None:
         (
             spec is not None and envs.VLLM_KIMI_K3_AUX_ATTN_RES_STREAM,
             "the AttnRes aux stream",
+        ),
+        (
+            dsa and parallel.decode_context_parallel_size > 1,
+            "decode context parallel with DSA layers (Kimi K3.1)",
+        ),
+        (
+            dsa and vllm_config.cache_config.cache_dtype != "fp8_ds_mla",
+            "DSA layers on KV cache dtypes other than fp8_ds_mla",
         ),
     )
     return next((reason for failed, reason in checks if failed), None)
