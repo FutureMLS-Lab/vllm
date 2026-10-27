@@ -253,6 +253,10 @@ class DeepGemmMegaMoEExperts(nn.Module):
         weight_format: Routed-expert precision, a row of the feature matrix.
         shared_experts: Shared MLP to fuse if it is unsharded and in one of
             the ``weight_format.shared`` precisions; ``None`` never fuses.
+        max_num_tokens: Most tokens one rank passes per launch, which sizes the
+            symmetric buffer. Defaults to ``max_num_batched_tokens``; callers
+            that shard tokens across ranks first (sequence parallel) pass
+            their per-rank bound.
 
     """
 
@@ -274,6 +278,7 @@ class DeepGemmMegaMoEExperts(nn.Module):
         shared_experts: nn.Module | None = None,
         num_logical_experts: int | None = None,
         fast_math: bool = True,
+        max_num_tokens: int | None = None,
         prefix: str = "",
     ):
         super().__init__()
@@ -301,7 +306,11 @@ class DeepGemmMegaMoEExperts(nn.Module):
         self.top_k = top_k
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
-        self.max_num_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+        self.max_num_tokens = (
+            max_num_tokens
+            if max_num_tokens is not None
+            else vllm_config.scheduler_config.max_num_batched_tokens
+        )
         self.weight_format = weight_format
         self.activation = activation
         self.fast_math = fast_math

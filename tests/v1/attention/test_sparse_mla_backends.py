@@ -945,6 +945,51 @@ def test_sparse_backend_decode_correctness(
         torch.testing.assert_close(backend_output, sdpa_reference, rtol=0.01, atol=0.01)
 
 
+@pytest.mark.parametrize("batch_name", ["large_q_prefill", "large_q_pure_prefill"])
+def test_flashmla_sparse_mixed_batch_chunks_long_steps(
+    default_vllm_config, dist_init, workspace_init, batch_name, monkeypatch
+):
+    """DeepSeek-layout heads at TP8 (16 per rank, e.g. Kimi K3.1 prefill) take
+    the fp8 mixed-batch path; a small chunk size splits each step across
+    several kernel calls, with a ragged tail chunk."""
+    chunk_tokens = 96
+    monkeypatch.setattr(
+        "vllm.v1.attention.backends.mla.flashmla_sparse.FP8_MIXED_BATCH_CHUNK_TOKENS",
+        chunk_tokens,
+    )
+    call_tokens: list[int] = []
+    fp8_kernel = FlashMLASparseImpl._fp8_flash_mla_kernel
+
+    def counting_fp8_kernel(self, q, *args, **kwargs):
+        call_tokens.append(q.shape[1])
+        return fp8_kernel(self, q, *args, **kwargs)
+
+    monkeypatch.setattr(
+        FlashMLASparseImpl, "_fp8_flash_mla_kernel", counting_fp8_kernel
+    )
+    test_sparse_backend_decode_correctness(
+        default_vllm_config,
+        dist_init,
+        FlashMLASparseBackend,
+        batch_name,
+        "fp8_ds_mla",
+        8,
+        64,
+        workspace_init,
+        1.0,
+        1.0,
+        128,
+        128,
+        64,
+        128,
+        monkeypatch,
+    )
+    total_tokens = sum(SPARSE_BACKEND_BATCH_SPECS[batch_name].query_lens)
+    assert sum(call_tokens) == total_tokens
+    assert len(call_tokens) == cdiv(total_tokens, chunk_tokens)
+    assert max(call_tokens) == chunk_tokens
+
+
 @pytest.mark.parametrize(
     ("backend_cls", "kv_cache_dtype", "block_size", "block_stride_rows", "head_dims"),
     [

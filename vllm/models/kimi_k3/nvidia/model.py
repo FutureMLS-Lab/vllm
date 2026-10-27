@@ -522,6 +522,12 @@ class KimiMoE(nn.Module):
                     f"EP size {ep_size}."
                 )
             num_local_experts = num_experts // ep_size
+            # Under sequence parallel each rank routes only its token shard;
+            # sizing the symmetric buffer for the whole batch would reserve
+            # tp_size times the memory (~16 GiB at 32k tokens on TP8).
+            max_num_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+            if use_sequence_parallel:
+                max_num_tokens = cdiv(max_num_tokens, self.tp_size)
             self.experts = DeepGemmMegaMoEExperts(
                 vllm_config,
                 num_experts=num_experts,
@@ -536,6 +542,7 @@ class KimiMoE(nn.Module):
                     beta=activation_situ_linear_beta or 0.0,
                 ),
                 weight_format=MEGA_MOE_MXFP4,
+                max_num_tokens=max_num_tokens,
                 prefix=f"{prefix}.experts",
             )
         else:

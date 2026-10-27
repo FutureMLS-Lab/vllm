@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, ClassVar
 
 import numpy as np
@@ -77,6 +77,22 @@ logger = init_logger(__name__)
 # so when the per-rank head count is below MIN_HEADS_FOR_BF16_PREFILL we use the mixed
 # batch mode (#1).
 MIN_HEADS_FOR_BF16_PREFILL = 32
+
+# Mixed batch mode runs prefill steps through the decode kernel, whose transient
+# memory grows with the token count; longer steps run in chunks of this many
+# tokens (~1% slower than one call at 32k tokens on B300, ~1/4 the memory).
+FP8_MIXED_BATCH_CHUNK_TOKENS = 8192
+
+
+def use_fp8_mixed_batch(
+    num_heads: int, use_hisparse: bool, pcp_dcp_kv_gather: bool
+) -> bool:
+    return (
+        num_heads < MIN_HEADS_FOR_BF16_PREFILL
+        and not use_hisparse
+        and not pcp_dcp_kv_gather
+    )
+
 
 """
 NOTE: FlashMLA Sparse uses an fp8 cache with the following format
@@ -298,6 +314,10 @@ class FlashMLASparseMetadata(SparseMLACommonMetadata):
         scheduler_metadata: FlashMLASchedMeta
         dummy_block_table: torch.Tensor
         cache_lens: torch.Tensor
+        # Mixed-batch chunks, keyed by chunk length; shared across layers.
+        chunk_scheduler_metadata: dict[int, FlashMLASchedMeta] = field(
+            default_factory=dict
+        )
 
     @dataclass
     class FP8SeparatePrefillDecode:
@@ -453,10 +473,8 @@ class FlashMLASparseMetadataBuilder(
         # PCP+DCP attends prefill rows over the DCP-gathered KV, which only the
         # separate prefill/decode path can do.
         self.pcp_dcp_kv_gather = self.use_pcp and self.dcp_world_size > 1
-        self.fp8_use_mixed_batch = (
-            self.num_heads < MIN_HEADS_FOR_BF16_PREFILL
-            and not self.use_hisparse
-            and not self.pcp_dcp_kv_gather
+        self.fp8_use_mixed_batch = use_fp8_mixed_batch(
+            self.num_heads, self.use_hisparse, self.pcp_dcp_kv_gather
         )
 
         if parallel_config.decode_context_parallel_size > 1:
@@ -804,18 +822,29 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
             )
 
         self.pcp_dcp_kv_gather = False
+        self.fp8_use_mixed_batch = False
         self.workspace_specs: list[tuple[tuple[int, ...], torch.dtype]] = [
             (q_concat_shape, torch.bfloat16)
         ]
         if kv_cache_dtype in QUANTIZED_DS_MLA_CACHE_FORMATS:
-            # Reserve workspace during initialization
             assert vllm_config is not None and vllm_config.model_config is not None
-            prefill_workspace_size = get_prefill_workspace_size(vllm_config)
             parallel_config = vllm_config.parallel_config
             self.pcp_dcp_kv_gather = (
                 parallel_config.prefill_context_parallel_size > 1
                 and parallel_config.decode_context_parallel_size > 1
             )
+            # Same decision as the metadata builder.
+            self.fp8_use_mixed_batch = use_fp8_mixed_batch(
+                num_heads,
+                vllm_config.attention_config.hisparse_config is not None,
+                self.pcp_dcp_kv_gather,
+            )
+        if kv_cache_dtype in QUANTIZED_DS_MLA_CACHE_FORMATS and (
+            not self.fp8_use_mixed_batch
+        ):
+            # Reserve the BF16 prefill workspace during initialization. Mixed
+            # batch mode attends straight from the fp8 cache and never uses it.
+            prefill_workspace_size = get_prefill_workspace_size(vllm_config)
             shard_rows = prefill_workspace_size
             if self.pcp_dcp_kv_gather:
                 # PCP+DCP upconverts this rank's KV shard, then all-gathers the
@@ -844,6 +873,33 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
         # Reserve capacity without retaining views that prevent old storage
         # from being released when another layer grows the shared workspace.
         current_workspace_manager().get_simultaneous(*self.workspace_specs)
+
+        # Transient peak of one mixed-batch kernel call, claimed in the profile
+        # run (which returns before attention). flash_mla_with_kvcache sizes
+        # its split-KV accumulators by b + num_sm_parts splits.
+        self.mixed_batch_profile_bytes = 0
+        if self.fp8_use_mixed_batch:
+            chunk = min(max_tokens, FP8_MIXED_BATCH_CHUNK_TOKENS)
+            heads = self.fp8_decode_padded_heads
+            num_splits = 1 + max(1, num_compute_units() // chunk)
+            per_token = (
+                heads * self.q_head_size * 2  # head-padded Q
+                + heads * 512 * 2  # output
+                + heads * 4  # LSE
+                + num_splits * heads * (512 + 1) * 4  # o_accum, lse_accum
+            )
+            self.mixed_batch_profile_bytes = chunk * per_token
+            if max_tokens > chunk:
+                # The chunked path's assembled output.
+                self.mixed_batch_profile_bytes += max_tokens * num_heads * 512 * 2
+
+    def reserve_workspace(self) -> None:
+        if self.mixed_batch_profile_bytes > 0:
+            _ = torch.empty(
+                self.mixed_batch_profile_bytes,
+                dtype=torch.uint8,
+                device=current_platform.device_type,
+            )
 
     def _forward_bf16_kv(
         self,
@@ -1270,20 +1326,45 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
                     NUM_TOPK_TOKENS=topk_indices.shape[1],
                 )
 
-        _attn_out, _lse = self._fp8_flash_mla_kernel(
-            q=q.unsqueeze(0),  # unsqueeze to add batch_dim: (T, H, D) -> (1, T, H, D)
-            kv_c_and_k_pe_cache=kv_pages,
-            topk_indices=topk_indices.unsqueeze(0),  # (T, topk) -> (1, T, topk)
-            kernel_metadata=fp8_metadata,
-        )
-        # Output is (1, T, H, D_v), squeeze back to (T, H, D_v)
-        out = _attn_out.squeeze(0)
+        num_tokens = q.shape[0]
+        if num_tokens <= FP8_MIXED_BATCH_CHUNK_TOKENS:
+            _attn_out, _lse = self._fp8_flash_mla_kernel(
+                q=q.unsqueeze(0),  # add batch_dim: (T, H, D) -> (1, T, H, D)
+                kv_c_and_k_pe_cache=kv_pages,
+                topk_indices=topk_indices.unsqueeze(0),  # (T, topk) -> (1, T, topk)
+                kernel_metadata=fp8_metadata,
+            )
+            # Output is (1, T, H, D_v), squeeze back to (T, H, D_v)
+            out = _attn_out.squeeze(0)
+            _lse = _lse.squeeze(0)
+        else:
+            # The kernel's head-padded Q, output and split-KV accumulators grow
+            # with the token count (~400 KB per token at 64 padded heads), so
+            # long prefill steps run in chunks. Tokens attend independently
+            # (sparse indices), so chunking does not change the result.
+            out = q.new_empty((num_tokens, q.shape[1], 512))
+            _lse = q.new_empty((q.shape[1], num_tokens), dtype=torch.float32)
+            chunk_metas = fp8_metadata.chunk_scheduler_metadata
+            for start in range(0, num_tokens, FP8_MIXED_BATCH_CHUNK_TOKENS):
+                end = min(num_tokens, start + FP8_MIXED_BATCH_CHUNK_TOKENS)
+                # A scheduler metadata is reusable only for one query shape.
+                if (sched := chunk_metas.get(end - start)) is None:
+                    sched = chunk_metas[end - start] = get_mla_metadata()[0]
+                chunk_out, chunk_lse = self._fp8_flash_mla_kernel(
+                    q=q[start:end].unsqueeze(0),
+                    kv_c_and_k_pe_cache=kv_pages,
+                    topk_indices=topk_indices[start:end].unsqueeze(0),
+                    kernel_metadata=replace(fp8_metadata, scheduler_metadata=sched),
+                )
+                out[start:end] = chunk_out[0]
+                _lse[:, start:end] = chunk_lse[0]
+                del chunk_out, chunk_lse
 
         if not self.need_to_return_lse_for_decode:
             return out, None
 
-        # Kernel LSE is (1, H, T); the DCP merge consumes (T, H).
-        lse = _lse.squeeze(0).transpose(0, 1)
+        # Kernel LSE is (H, T); the DCP merge consumes (T, H).
+        lse = _lse.transpose(0, 1)
         # Rows where this rank owns none of the selected tokens (all indices
         # -1) have undefined out/lse; (0, -inf) is the identity element of the
         # cross-rank LSE merge, so it drops this rank from those rows.
