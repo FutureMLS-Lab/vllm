@@ -11,6 +11,7 @@ from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     per_token_group_quant_fp8,
 )
 from vllm.models.kimi_k3.nvidia.ops.dsa_indexer import (
+    dsa_fused_prologue,
     indexer_k_norm_quant_insert,
     indexer_q_quant_fold_weights,
 )
@@ -151,3 +152,111 @@ def test_q_quant_fold_weights_matches_unfused(num_heads: int, num_tokens: int):
     if padded != num_heads:
         assert torch.count_nonzero(q_fp8[:, num_heads:].view(torch.uint8)) == 0
         assert torch.count_nonzero(weights[:, num_heads:]) == 0
+
+
+Q_LORA = 1536
+KV_LORA = 512
+ROPE = 64
+
+
+def _rms_norm_ref(x: torch.Tensor, w: torch.Tensor, eps: float) -> torch.Tensor:
+    xf = x.float()
+    y = xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + eps) * w.float()
+    return y.to(x.dtype)
+
+
+def _dsa_caches(merged: bool, num_blocks: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """(fp8_ds_mla cache, indexer cache) views, both sections of one unit when
+    merged."""
+    if not merged:
+        mla = torch.zeros(
+            num_blocks, BLOCK, MLA_BYTES, dtype=torch.uint8, device="cuda"
+        )
+        return mla, _make_cache(False, num_blocks)[1]
+    raw, index = _make_cache(True, num_blocks)
+    return torch.as_strided(
+        raw, (num_blocks, BLOCK, MLA_BYTES), (UNIT_STRIDE, MLA_BYTES, 1)
+    ), index
+
+
+@pytest.mark.parametrize("merged", [False, True])
+@pytest.mark.parametrize("num_tokens", [1, 7, 300])
+@torch.inference_mode()
+def test_fused_prologue_matches_unfused(merged: bool, num_tokens: int):
+    """dsa_fused_prologue == q/kv RMSNorm + fp8_ds_mla insert + indexer key insert
+    + top-k fill, on strided views of the projection outputs."""
+    torch.manual_seed(0)
+    num_blocks = (num_tokens + 2 * BLOCK - 1) // BLOCK + 1
+    qkv = torch.randn(
+        num_tokens, Q_LORA + KV_LORA + ROPE, dtype=torch.bfloat16, device="cuda"
+    )
+    q_c, kv_c, k_pe = qkv.split([Q_LORA, KV_LORA, ROPE], dim=-1)
+    k = torch.randn(
+        num_tokens, HEAD_DIM + NUM_HEADS, dtype=torch.bfloat16, device="cuda"
+    )[:, :HEAD_DIM]
+    q_w = torch.rand(Q_LORA, dtype=torch.bfloat16, device="cuda") + 0.5
+    kv_w = torch.rand(KV_LORA, dtype=torch.bfloat16, device="cuda") + 0.5
+    k_w = torch.rand(HEAD_DIM, dtype=torch.float32, device="cuda") + 0.5
+    k_b = torch.randn(HEAD_DIM, dtype=torch.float32, device="cuda") * 0.1
+    eps = 1e-6
+    # Fewer slots than rows (cudagraph padding), plus a padded (-1) slot.
+    num_slots = max(num_tokens - 1, 1)
+    slots = torch.randperm(num_blocks * BLOCK, device="cuda")[:num_slots]
+    if num_slots > 2:
+        slots[1] = -1
+    slots = slots.to(torch.int64)
+
+    ref_mla, ref_index = _dsa_caches(merged, num_blocks)
+    ref_kv = _rms_norm_ref(kv_c, kv_w, eps)
+    ops.concat_and_cache_mla(
+        ref_kv[:num_slots].contiguous(),
+        k_pe[:num_slots].contiguous(),
+        ref_mla,
+        slots,
+        "fp8_ds_mla",
+        torch.ones(1, dtype=torch.float32, device="cuda"),
+    )
+    ref_k = F.layer_norm(k.float(), (HEAD_DIM,), k_w, k_b, eps).to(k.dtype)
+    ops.indexer_k_quant_and_cache(
+        ref_k[:num_slots].contiguous(),
+        ref_index,
+        slots,
+        HEAD_DIM,
+        "mxfp8" if mqa_logits_use_mx_scales() else "ue8m0",
+    )
+
+    mla, index = _dsa_caches(merged, num_blocks)
+    topk = torch.full((num_tokens + 5, TOPK), 7, dtype=torch.int32, device="cuda")
+    q_out, kv_out = dsa_fused_prologue(
+        q_c, kv_c, k_pe, k, q_w, kv_w, k_w, k_b, eps, topk, mla, slots, index, slots
+    )
+
+    # Only reduction order differs, so bytes match except for rare bf16 ties.
+    torch.testing.assert_close(
+        q_out, _rms_norm_ref(q_c, q_w, eps), atol=2e-2, rtol=2e-2
+    )
+    torch.testing.assert_close(kv_out, ref_kv, atol=2e-2, rtol=2e-2)
+    mismatch = (mla != ref_mla).float().mean().item()
+    assert mismatch < 2e-3, f"{mismatch:.2e} of MLA cache bytes differ"
+    torch.testing.assert_close(
+        _dequant(index), _dequant(ref_index), atol=0.07, rtol=0.07
+    )
+    assert torch.all(topk[:num_tokens] == -1)
+    assert torch.all(topk[num_tokens:] == 7)
+
+
+@torch.inference_mode()
+def test_fused_prologue_without_caches():
+    """Profile / dummy runs: norms only, no cache access."""
+    qkv = torch.randn(3, Q_LORA + KV_LORA + ROPE, dtype=torch.bfloat16, device="cuda")
+    q_c, kv_c, k_pe = qkv.split([Q_LORA, KV_LORA, ROPE], dim=-1)
+    k = torch.randn(3, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
+    w = torch.ones(Q_LORA, dtype=torch.bfloat16, device="cuda")
+    kn = torch.ones(HEAD_DIM, dtype=torch.float32, device="cuda")
+    topk = torch.zeros(3, TOPK, dtype=torch.int32, device="cuda")
+    q_out, kv_out = dsa_fused_prologue(
+        q_c, kv_c, k_pe, k, w, w[:KV_LORA], kn, kn, 1e-6, topk,
+        None, None, None, None,
+    )  # fmt: skip
+    torch.testing.assert_close(q_out, _rms_norm_ref(q_c, w, 1e-6))
+    torch.testing.assert_close(kv_out, _rms_norm_ref(kv_c, w[:KV_LORA], 1e-6))

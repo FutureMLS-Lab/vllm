@@ -28,6 +28,7 @@ from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
+    UnquantizedLinearMethod,
 )
 from vllm.model_executor.layers.mla import (
     MLAModules,
@@ -36,13 +37,24 @@ from vllm.model_executor.layers.mla import (
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
+from vllm.model_executor.utils import is_weights_pre_processed
 from vllm.models.kimi_k3.nvidia.index_rope import index_rope
+from vllm.models.kimi_k3.nvidia.low_latency_gemm import (
+    low_latency_linear,
+    request_low_latency_warmup,
+)
+from vllm.models.kimi_k3.nvidia.mla import (
+    _GATE_MULTI_STREAM_TOKEN_THRESHOLD,
+    _gate_sigmoid_mul,
+)
 from vllm.models.kimi_k3.nvidia.ops.dsa_indexer import (
+    dsa_fused_prologue,
     indexer_k_norm_quant_insert,
     indexer_q_quant_fold_weights,
 )
 from vllm.platforms import current_platform
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
+from vllm.utils.multi_stream_utils import maybe_execute_in_parallel
 from vllm.utils.torch_utils import _encode_layer_name
 from vllm.v1.attention.backends.mla import indexer as v32_indexer
 
@@ -301,6 +313,17 @@ class KimiK3DSAIndexer(nn.Module):
                 index_q, index_k = self._apply_index_rope(
                     index_q, index_k, positions, rotary_emb
                 )
+        return self.score(hidden_states, index_q, index_weights, index_k)
+
+    def score(
+        self,
+        hidden_states: torch.Tensor,
+        index_q: torch.Tensor,
+        index_weights: torch.Tensor,
+        index_k: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Top-k of the current rows into ``topk_indices_buffer``; ``index_k`` is
+        None when the key was already inserted (``use_fused_k_insert``)."""
         q_fp8, weights = indexer_q_quant_fold_weights(
             index_q,
             index_weights,
@@ -364,6 +387,7 @@ class KimiK3DSAAttention(nn.Module):
         reduce_results: bool = True,
         topk_indices_buffer: torch.Tensor | None = None,
         dense_draft: bool = False,
+        aux_stream: torch.cuda.Stream | None = None,
     ) -> None:
         super().__init__()
         if config.dsa_config is None:
@@ -646,9 +670,162 @@ class KimiK3DSAAttention(nn.Module):
             mla_layer.ds_index_head_dim = self.index_head_dim
             mla_layer.ds_indexer_layer_name = self.dsa_indexer.k_cache.prefix
 
+        self.dense_draft = dense_draft
+        offload = vllm_config.offload_config
+        self.weights_offloaded = (
+            offload.uva.cpu_offload_gb > 0 or offload.prefetch.offload_group_size > 0
+        )
+        self.aux_stream = aux_stream
+        self._gate_events: tuple[torch.cuda.Event, torch.cuda.Event] | None = None
+        # Set by pack_projections(): the packed input and query weights.
+        self._packed: list[torch.Tensor] | None = None
+
+    def pack_projections(self) -> None:
+        """Enable the fused forward (as DeepseekV32Attention): pack
+        ``[q_a | kv_a | wk | weights_proj]`` and ``[q_b | wq_index]`` into one
+        weight each, the linears becoming views. Other configurations keep the
+        wrapper forward."""
+        attn = cast(Any, self.mla_attn.mla_attn)
+        indexer = cast(Any, self.dsa_indexer)
+        if not (
+            not self.dense_draft
+            and indexer.use_fused_k_insert
+            and indexer.dcp_world_size == 1
+            and self.q_lora_rank is not None
+            and self.use_nope
+            and hasattr(self, "g_proj")
+            and attn.kv_cache_dtype == "fp8_ds_mla"
+            and attn.hisparse_cache is None
+            and not is_weights_pre_processed()
+            and not self.weights_offloaded
+            # The fused prologue takes one eps for all three norms.
+            and self.q_a_layernorm.variance_epsilon
+            == self.kv_a_layernorm.variance_epsilon
+            == indexer.k_index_norm.eps
+        ):
+            return
+        groups = (
+            (self.fused_qkv_a_proj, indexer.wkv_index),
+            (self.q_b_proj, indexer.wq_index),
+        )
+        if not all(
+            isinstance(linear.quant_method, UnquantizedLinearMethod)
+            for linears in groups
+            for linear in linears
+        ):
+            return
+        self._packed = []
+        for linears in groups:
+            packed = torch.cat([linear.weight.data for linear in linears])
+            rows = [linear.weight.shape[0] for linear in linears]
+            for linear, view in zip(linears, packed.split(rows)):
+                linear.weight.data = view
+            request_low_latency_warmup(packed)
+            self._packed.append(packed)
+        if self.aux_stream is not None:
+            self._gate_events = (torch.cuda.Event(), torch.cuda.Event())
+        logger.info_once("Kimi K3.1 DSA layers use the fused forward.")
+
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-        return self.mla_attn(positions, hidden_states)
+        if self._packed is None:
+            return self.mla_attn(positions, hidden_states)
+        # As in the dense Kimi-K3 MLA: the output-gate GEMM overlaps the
+        # attention front-end on the aux stream for small batches.
+        if (
+            self._gate_events is not None
+            and hidden_states.shape[0] < _GATE_MULTI_STREAM_TOKEN_THRESHOLD
+        ):
+            attn_out, gate = maybe_execute_in_parallel(
+                lambda: self._fused_attention(hidden_states),
+                lambda: self.g_proj(hidden_states)[0],
+                *self._gate_events,
+                self.aux_stream,
+            )
+        else:
+            attn_out = self._fused_attention(hidden_states)
+            gate = self.g_proj(hidden_states)[0]
+        return self.o_proj(_gate_sigmoid_mul(attn_out, gate))[0]
+
+    def _fused_attention(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        assert self.q_lora_rank is not None and self._packed is not None
+        indexer = cast(KimiK3DSAIndexer, self.dsa_indexer)
+        attn = cast(Any, self.mla_attn.mla_attn)
+        input_weight, query_weight = self._packed
+        q_c, kv_c, k_pe, index_k, index_weights = low_latency_linear(
+            hidden_states, input_weight
+        ).split(
+            [
+                self.q_lora_rank,
+                self.kv_lora_rank,
+                self.qk_rope_head_dim,
+                indexer.index_head_dim,
+                indexer.index_num_heads,
+            ],
+            dim=-1,
+        )
+
+        # Profile / dummy runs have no metadata and leave both caches alone.
+        caches: tuple = (None, None, None, None)
+        has_prefills = False
+        forward_context = get_forward_context()
+        attn_metadata = forward_context.attn_metadata
+        if isinstance(attn_metadata, dict) and attn.kv_cache.numel() > 0:
+            assert isinstance(forward_context.slot_mapping, dict)
+            has_prefills = cast(Any, attn_metadata[attn.layer_name]).num_prefills > 0
+            index_metadata = attn_metadata[indexer.k_cache.prefix]
+            assert isinstance(index_metadata, v32_indexer.DeepseekV32IndexerMetadata)
+            caches = (
+                attn.kv_cache,
+                forward_context.slot_mapping[attn.layer_name],
+                indexer.k_cache.kv_cache,
+                index_metadata.slot_mapping,
+            )
+        assert indexer.topk_indices_buffer is not None
+        k_norm = cast(KimiK3DSAIndexerKNorm, indexer.k_index_norm)
+        # One eps for the three norms (equal, checked in pack_projections).
+        q_c, kv_c_normed = dsa_fused_prologue(
+            q_c,
+            kv_c,
+            k_pe,
+            index_k,
+            self.q_a_layernorm.weight,
+            self.kv_a_layernorm.weight,
+            k_norm.weight,
+            k_norm.bias,
+            k_norm.eps,
+            indexer.topk_indices_buffer,
+            *caches,
+        )
+
+        q, index_q = low_latency_linear(q_c, query_weight).split(
+            [
+                self.num_local_heads * self.qk_head_dim,
+                indexer.index_num_heads * indexer.index_head_dim,
+            ],
+            dim=-1,
+        )
+        q = q.view(-1, self.num_local_heads, self.qk_head_dim)
+        if has_prefills:
+            # q is a column slice; some MHA prefill backends need it contiguous.
+            q = q.contiguous()
+        index_q = index_q.view(-1, indexer.index_num_heads, indexer.index_head_dim)
+        indexer.score(hidden_states, index_q, index_weights, None)
+        attn.impl.record_logical_topk_ready()
+
+        output = torch.empty(
+            (hidden_states.shape[0], self.num_local_heads * self.v_head_dim),
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+        torch.ops.vllm.unified_mla_attention_with_output(
+            q,
+            kv_c_normed,
+            k_pe.unsqueeze(1),
+            output,
+            _encode_layer_name(attn.layer_name),
+        )
+        return output

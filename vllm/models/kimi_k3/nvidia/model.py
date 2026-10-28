@@ -771,6 +771,7 @@ class KimiDecoderLayer(nn.Module):
                     prefix=f"{prefix}.self_attn",
                     topk_indices_buffer=topk_indices_buffer,
                     dense_draft=not is_dsa_layer,
+                    aux_stream=aux_stream,
                 )
             # q_lora_rank may be None (Kimi-Linear): the MLA layer then uses an
             # uncompressed q_proj instead of the fused q-LoRA front-end.
@@ -1546,6 +1547,13 @@ class KimiLinearForCausalLM(
         # applies it in forward.
         self.needs_norm_in_logits = True
 
+    def process_weights_after_loading(self) -> None:
+        # The specialized decode packs the DSA projections its own way.
+        if self.specialized_decode_config is None:
+            for module in self.model.modules():
+                if isinstance(module, KimiK3DSAAttention):
+                    module.pack_projections()
+
     def build_specialized_decode(self) -> None:
         from .specialized_decode.runtime.decode import SpecializedDecode
 
@@ -1803,6 +1811,9 @@ class KimiK3ForConditionalGeneration(
             self.language_model.make_empty_intermediate_tensors
         )
         self.media_placeholder: int = self.config.media_placeholder_token_id
+
+    def process_weights_after_loading(self) -> None:
+        self.language_model.process_weights_after_loading()
 
     # -- SupportsEncoderCudaGraph protocol methods --
 

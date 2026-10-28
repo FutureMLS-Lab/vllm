@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 import vllm.envs as envs
@@ -325,6 +326,27 @@ KIMI_K3_PROJECTIONS: dict[tuple[int, int], ProjectionSpec] = {
             (4, _cute(4, 64, 4, 1)),
         ),
         name="lm_head",
+    ),
+    # Kimi K3.1 DSA packed projections: [q_a | kv_a | wk | weights_proj] at any
+    # TP, and [q_b | wq_index] at TP1 / TP8. Packed cuBLAS already beats the
+    # separate GEMMs at M1..16; CuTe wins >=5% over it only where listed.
+    (2272, 7168): ProjectionSpec(
+        2272,
+        7168,
+        cute_configs=(
+            (1, _cute(1, 224, 4, 2)),
+            (2, _cute(2, 224, 4, 2)),
+            (3, _cute(3, 128, 2, 2)),
+            (4, _cute(4, 224, 4, 1)),
+            (5, _cute(5, 128, 2, 1)),
+        ),
+        name="dsa_qkv_a_wkv_proj",
+    ),
+    (22528, 1536): ProjectionSpec(
+        22528, 1536, cute_configs=((1, _cute(1, 32, 8, 2)),), name="dsa_q_b_wq_proj"
+    ),
+    (6400, 1536): ProjectionSpec(
+        6400, 1536, cute_configs=((1, _cute(1, 64, 4, 2)),), name="dsa_q_b_wq_proj"
     ),
     # 7168x2112 (TP16 dense down_proj) has no entry on purpose: K=2112 divides
     # none of the fused-A tile_k values, and the CuTe kernel is left with
@@ -905,6 +927,22 @@ def try_low_latency_gemm(
     if not _residual_ok(x, weight, residual):
         return None
     return _run_residual_plan(_build_residual_plan(spec), x, weight, residual)
+
+
+def low_latency_linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    out = try_low_latency_gemm(x, weight)
+    return out if out is not None else F.linear(x, weight)
+
+
+def request_low_latency_warmup(weight: torch.Tensor) -> None:
+    """Warm up the measured CuTe configs for a weight that no linear module owns
+    (``enable_kimi_k3_low_latency_gemm`` only covers modules)."""
+    table = _low_latency_table()
+    spec = table.get(tuple(weight.shape)) if table is not None else None
+    if spec is not None and shape_dynamic_skinny_gemm.is_available():
+        shape_dynamic_skinny_gemm.request_warmup_configs(
+            weight.dtype, (config for _, config in spec.cute_configs)
+        )
 
 
 class _KimiK3LowLatencyApply:
