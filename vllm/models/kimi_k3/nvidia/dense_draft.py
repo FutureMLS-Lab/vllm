@@ -217,6 +217,10 @@ def _bind_plain_rows(layer: Any, kv_cache: torch.Tensor) -> None:
     # kv_cache: this layer's merged pages, (units, 1, 64, merged row bytes) at the
     # unit stride. Plain fp8 MLA rows, one byte per element.
     row = layer.head_size
+    assert kv_cache.shape[2] * row <= kv_cache.stride(0), (
+        f"dense draft rows ({kv_cache.shape[2]} x {row}B) overflow the "
+        f"{kv_cache.stride(0)}B merged unit"
+    )
     layer.kv_cache = torch.as_strided(
         kv_cache,
         size=(kv_cache.shape[0], kv_cache.shape[2], row),

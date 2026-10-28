@@ -63,7 +63,34 @@ def test_kimi_k31_defaults_draft_attention(method, draft_text_config, expected):
     assert (spec_config.attention_backend, spec_config.kv_cache_dtype) == expected
 
 
-def test_dense_draft_shares_the_target_mla_group_and_pages():
+@pytest.mark.parametrize("cache_dtype", ["fp8_ds_mla", "nvfp4_ds_mla"])
+def test_kimi_k31_accepts_ds_mla_cache_dtypes(cache_dtype):
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(hf_config=K31_TEXT_CONFIG),
+        cache_config=SimpleNamespace(cache_dtype=cache_dtype),
+        speculative_config=None,
+    )
+    KimiK3ForConditionalGenerationConfig.verify_and_update_config(vllm_config)
+    assert vllm_config.cache_config.cache_dtype == cache_dtype
+
+    vllm_config.cache_config.cache_dtype = "bfloat16"
+    with pytest.raises(ValueError, match="fp8_ds_mla and nvfp4_ds_mla"):
+        KimiK3ForConditionalGenerationConfig.verify_and_update_config(vllm_config)
+
+
+@pytest.mark.parametrize(
+    ("cache_dtype", "row_bytes", "unit_bytes"),
+    [
+        # 64 x (656 + 132) = 50432, padded to a multiple of the 656B row.
+        ("fp8_ds_mla", 656, 50512),
+        # 64 x (352 + 132) = 30976 cannot hold the draft's 64 x 576B rows;
+        # padded to 36864 rounded up to the 352B row.
+        ("nvfp4_ds_mla", 352, 36960),
+    ],
+)
+def test_dense_draft_shares_the_target_mla_group_and_pages(
+    cache_dtype, row_bytes, unit_bytes
+):
     # Kimi-K3.1 (69 KDA + 24 merged MLA + indexer layers) plus an EAGLE3 draft.
     vllm_config = SimpleNamespace(
         model_config=SimpleNamespace(
@@ -71,7 +98,7 @@ def test_dense_draft_shares_the_target_mla_group_and_pages():
             hf_text_config=K31_TEXT_CONFIG,
         ),
         cache_config=SimpleNamespace(
-            cache_dtype="fp8_ds_mla",
+            cache_dtype=cache_dtype,
             block_size=1088,
             get_resolved_kv_cache_layout=lambda: SimpleNamespace(
                 is_block_outermost=True
@@ -91,12 +118,13 @@ def test_dense_draft_shares_the_target_mla_group_and_pages():
         block_size=1088,
         mla_head_size=576,
         mla_dtype=torch.uint8,
-        cache_dtype_str="fp8_ds_mla",
+        cache_dtype_str=cache_dtype,
         index_head_size=132,
         index_head_dim=128,
         kernel_block_size=64,
     )
     assert draft_spec == mla
+    assert mla.padded_unit_bytes == unit_bytes
 
     # So it joins the target's MLA group: K3.1 keeps its 4 groups. (That group
     # takes the EAGLE block drop through the draft layer's is_draft tag.)
@@ -119,10 +147,10 @@ def test_dense_draft_shares_the_target_mla_group_and_pages():
 
     # In its own pages it binds 64 plain fp8 MLA rows of 576 B at the head of
     # each unit, at the unit stride; the merged-view split leaves it alone.
-    unit, num_units = mla.padded_unit_bytes, 6
+    unit, num_units, row = mla.padded_unit_bytes, 6, row_bytes + 132
     buf = torch.zeros(num_units, unit, dtype=torch.uint8)
     kv_caches = {
-        "draft": torch.as_strided(buf, (num_units, 1, 64, 788), (unit, unit, 788, 1))
+        "draft": torch.as_strided(buf, (num_units, 1, 64, row), (unit, unit, row, 1))
     }
     split_merged_dsa_cache_views(
         kv_caches, {"draft": draft}, [KVCacheGroupSpec(["draft"], draft_spec)]

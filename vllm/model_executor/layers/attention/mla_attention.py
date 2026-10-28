@@ -3080,10 +3080,26 @@ class MLACommonBaseImpl(MLAAttentionImpl[A], Generic[A]):
 
         output = None
         output_lse = None
-        for chunk in chunked_context.chunks:
+        for i, chunk in enumerate(chunked_context.chunks):
             toks = chunk.num_context_tokens
             chunk_block_table = prefill_metadata.block_table[chunk.request_slice]
-            if self.kv_cache_dtype == "fp8_ds_mla":
+            if self.kv_cache_dtype == "nvfp4_ds_mla":
+                # The prebuilt NVFP4 gather reads each context from its first
+                # token (no seq_starts before vllm-project/vllm#58744), which
+                # only the first context chunk does.
+                if i > 0:
+                    raise NotImplementedError(
+                        "nvfp4_ds_mla: multi-chunk prefill context needs the "
+                        "seq_starts NVFP4 gather (vllm-project/vllm#58744)"
+                    )
+                ops.cp_gather_and_upconvert_nvfp4_kv_cache(
+                    src_cache=kv_c_and_k_pe_cache,
+                    dst=workspace[:toks],
+                    block_table=chunk_block_table,
+                    workspace_starts=chunk.cu_seq_lens,
+                    batch_size=chunk.num_requests,
+                )
+            elif self.kv_cache_dtype == "fp8_ds_mla":
                 ops.cp_gather_and_upconvert_fp8_kv_cache(
                     src_cache=kv_c_and_k_pe_cache,
                     dst=workspace[:toks],

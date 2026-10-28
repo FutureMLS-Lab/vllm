@@ -831,6 +831,10 @@ class MergedMLAIndexerSpec(MLAAttentionSpec):
     multiple of its 656B TMA row width, which the dense 50432B unit
     violates; each unit is tail-padded to 50512B (``padded_unit_bytes``),
     which no kernel ever addresses.
+
+    nvfp4_ds_mla rows are 352 bytes. Their unit is padded to hold 64 plain fp8
+    MLA rows (64 x 576B, rounded up to 352B rows: 36960B), since a dense MLA
+    draft (EAGLE3 / DSpark) binds those at the head of each unit.
     """
 
     # indexer per-token bytes (data + scale), e.g. 132 for head_dim 128.
@@ -854,14 +858,16 @@ class MergedMLAIndexerSpec(MLAAttentionSpec):
         index_head_size: int,
         kernel_block_size: int,
     ) -> int:
-        """Bytes per merged unit, including the TMA tail pad (fp8_ds_mla)."""
-        if cache_dtype_str == "fp8_ds_mla":
-            mla_bytes = DS_MLA_STATE_CONTENT_BYTES[cache_dtype_str]
-        else:
-            mla_bytes = mla_head_size * get_dtype_size(mla_dtype)
+        """Bytes per merged unit, including the tail pad (fp8_ds_mla:
+        TMA row alignment; nvfp4_ds_mla: room for a dense draft's fp8 rows)."""
+        mla_bytes = DS_MLA_STATE_CONTENT_BYTES.get(
+            cache_dtype_str, mla_head_size * get_dtype_size(mla_dtype)
+        )
         unit_bytes = kernel_block_size * (mla_bytes + index_head_size)
-        if cache_dtype_str == "fp8_ds_mla":
-            unit_bytes = round_up(unit_bytes, DS_MLA_STATE_CONTENT_BYTES["fp8_ds_mla"])
+        if cache_dtype_str == "nvfp4_ds_mla":
+            unit_bytes = max(unit_bytes, kernel_block_size * mla_head_size)
+        if cache_dtype_str in DS_MLA_STATE_CONTENT_BYTES:
+            unit_bytes = round_up(unit_bytes, mla_bytes)
         return unit_bytes
 
     @classmethod
@@ -888,10 +894,9 @@ class MergedMLAIndexerSpec(MLAAttentionSpec):
             f"kernel_block_size ({kernel_block_size}); the merged-unit layout "
             "cannot align otherwise"
         )
-        if cache_dtype_str == "fp8_ds_mla":
-            mla_bytes = DS_MLA_STATE_CONTENT_BYTES[cache_dtype_str]
-        else:
-            mla_bytes = mla_head_size * get_dtype_size(mla_dtype)
+        mla_bytes = DS_MLA_STATE_CONTENT_BYTES.get(
+            cache_dtype_str, mla_head_size * get_dtype_size(mla_dtype)
+        )
         padded_unit_bytes = cls.merged_padded_unit_bytes(
             cache_dtype_str,
             mla_head_size,
