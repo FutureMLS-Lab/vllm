@@ -206,6 +206,9 @@ class KimiK3DSAIndexer(nn.Module):
         self.use_pcp = vllm_config.parallel_config.prefill_context_parallel_size > 1
         # Set by KimiK3DSAAttention to skip scoring dense-MHA prefills.
         self.dense_mha_metadata_layer_name = ""
+        # Set by KimiK3DSAAttention when its MLA layer takes ShardQ steps: the
+        # op then follows that layer's token split.
+        self.shardq_layer_name = ""
         self.topk_backend = vllm_config.kernel_config.sparse_indexer_topk_backend
         # PCP gathers the unquantized key inside the op.
         self.use_fused_k_insert = (
@@ -360,6 +363,7 @@ class KimiK3DSAIndexer(nn.Module):
             self.cp_kv_cache_interleave_size,
             skip_topk_buffer_clear=self.use_fused_k_insert,
             topk_backend=self.topk_backend,
+            shardq_layer_name=self.shardq_layer_name,
         )
 
 
@@ -387,6 +391,7 @@ class KimiK3DSAAttention(nn.Module):
         reduce_results: bool = True,
         topk_indices_buffer: torch.Tensor | None = None,
         dense_draft: bool = False,
+        is_mtp_layer: bool = False,
         aux_stream: torch.cuda.Stream | None = None,
     ) -> None:
         super().__init__()
@@ -659,6 +664,13 @@ class KimiK3DSAAttention(nn.Module):
                 indexer.dense_mha_metadata_layer_name = (
                     self.mla_attn.mla_attn.layer_name
                 )
+            # ShardQ (sparse_mla_shard_q): the indexer is not an indexer_op,
+            # so the layer opts in itself, as DeepseekV32Attention does. MTP
+            # layers stay head-sharded, as upstream's DSA MTP layers do.
+            mla_layer = cast(Any, self.mla_attn.mla_attn)
+            if not is_mtp_layer and getattr(mla_layer.impl, "use_shardq", False):
+                mla_layer.use_shardq = True
+                indexer.shardq_layer_name = mla_layer.layer_name
 
         # Merged cache mode (MergedMLAIndexerSpec): the registered MLA layer is
         # the wrapper's inner mla_attn; mark it with the indexer geometry so

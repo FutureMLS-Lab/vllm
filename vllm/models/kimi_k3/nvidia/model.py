@@ -771,6 +771,7 @@ class KimiDecoderLayer(nn.Module):
                     prefix=f"{prefix}.self_attn",
                     topk_indices_buffer=topk_indices_buffer,
                     dense_draft=not is_dsa_layer,
+                    is_mtp_layer=layer_idx >= config.num_hidden_layers,
                     aux_stream=aux_stream,
                 )
             # q_lora_rank may be None (Kimi-Linear): the MLA layer then uses an
