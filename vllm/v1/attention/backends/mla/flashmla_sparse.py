@@ -93,6 +93,10 @@ def fp8_mixed_batch_chunk_tokens(num_heads: int) -> int:
     return max(1, FP8_MIXED_BATCH_CHUNK_TOKENS * 64 // padded_heads)
 
 
+# The fp8 sparse decode kernel runs 64 or 128 query heads.
+FP8_SPARSE_DECODE_MAX_HEADS = 128
+
+
 def use_fp8_mixed_batch(
     num_heads: int, use_hisparse: bool, pcp_dcp_kv_gather: bool
 ) -> bool:
@@ -427,13 +431,7 @@ class FlashMLASparseMetadataBuilder(
             supports_dcp_with_varlen=(parallel_config.cp_kv_cache_interleave_size == 1),
         )
 
-        sm_count = num_compute_units(device.index)
-
         self.num_heads = self.model_config.get_num_attention_heads(parallel_config)
-        # FP8 decode kernel only supports h_q = 64 or 128, so we need to pad
-        self.fp8_decode_padded_heads = (
-            FlashMLASparseImpl._compute_fp8_decode_padded_heads(self.num_heads)
-        )
 
         self.use_fp8_kv_cache = (
             cache_config.cache_dtype in QUANTIZED_DS_MLA_CACHE_FORMATS
@@ -453,34 +451,6 @@ class FlashMLASparseMetadataBuilder(
         # this is ignored by `flash_mla_with_kvcache` if indices not None
         self.dummy_block_table = torch.empty(
             (max_num_seqs, 1), dtype=torch.int32, device=self.device
-        )
-
-        # Equation taken from FlashMLA/csrc/api/sparse_decode.h
-        # For sparse FP8 decode, the formula depends on architecture:
-        # - SM90 (Hopper): num_sm_parts = num_sms / s_q / (h_q/64)
-        # - SM100 (Blackwell head64/head64x2): num_sm_parts = num_sms / s_q
-        # - SM100 (Blackwell head128): num_sm_parts = num_sms / s_q / 2
-        # For max buffer size, use s_q = 1 (the case that produces largest output)
-        # Use padded head count since that's what will be passed to the kernel
-        h_q = self.fp8_decode_padded_heads
-        if current_platform.is_device_capability_family(100):
-            # SM100 head64 or head64x2 uses full SM count
-            max_num_sm_parts = sm_count
-        else:
-            # SM90 uses h_q/64 divisor
-            max_num_sm_parts = sm_count // max(1, h_q // 64)
-        self.tile_scheduler_metadata_buffer = torch.empty(
-            # TileSchedulerMetaDataSize = 8
-            # see: FlashMLA/csrc/params.h
-            (max_num_sm_parts, 8),
-            dtype=torch.int32,
-            device=device,
-        )
-        # Sized for per-request batching (num_decodes + 1)
-        self.num_splits_buffer = torch.empty(
-            (max_num_seqs + 1,),
-            dtype=torch.int32,
-            device=device,
         )
 
         # PCP+DCP attends prefill rows over the DCP-gathered KV, which only the
@@ -504,9 +474,9 @@ class FlashMLASparseMetadataBuilder(
                     "prefill/decode path returns the LSE for decode tokens "
                     "only, while the DCP merge needs it for every token"
                 )
-            # Head padding (and the tile-scheduler metadata sized from it) is
-            # computed from the local head count, but the kernel runs on the
-            # DCP-gathered heads.
+            # The fp8 kernel runs on the DCP-gathered query heads: it pads them
+            # to 64 or 128 at run time and FlashMLA builds its scheduler
+            # metadata on the first call, so only its head limit applies.
             if self.use_pcp:
                 gathered_num_heads = (
                     self.num_heads * parallel_config.tensor_parallel_size
@@ -517,17 +487,12 @@ class FlashMLASparseMetadataBuilder(
                 gathered_num_heads = (
                     self.num_heads * parallel_config.decode_context_parallel_size
                 )
-            gathered_padded_heads = FlashMLASparseImpl._compute_fp8_decode_padded_heads(
-                gathered_num_heads
-            )
-            if self.fp8_decode_padded_heads != gathered_padded_heads:
+            if gathered_num_heads > FP8_SPARSE_DECODE_MAX_HEADS:
                 raise NotImplementedError(
-                    "DCP for FlashMLA sparse requires the local and "
-                    "DCP-gathered head counts to pad to the same fp8 decode "
-                    f"kernel envelope; got {self.num_heads} local heads "
-                    f"(pad to {self.fp8_decode_padded_heads}) vs "
-                    f"{gathered_num_heads} gathered heads (pad to "
-                    f"{gathered_padded_heads})"
+                    "DCP for FlashMLA sparse gathers "
+                    f"{gathered_num_heads} query heads ({self.num_heads} per "
+                    "rank); the fp8 sparse decode kernel runs at most "
+                    f"{FP8_SPARSE_DECODE_MAX_HEADS}"
                 )
 
     def _build_fp8_mixed_decode_prefill(

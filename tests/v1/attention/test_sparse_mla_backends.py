@@ -4548,8 +4548,8 @@ def _build_sparse_dcp_vllm_config(
     dcp_world_size: int,
     comm_backend: str = "ag_rs",
 ):
-    """Minimal sparse-MLA VllmConfig for the FlashMLASparse DCP head-envelope
-    guard. TP is simulated by mocking ``get_num_attention_heads`` to return the
+    """Minimal sparse-MLA VllmConfig for the FlashMLASparse DCP builder tests.
+    TP is simulated by mocking ``get_num_attention_heads`` to return the
     per-rank head count, as the decode-correctness test above does.
     """
     kv_lora_rank = 512
@@ -4616,19 +4616,19 @@ def _build_sparse_dcp_vllm_config(
 @pytest.mark.parametrize(
     "local_heads,dcp_world_size,should_raise",
     [
-        (16, 8, True),
-        (24, 4, True),
+        (12, 8, False),  # Kimi K3.1 TP8 DCP8: 96 gathered heads, padded to 128
+        (16, 8, False),  # 128 gathered heads: the kernel maximum
+        (24, 4, False),
+        (24, 8, True),  # 192 gathered heads
         (16, 4, False),
         (16, 1, False),
     ],
 )
-def test_fp8_dcp_head_envelope_guard(
+def test_fp8_dcp_gathered_head_limit(
     monkeypatch, local_heads, dcp_world_size, should_raise
 ):
-    """The fp8 decode envelope (head padding + tile-scheduler metadata) is
-    sized from the local head count while the kernel runs on the DCP-gathered
-    heads, so the builder must reject configs where the two pad differently.
-    """
+    """The fp8 kernel runs on the DCP-gathered heads, padded to 64 or 128 at
+    run time, so DCP may gather past the local head padding up to 128 heads."""
     device = torch.device(DEVICE_TYPE)
     vllm_config = _build_sparse_dcp_vllm_config(
         monkeypatch, local_heads, dcp_world_size
@@ -4637,15 +4637,11 @@ def test_fp8_dcp_head_envelope_guard(
     builder_cls = FlashMLASparseBackend.get_builder_cls()
 
     if should_raise:
-        with pytest.raises(NotImplementedError, match="envelope"):
+        with pytest.raises(NotImplementedError, match="runs at most 128"):
             builder_cls(kv_cache_spec, ["placeholder"], vllm_config, device)
     else:
         builder = builder_cls(kv_cache_spec, ["placeholder"], vllm_config, device)
-        gathered_heads = local_heads * dcp_world_size
-        local_pad = 64 if local_heads <= 64 else 128
-        gathered_pad = 64 if gathered_heads <= 64 else 128
-        assert builder.fp8_decode_padded_heads == local_pad
-        assert local_pad == gathered_pad
+        assert builder.fp8_use_mixed_batch
 
 
 @pytest.mark.skipif(
