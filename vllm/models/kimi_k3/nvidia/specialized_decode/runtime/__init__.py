@@ -136,10 +136,6 @@ def unsupported(vllm_config) -> str | None:
             "the AttnRes aux stream",
         ),
         (
-            dsa and parallel.decode_context_parallel_size > 1,
-            "decode context parallel with DSA layers (Kimi K3.1)",
-        ),
-        (
             dsa and vllm_config.cache_config.cache_dtype != "fp8_ds_mla",
             "DSA layers on KV cache dtypes other than fp8_ds_mla",
         ),

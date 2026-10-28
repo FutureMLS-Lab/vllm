@@ -111,6 +111,13 @@ class Attention:
             pitches = {b: pitch for b in runtime.batches}
             rows = dsa_scratch(runtime)
             policy = dict(queries=runtime.queries, core=runtime.dsa_core)
+            if runtime.dcp > 1:
+                heads = attention.num_local_heads
+                policy.update(
+                    dcp=dcp_box(runtime, heads, dsa=True),
+                    parity=runtime.dsa_layers % 2,
+                )
+            runtime.dsa_layers += 1
             self.core = PreparedDsa(attention, pitches, rows, **policy)
         elif kind == "kda":
             mode = lambda b: (1 if b == 1 else 2 if b <= 8 else 0) if tp == 8 else 0
@@ -213,9 +220,11 @@ def dsa_scratch(runtime):
     )
 
 
-def dcp_box(runtime, heads):
-    """The model's DCP mailboxes (one set for every MLA layer)."""
-    if runtime.dcp_box is None:
+def dcp_box(runtime, heads, dsa=False):
+    """The model's DCP mailboxes (one set for every MLA layer, one for every DSA
+    layer: a BF16 q mailbox padded to FlashMLA sparse's 64 or 128 heads)."""
+    name = "dsa_dcp_box" if dsa else "dcp_box"
+    if getattr(runtime, name) is None:
         from vllm.distributed import get_dcp_group
 
         group = get_dcp_group()
@@ -225,8 +234,10 @@ def dcp_box(runtime, heads):
         args = group.device_group, runtime.device, group.world_size, group.rank_in_group
         parallel = get_current_vllm_config().parallel_config
         interleave = parallel.cp_kv_cache_interleave_size
-        runtime.dcp_box = DcpBox(*args, heads, interleave=interleave)
-    return runtime.dcp_box
+        q_heads = (64 if group.world_size * heads <= 64 else 128) if dsa else None
+        box = DcpBox(*args, heads, interleave=interleave, q_heads=q_heads)
+        setattr(runtime, name, box)
+    return getattr(runtime, name)
 
 
 def pack_front(moe, rank, tp):

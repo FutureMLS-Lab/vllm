@@ -84,7 +84,8 @@ class MlaQuery:
     mailbox, its multicast address and the rank): each CTA also multicasts the query
     bytes it wrote into head block ``rank`` of every rank's Lamport q mailbox
     (mla.dcp.DcpBox), then polls its share of the gathered mailbox until no word is
-    the sentinel, so the next kernel reads the gathered query."""
+    the sentinel, so the next kernel reads the gathered query. DSA publishes BF16
+    rows into a mailbox of ``q_heads`` (FlashMLA's padding) rows per token."""
 
     def __init__(
         self,
@@ -94,11 +95,14 @@ class MlaQuery:
         q_b_cp_async: bool = False,
         dcp: int = 0,
         dsa: bool = False,
+        q_heads: int = 0,
     ):
         tiled = TILED_FROM[heads]
         self.heads, self.batch, self.wide = heads, batch, batch >= tiled
-        assert not (dsa and dcp), "the DSA query has no DCP publication"
         self.dcp, self.dsa = dcp, dsa
+        # q mailbox geometry: rows per token, element bytes, args index of the box.
+        self.q_heads = q_heads or dcp * heads
+        self.q_bytes, self.box_arg = (2, 12) if dsa else (1, 11)
         self.cluster = 16 if heads == 6 and not self.wide else 8
         self.rows, self.latent = 192 // self.cluster, 512 // self.cluster
         self.groups, self.p_per_group = 256 // self.latent, self.latent // 2
@@ -124,45 +128,52 @@ class MlaQuery:
         """DCP: this CTA's query bytes (latent columns L*part.. as 16 B, the rope rows
         of Q_B rows R*part.. as 4 B multicast stores) -> every rank's q mailbox (FP8
         bytes are never 0xFF: no word is the sentinel)."""
-        output, (box_mc, rank) = args[10], args[12:14]
+        output = args[10]
+        box_mc, rank = args[self.box_arg + 1 : self.box_arg + 3]
         part, head, _ = cute.arch.block_idx()
-        R, L, D = self.rows, self.latent, self.dcp
-        chunks: cutlass.Constexpr = L // 16
-        items: cutlass.Constexpr = chunks + R // 4
+        R, L, E = self.rows, self.latent, self.q_bytes
+        per: cutlass.Constexpr = 16 // E  # elements per 16 B chunk
+        chunks: cutlass.Constexpr = L // per
+        items: cutlass.Constexpr = chunks + R * E // 4
+        pitch: cutlass.Constexpr = 576 * E
         cute.arch.sync_threads()
         for i in range(tid, self.tokens * items, 256):
             t, w = i // items, i % items
-            p = R * part + 4 * (w - chunks)  # Q_B row of a rope word
-            row = ((tok0 + t) * D + rank) * self.heads + head
+            p = R * part + (4 // E) * (w - chunks)  # Q_B row of a rope word
+            row = (tok0 + t) * self.q_heads + rank * self.heads + head
             if w < chunks:
-                byte = L * part + 16 * w
+                col = L * part + per * w
                 if self.live(tok0 + t):
                     words = load_words(
-                        at(output, tok0 + t, head, byte), count=4, mutable=True
+                        at(output, tok0 + t, head, col), count=4, mutable=True
                     )
-                    multicast_words(box_mc + Int64(row) * 576 + byte, words)
+                    multicast_words(box_mc + Int64(row) * pitch + col * E, words)
             elif self.live(tok0 + t) & (p >= 128):
-                byte = 512 + p - 128
+                col = 512 + p - 128
                 word = load_words(
-                    at(output, tok0 + t, head, byte), count=1, mutable=True
+                    at(output, tok0 + t, head, col), count=1, mutable=True
                 )
-                multicast_words(box_mc + Int64(row) * 576 + byte, word, kind="b32")
+                address = box_mc + Int64(row) * pitch + col * E
+                multicast_words(address, word, kind="b32")
 
     @cute.jit
     def gathered(self, args, tid):
         """DCP: poll this CTA's share of the gathered mailbox (16 B chunks of the
         B x DCP*H x 576 bytes) until every rank's bytes have landed."""
-        mailbox = args[11]
+        mailbox = args[self.box_arg]
         part, head, tile = cute.arch.block_idx()
         threads: cutlass.Constexpr = self.grid[0] * self.grid[1] * self.grid[2] * 256
-        chunks: cutlass.Constexpr = self.batch * self.dcp * self.heads * 36
+        row: cutlass.Constexpr = 36 * self.q_bytes  # 16 B chunks per head row
+        token: cutlass.Constexpr = self.dcp * self.heads * row  # published per token
+        chunks: cutlass.Constexpr = self.batch * token
         first = ((tile * self.heads + head) * self.cluster + part) * 256 + tid
         last = chunks - 1  # threads past the end re-poll it
         for i0 in cutlass.range_constexpr(0, -(-chunks // threads), 8):
             n: cutlass.Constexpr = min(8, -(-chunks // threads) - i0)
+            picks = [min(first + (i0 + i) * threads, last) for i in range(n)]
             sources = [
-                mailbox.iterator + min(first + (i0 + i) * threads, last) * 16
-                for i in range(n)
+                mailbox.iterator + (c // token * self.q_heads * row + c % token) * 16
+                for c in picks
             ]
             loads = [load_volatile(source, count=4) for source in sources]
             for i in cutlass.range_constexpr(n):  # the loads above are in flight

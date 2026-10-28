@@ -128,6 +128,8 @@ def test_indexer_inputs(batch):
     norm_b = torch.randn(128, device=dev) / 10
     raw, mla, _ = merged_cache(8)
     slots = torch.randperm(8 * UNIT, device=dev)[:batch]
+    if batch > 2:
+        slots[1] = -1  # a padded row or, under DCP, a token another rank owns
     weights = (
         torch.ones(1536, device=dev, dtype=bf),
         torch.ones(512, device=dev, dtype=bf),

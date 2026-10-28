@@ -102,6 +102,7 @@ class SpecializedDecode:
         self.dsa_core = config.dsa_core
         # Decode context parallel over the TP ranks: MLA KV is sequence-sharded.
         self.dcp, self.dcp_box, self.mla_layers = config.dcp, None, 0
+        self.dsa_dcp_box, self.dsa_layers = None, 0
         group = get_tp_group()
         self.tp, self.rank = group.world_size, group.rank_in_group
         self.group = group.device_group

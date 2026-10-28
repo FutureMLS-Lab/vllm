@@ -60,11 +60,16 @@ class DcpBox:
     and the local tokenspeed rows / LSE. Parity alternates by layer. ``interleave``:
     the KV cache's DCP interleave (global masking of spec verify rows)."""
 
-    def __init__(self, group, device, size, rank, heads, cap=64, interleave=1):
+    def __init__(
+        self, group, device, size, rank, heads, cap=64, interleave=1, q_heads=None
+    ):
         self.size, self.rank, self.heads, self.cap = size, rank, heads, cap
         self.interleave = interleave
         empty = symm_mem.empty
-        self.q = empty((2, cap, size * heads, 576), dtype=torch.uint8, device=device)
+        # DSA: BF16 query rows, q_heads per token (the FlashMLA sparse padding).
+        self.q_heads = q_heads or size * heads
+        q_dtype = torch.bfloat16 if q_heads else torch.uint8
+        self.q = empty((2, cap, self.q_heads, 576), dtype=q_dtype, device=device)
         shape = (2, size, cap, heads)
         self.partial = empty((*shape, 512), dtype=torch.bfloat16, device=device)
         self.lse = empty(shape, dtype=torch.float32, device=device)
@@ -76,7 +81,8 @@ class DcpBox:
         i64 = dict(dtype=torch.int64, device=device)
         self.peers = torch.tensor(handles[1].buffer_ptrs, **i64)
         self.lse_peers = torch.tensor(handles[2].buffer_ptrs, **i64)
-        self.q.fill_(0xFF)
+        self.q.zero_()  # padded heads stay zero
+        self.q[:, :, : size * heads].view(torch.uint8).fill_(0xFF)
         self.partial.view(torch.int32).fill_(-0x80000000)
         self.lse.view(torch.int32).fill_(-1)
         rows = (cap, 1, size * heads)
@@ -87,7 +93,7 @@ class DcpBox:
 
     def mc(self, parity):
         """The q mailbox multicast address of ``parity``."""
-        return Int64(self.q_mc + parity * self.q[0].numel())
+        return Int64(self.q_mc + parity * self.q[0].numel() * self.q.element_size())
 
 
 class DcpValue:
@@ -101,9 +107,16 @@ class DcpValue:
     MMA, FP32 accumulation) and the sigmoid gate follow as in MlaValue: warp w owns
     outputs 32 (w // 4) + 8 (w % 4) .. + 7. Rows are tokens, ``q`` per request."""
 
-    def __init__(self, heads, size, batch, sms=148, q=1):
+    def __init__(
+        self, heads, size, batch, sms=148, q=1, q_chunks=36, q_heads=0, lse_scale=1.0
+    ):
+        """``q_chunks``: 16 B chunks per q mailbox head row (36 FP8, 72 BF16);
+        ``q_heads``: q mailbox rows per token (default DCP * H); ``lse_scale``: to
+        base 2 (LOG2E for a natural-log LSE)."""
         self.heads, self.size, self.batch = heads, size, batch
         self.q = q
+        self.q_chunks, self.q_heads = q_chunks, q_heads or size * heads
+        self.lse_scale = lse_scale
         # Push-only CTAs (z > 0) spread the NVLink stores over more SMs: up to one
         # wave, at least 4 16 B chunks per thread.
         merge = heads * ((batch + 15) // 16)
@@ -136,28 +149,36 @@ class DcpValue:
         cute.arch.griddepcontrol_wait()
         threads = H * self.grid[1] * self.grid[2] * 512
         me = ((pusher * self.grid[1] + tile) * H + head) * 512 + tid
-        for c in range(me, B * D * H * 36, threads):  # 16 B q mailbox chunks
-            store_words(mailbox.iterator + c * 16, (Uint32(Q_SENT),) * 4)
+        C, P = self.q_chunks, self.q_heads
+        for c in range(me, B * D * H * C, threads):  # 16 B q mailbox chunks
+            row = c // (D * H * C) * P * C + c % (D * H * C)
+            store_words(mailbox.iterator + row * 16, (Uint32(Q_SENT),) * 4)
         for i in range(me, B * D * H * 64, threads):
             r, k = i // 64, i % 64  # r = b * D * H + global head
             b, gh = r // (D * H), r % (D * H)
             words = (Uint32(0),) * 4
-            if lens[b // self.q] > 0:
+            if (lens[b // self.q] > 0) & self.valid(rows_lse[b, 0, gh]):
                 words = load_words(at(rows, b, 0, gh, 8 * k), count=4, mutable=True)
             words = tuple(no_neg_zero(w) for w in words)
             slot = ((parity * D + rank) * cap + b) * H + gh % H
             store_relaxed(peers[gh // H] + (Int64(slot) * 512 + 8 * k) * 2, words)
         for i in range(me, B * D * H, threads):
             b, gh = i // (D * H), i % (D * H)
-            value, n = rows_lse[b, 0, gh], lens[b // self.q]
+            value = rows_lse[b, 0, gh] * Float32(self.lse_scale)  # base 2
             bad = (value != value) | (value <= Float32(EMPTY_LSE))  # NaN, -inf
-            if (n <= 0) | bad | (value >= Float32(-EMPTY_LSE)):  # or +inf
-                value = Float32(EMPTY_LSE)
+            if (lens[b // self.q] <= 0) | bad | (value >= Float32(-EMPTY_LSE)):
+                value = Float32(EMPTY_LSE)  # or +inf
             slot = ((parity * D + rank) * cap + b) * H + gh % H
             store_relaxed(lpeers[gh // H] + Int64(slot) * 4, (float_bits(value),))
         cute.arch.griddepcontrol_launch_dependents()
         if pusher == 0:
             self.merge(args, latent, scales, wb, tid)
+
+    @cute.jit
+    def valid(self, value: Float32):
+        """A finite LSE (empty or invalid sources: NaN or infinite)."""
+        live = (value == value) & (value > Float32(EMPTY_LSE))
+        return live & (value < Float32(-EMPTY_LSE))
 
     @cute.jit
     def merge(self, args, latent, scales, wb, tid):
@@ -255,24 +276,33 @@ class DcpValue:
 
 
 @cache
-def compile_value(heads, size, batch, cap, uv, pitch, device, sms=148, q=1):
+def compile_value(
+    heads, size, batch, cap, uv, pitch, device, sms=148, q=1, dsa_heads=0
+):
     """DcpValue of one batch (``q`` rows per request); ``uv``: the (shape, stride,
     dtype) of W_UV, ``pitch``: the projected rows' (the gate follows the 2112 query /
-    KV columns)."""
+    KV columns). ``dsa_heads``: DSA (FlashMLA sparse) layout, its padded head count:
+    BF16 q mailbox rows, rows / natural-log LSE as FlashMLA returns them."""
     f32, i32 = torch.float32, torch.int32
     w_uv, gate = fake(*uv), fake((batch, heads * 128), (pitch, 1))
     rows = fake((batch, 1, size * heads, 512))
     rows_lse = fake((batch, 1, size * heads), None, f32, 4)
+    mailbox = fake((cap, size * heads, 576), None, torch.uint8)
+    value = DcpValue(heads, size, batch, sms, q)
+    if dsa_heads:
+        rows = fake((batch, 1, size * heads, 512), (dsa_heads * 512, 0, 512, 1))
+        rows_lse = fake((batch, 1, size * heads), (dsa_heads, 0, 1), f32, 4)
+        mailbox = fake((cap, dsa_heads, 1152), None, torch.uint8)  # BF16 bytes
+        value = DcpValue(heads, size, batch, sms, q, 72, dsa_heads, math.log2(math.e))
     lens = fake((batch // q,), None, i32, 4)
     box = fake((size, cap, heads, 512))
     lbox = fake((size, cap, heads), None, f32, 4)
     peers = fake((size,), None, torch.int64, 8)
-    mailbox = fake((cap, size * heads, 576), None, torch.uint8)
     output = fake((batch, heads * 128), (heads * 128, 1))
     args: tuple = (rows, rows_lse, lens, box, lbox, peers, peers, mailbox, w_uv)
     args += (gate, lens, output, Int32(0), Int32(0), make_fake_stream())
     with torch.accelerator.device_index(device):
-        return cute.compile(DcpValue(heads, size, batch, sms, q), *args)
+        return cute.compile(value, *args)
 
 
 _WORKSPACE: dict[tuple[torch.device, int], torch.Tensor] = {}
