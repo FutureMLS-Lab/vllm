@@ -201,6 +201,7 @@ class PreparedDsa:
             0,
             1,
             1,
+            topk_backend=indexer.topk_backend,
         )
 
     def sparse_core(self, cache, topk, metadata, batch, q):
