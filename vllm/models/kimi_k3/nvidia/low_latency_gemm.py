@@ -14,8 +14,8 @@ The supported capabilities carry separate measured tables:
 :data:`KIMI_K3_PROJECTIONS_SM90` on H200 (SM90). The per-(shape, M) winners
 genuinely differ between the parts, so the tables must not be merged. SM107
 (Rubin) reuses the SM103 table: the plan was validated end-to-end on SM107
-hardware, but the per-M crossovers have not been re-measured there and may
-deserve their own table once retuned.
+hardware, but apart from 3584x7168 the per-M crossovers have not been
+re-measured there and may deserve their own table once retuned.
 """
 
 from __future__ import annotations
@@ -141,11 +141,15 @@ KIMI_K3_PROJECTIONS: dict[tuple[int, int], ProjectionSpec] = {
     (2112, 7168): ProjectionSpec(2112, 7168, _M1_TO_16, name="fused_qkv_a_proj"),
     (2304, 1536): ProjectionSpec(2304, 1536, _M1_TO_16, name="q_b_proj"),
     (4608, 1536): ProjectionSpec(4608, 1536, _M1_TO_16, name="q_b_proj"),
+    # 3584x7168 (latent-MoE routed_expert_down_proj): CuTe at M1 only. M2..8 go
+    # to the linear backend, where FlashInfer cute-dsl beats dsv3_fused_a_gemm
+    # (cold L2): ~11.3 vs ~15.0-15.6 us at M=2..8 on B300, 7.1 vs 10.4 us at M=8
+    # on SM107. cuBLAS loses to dsv3 at M>=4 on B300 (it wins on SM107), so the
+    # B300 gain needs --linear-backend flashinfer_cutedsl.
     (3584, 7168): ProjectionSpec(
         3584,
         7168,
-        frozenset(range(2, 9)),
-        ((1, _cute(1, 224, 2, 4)),),
+        cute_configs=((1, _cute(1, 224, 2, 4)),),
         name="routed_expert_down_proj",
     ),
     (6288, 7168): ProjectionSpec(
@@ -499,8 +503,8 @@ KIMI_K3_PROJECTIONS_SM100: dict[tuple[int, int], ProjectionSpec] = {
         ),
         name="lm_head",
     ),
-    # Latent-MoE replicated projections. dsv3 measured M2..8 wins on B300 for
-    # 3584x7168 but loses to cuBLAS there on B200; only CuTe wins land here.
+    # Latent-MoE replicated projections. dsv3 loses to cuBLAS on B200 for
+    # 3584x7168 (and is no longer used for it on B300); only CuTe wins land here.
     (3584, 7168): ProjectionSpec(
         3584,
         7168,
@@ -1043,8 +1047,9 @@ def enable_kimi_k3_low_latency_gemm(
 
     Modules are matched purely by type, an exactly-unquantized method, and a
     local ``(N, K)`` present in the current device's measured table
-    (:data:`KIMI_K3_PROJECTIONS` on SM103, :data:`KIMI_K3_PROJECTIONS_SM100`
-    on SM100, :data:`KIMI_K3_PROJECTIONS_SM90` on SM90).
+    (:data:`KIMI_K3_PROJECTIONS` on SM103 and SM107,
+    :data:`KIMI_K3_PROJECTIONS_SM100` on SM100, :data:`KIMI_K3_PROJECTIONS_SM90`
+    on SM90).
     """
     if dtype != torch.bfloat16:
         return
