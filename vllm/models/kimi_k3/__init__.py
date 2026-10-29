@@ -5,6 +5,9 @@
 The implementation lives under ``nvidia/`` and ``amd/``; this module picks the
 right one for the current platform and re-exports the public classes used by
 the model registry. (Mirrors ``vllm.models.minimax_m3``.)
+
+On XPU, Kimi-Linear uses the reference KDA/MLA path in ``amd/linear.py``
+instead of the NVIDIA-specific fused attention kernels.
 """
 
 from typing import TYPE_CHECKING
@@ -22,6 +25,9 @@ elif current_platform.device_type == "tpu":
 elif current_platform.is_rocm():
     from .amd.linear import KimiLinearForCausalLM  # type: ignore[assignment]
     from .amd.model import KimiK3ForConditionalGeneration  # type: ignore[assignment]
+elif current_platform.is_xpu():
+    from .amd.linear import KimiLinearForCausalLM  # type: ignore[assignment]
+    from .nvidia.model import KimiK3ForConditionalGeneration
 else:
     from .nvidia.model import KimiK3ForConditionalGeneration, KimiLinearForCausalLM
 

@@ -253,10 +253,10 @@ class DeepGemmMegaMoEExperts(nn.Module):
         weight_format: Routed-expert precision, a row of the feature matrix.
         shared_experts: Shared MLP to fuse if it is unsharded and in one of
             the ``weight_format.shared`` precisions; ``None`` never fuses.
-        max_num_tokens: Most tokens one rank passes per launch, which sizes the
-            symmetric buffer. Defaults to ``max_num_batched_tokens``; callers
-            that shard tokens across ranks first (sequence parallel) pass
-            their per-rank bound.
+        max_num_tokens: Most tokens one rank passes to ``forward``; the
+            symmetric buffer is sized for it. Defaults to
+            ``max_num_batched_tokens``. A caller that hands this layer only its
+            sequence-parallel shard of the batch can pass the shard size.
 
     """
 
