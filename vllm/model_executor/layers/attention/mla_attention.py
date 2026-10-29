@@ -1442,10 +1442,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         )
         if getattr(self, "ds_index_head_size", 0):
             # Merged DSA cache: the indexer's bytes live in this layer's spec.
-            from vllm.v1.kv_cache_interface import (
-                DenseDraftMergedMLAIndexerSpec,
-                MergedMLAIndexerSpec,
-            )
+            from vllm.v1.kv_cache_interface import MergedMLAIndexerSpec
 
             # Only the FlashMLA sparse (NVIDIA) and ROCm AITER sparse MLA
             # kernels understand the merged layout.
@@ -1459,10 +1456,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                     "read wrong addresses. Set VLLM_ATTENTION_BACKEND to one of "
                     "the supported backends."
                 )
-            spec_cls: type[MergedMLAIndexerSpec] = MergedMLAIndexerSpec
-            if getattr(getattr(self, "indexer", None), "dense_draft", False):
-                spec_cls = DenseDraftMergedMLAIndexerSpec
-            return spec_cls.from_mla_and_indexer(
+            return MergedMLAIndexerSpec.from_mla_and_indexer(
                 block_size=vllm_config.cache_config.block_size,
                 mla_head_size=self.head_size,
                 mla_dtype=kv_cache_dtype,
@@ -1477,13 +1471,6 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             return SlidingWindowMLASpec(
                 **common_kwargs,
                 sliding_window=self.sliding_window,
-            )
-        if getattr(getattr(self, "indexer", None), "dense_draft", False):
-            from vllm.v1.kv_cache_interface import DenseDraftMLASpec
-
-            return DenseDraftMLASpec(
-                **common_kwargs,
-                non_causal_multi_token_decode=self.non_causal_multi_token_decode,
             )
         spec = MLAAttentionSpec(
             **common_kwargs,

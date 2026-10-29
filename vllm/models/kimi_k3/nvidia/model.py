@@ -749,14 +749,7 @@ class KimiDecoderLayer(nn.Module):
             assert v_head_dim is not None
             assert kv_lora_rank is not None
             assert mla_use_nope, "Kimi-K3 MLA (MultiHeadLatentAttention) is NoPE-only"
-            is_dsa_layer = config.is_dsa_layer(layer_idx)
-            # A dense (non-DSA) MTP draft of a DSA model has no indexer weights
-            # and no SM100 dense MLA kernel reads the fp8_ds_mla cache, so it
-            # runs the sparse form with a full-range dense-draft indexer.
-            is_dense_draft = (
-                config.dsa_config is not None and layer_idx >= config.num_hidden_layers
-            )
-            if is_dsa_layer or is_dense_draft:
+            if config.is_dsa_layer(layer_idx):
                 self.self_attn = KimiK3DSAAttention(
                     config=config,
                     hidden_size=self.hidden_size,
@@ -770,8 +763,6 @@ class KimiDecoderLayer(nn.Module):
                     quant_config=quant_config,
                     prefix=f"{prefix}.self_attn",
                     topk_indices_buffer=topk_indices_buffer,
-                    dense_draft=not is_dsa_layer,
-                    is_mtp_layer=layer_idx >= config.num_hidden_layers,
                     aux_stream=aux_stream,
                 )
             # q_lora_rank may be None (Kimi-Linear): the MLA layer then uses an
@@ -1328,8 +1319,7 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
                 hidden_states = sp_all_gather(hidden_states)
                 hidden_states = hidden_states[:full_num_tokens]
 
-        # NOTE: the final norm is applied in compute_logits instead of here, so
-        # the MTP draft model receives the pre-norm hidden states.
+        # NOTE: the final norm is applied in compute_logits instead of here.
         aux_hidden_states = remote_aux + aux_hidden_states
         if aux_hidden_states:
             return hidden_states, aux_hidden_states
@@ -1421,9 +1411,6 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
             if experts_unpacked and name.endswith(".weight_packed"):
                 name = name.replace(".weight_packed", ".weight")
 
-            spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
-            if spec_layer is not None:
-                continue  # skip spec decode layers for main model
             if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
                 # Models trained using ColossalAI may include these tensors in
                 # the checkpoint. Skip them.
@@ -1661,8 +1648,7 @@ class KimiLinearForCausalLM(
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
-        # The model's final norm is applied here (not at the end of forward) so
-        # that the pre-norm hidden states can be fed to the MTP draft model.
+        # The model's final norm is applied here, not at the end of forward.
         if self.needs_norm_in_logits:
             hidden_states = self.model.norm(hidden_states, None)
         return self.logits_processor(self.lm_head, hidden_states)
@@ -1670,23 +1656,6 @@ class KimiLinearForCausalLM(
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
         return loader.load_weights(weights)
-
-
-def get_spec_layer_idx_from_weight_name(
-    config: KimiLinearConfig, weight_name: str
-) -> int | None:
-    if hasattr(config, "num_nextn_predict_layers") and (
-        config.num_nextn_predict_layers > 0
-    ):
-        layer_idx = config.num_hidden_layers
-        for i in range(config.num_nextn_predict_layers):
-            # Match regardless of the surrounding prefix. The name may arrive as
-            # ``model.layers.{i}.``, a bare ``layers.{i}.`` (after AutoWeightsLoader
-            # has stripped the ``model.`` prefix in the main model), or with the
-            # multimodal ``language_model.model.layers.{i}.`` prefix.
-            if f"layers.{layer_idx + i}." in weight_name:
-                return layer_idx + i
-    return None
 
 
 @MULTIMODAL_REGISTRY.register_processor(

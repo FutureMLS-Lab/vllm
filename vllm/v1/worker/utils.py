@@ -864,12 +864,6 @@ def split_merged_dsa_cache_views(
             if spec.cache_dtype_str == "fp8_ds_mla":
                 mla_view = mla_view.view(current_platform.fp8_dtype())
             kv_caches[layer_name] = mla_view
-            if indexer_name not in forward_context:
-                # Dense MTP draft (DenseDraftMergedMLAIndexerSpec): its
-                # indexer facade is not a registered layer, so nothing
-                # consumes the indexer section; skip creating its view
-                # (bind below would KeyError on the unregistered name).
-                continue
             # Indexer envelope: [data | scale] section split is derived by
             # the kernels from the shape; the row stride is bookkeeping
             # (same contract as kv_cache_as_quant_view).

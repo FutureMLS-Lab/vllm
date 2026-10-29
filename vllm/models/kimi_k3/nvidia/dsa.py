@@ -390,8 +390,6 @@ class KimiK3DSAAttention(nn.Module):
         prefix: str = "",
         reduce_results: bool = True,
         topk_indices_buffer: torch.Tensor | None = None,
-        dense_draft: bool = False,
-        is_mtp_layer: bool = False,
         aux_stream: torch.cuda.Stream | None = None,
     ) -> None:
         super().__init__()
@@ -570,50 +568,25 @@ class KimiK3DSAAttention(nn.Module):
         # stock standalone indexer cache.
         use_merged_cache = getattr(config, "linear_attn_config", None) is not None
 
-        if dense_draft:
-            # Dense (non-DSA) MTP draft on a DSA target: no indexer weights,
-            # and no SM100 dense MLA kernel reads the enforced fp8_ds_mla
-            # cache. Substitute a fake indexer that fills full-range
-            # candidates (mathematically exact dense attention); its k_cache
-            # facade keeps the merged-cache spec registration byte-identical
-            # to the target's (the indexer section is simply never touched).
-            from vllm.models.kimi_k3.nvidia.dense_draft import (
-                KimiK3DenseDraftIndexer,
-            )
-
-            dcp_world_size = vllm_config.parallel_config.decode_context_parallel_size
-            self.dsa_indexer = KimiK3DenseDraftIndexer(
-                max_model_len=vllm_config.model_config.max_model_len,
-                max_num_batched_tokens=(
-                    vllm_config.scheduler_config.max_num_batched_tokens
-                ),
-                dcp_kg_slack=(dcp_world_size - 1 if dcp_world_size > 1 else 0),
-                index_head_dim=self.index_head_dim,
-                prefix=f"{prefix}.dsa_indexer",
-                device=("cuda" if torch.cuda.is_available() else "cpu"),
-                use_merged_cache=use_merged_cache,
-            )
-            self.topk_indices_buffer = self.dsa_indexer.topk_indices_buffer
-        else:
-            index_q_input_size = (
-                self.q_lora_rank if self.q_lora_rank is not None else self.hidden_size
-            )
-            self.dsa_indexer = KimiK3DSAIndexer(
-                vllm_config=vllm_config,
-                hidden_size=self.hidden_size,
-                index_q_input_size=index_q_input_size,
-                index_head_dim=self.index_head_dim,
-                index_num_heads=self.index_num_heads,
-                index_topk=self.index_topk,
-                rms_norm_eps=config.rms_norm_eps,
-                index_rope_dim=self.index_rope_dim,
-                index_k_norm_type=dsa_config.index_k_norm_type,
-                cache_config=cache_config,
-                quant_config=quant_config,
-                topk_indices_buffer=self.topk_indices_buffer,
-                use_merged_cache=use_merged_cache,
-                prefix=f"{prefix}.dsa_indexer",
-            )
+        index_q_input_size = (
+            self.q_lora_rank if self.q_lora_rank is not None else self.hidden_size
+        )
+        self.dsa_indexer = KimiK3DSAIndexer(
+            vllm_config=vllm_config,
+            hidden_size=self.hidden_size,
+            index_q_input_size=index_q_input_size,
+            index_head_dim=self.index_head_dim,
+            index_num_heads=self.index_num_heads,
+            index_topk=self.index_topk,
+            rms_norm_eps=config.rms_norm_eps,
+            index_rope_dim=self.index_rope_dim,
+            index_k_norm_type=dsa_config.index_k_norm_type,
+            cache_config=cache_config,
+            quant_config=quant_config,
+            topk_indices_buffer=self.topk_indices_buffer,
+            use_merged_cache=use_merged_cache,
+            prefix=f"{prefix}.dsa_indexer",
+        )
 
         # The fp8_ds_mla normalization happens at config-verification time
         # (see the KimiK3 verifier in vllm/model_executor/models/config.py):
@@ -658,19 +631,15 @@ class KimiK3DSAAttention(nn.Module):
 
         # Dense-MHA prefills never read the top-k indices (PCP excluded, as
         # upstream).
-        if not dense_draft:
-            indexer = cast(KimiK3DSAIndexer, self.dsa_indexer)
-            if not indexer.use_pcp:
-                indexer.dense_mha_metadata_layer_name = (
-                    self.mla_attn.mla_attn.layer_name
-                )
-            # ShardQ (sparse_mla_shard_q): the indexer is not an indexer_op,
-            # so the layer opts in itself, as DeepseekV32Attention does. MTP
-            # layers stay head-sharded, as upstream's DSA MTP layers do.
-            mla_layer = cast(Any, self.mla_attn.mla_attn)
-            if not is_mtp_layer and getattr(mla_layer.impl, "use_shardq", False):
-                mla_layer.use_shardq = True
-                indexer.shardq_layer_name = mla_layer.layer_name
+        indexer = self.dsa_indexer
+        if not indexer.use_pcp:
+            indexer.dense_mha_metadata_layer_name = self.mla_attn.mla_attn.layer_name
+        # ShardQ (sparse_mla_shard_q): the indexer is not an indexer_op, so the
+        # layer opts in itself, as DeepseekV32Attention does.
+        mla_layer = cast(Any, self.mla_attn.mla_attn)
+        if getattr(mla_layer.impl, "use_shardq", False):
+            mla_layer.use_shardq = True
+            indexer.shardq_layer_name = mla_layer.layer_name
 
         # Merged cache mode (MergedMLAIndexerSpec): the registered MLA layer is
         # the wrapper's inner mla_attn; mark it with the indexer geometry so
@@ -682,7 +651,6 @@ class KimiK3DSAAttention(nn.Module):
             mla_layer.ds_index_head_dim = self.index_head_dim
             mla_layer.ds_indexer_layer_name = self.dsa_indexer.k_cache.prefix
 
-        self.dense_draft = dense_draft
         offload = vllm_config.offload_config
         self.weights_offloaded = (
             offload.uva.cpu_offload_gb > 0 or offload.prefetch.offload_group_size > 0
@@ -700,8 +668,7 @@ class KimiK3DSAAttention(nn.Module):
         attn = cast(Any, self.mla_attn.mla_attn)
         indexer = cast(Any, self.dsa_indexer)
         if not (
-            not self.dense_draft
-            and indexer.use_fused_k_insert
+            indexer.use_fused_k_insert
             and indexer.dcp_world_size == 1
             and self.q_lora_rank is not None
             and self.use_nope
@@ -764,7 +731,7 @@ class KimiK3DSAAttention(nn.Module):
 
     def _fused_attention(self, hidden_states: torch.Tensor) -> torch.Tensor:
         assert self.q_lora_rank is not None and self._packed is not None
-        indexer = cast(KimiK3DSAIndexer, self.dsa_indexer)
+        indexer = self.dsa_indexer
         attn = cast(Any, self.mla_attn.mla_attn)
         input_weight, query_weight = self._packed
         q_c, kv_c, k_pe, index_k, index_weights = low_latency_linear(

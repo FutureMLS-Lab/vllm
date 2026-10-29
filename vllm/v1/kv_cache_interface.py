@@ -805,19 +805,6 @@ class MLAAttentionSpec(FullAttentionSpec):
         return merged_spec
 
 
-class DenseDraftMLASpec(MLAAttentionSpec):
-    """Marker spec for a dense (non-DSA) MTP draft layer on a DSA target.
-
-    Field-identical to a plain MLAAttentionSpec (same page layout, so page
-    unification is unaffected); the subclass only exists so the draft layer
-    forms its own attention group instead of sharing one with the target's
-    sparse layers. A group's per-step scheduler metadata requires a
-    consistent topk across kernel calls, and the draft's full-range
-    candidates (max_model_len wide) are incompatible with the target
-    layers' index_topk on a shared instance.
-    """
-
-
 @dataclass(frozen=True, kw_only=True)
 class MergedMLAIndexerSpec(MLAAttentionSpec):
     """MLA + DSA indexer merged per-layer KV cache spec (KDA-hybrid DSA models).
@@ -934,8 +921,6 @@ class MergedMLAIndexerSpec(MLAAttentionSpec):
 
     @classmethod
     def merge(cls, specs: list[Self]) -> Self:
-        # Exact class: DenseDraftMergedMLAIndexerSpec must not merge into the
-        # target's group (different top-k width).
         assert all(type(spec) is cls for spec in specs), (
             "All attention layers in the same KV cache group must be "
             "MergedMLAIndexerSpec."
@@ -982,20 +967,6 @@ class MergedMLAIndexerSpec(MLAAttentionSpec):
             kernel_block_size=first.kernel_block_size,
             padded_unit_bytes=first.padded_unit_bytes,
         )
-
-
-@dataclass(frozen=True, kw_only=True)
-class DenseDraftMergedMLAIndexerSpec(MergedMLAIndexerSpec):
-    """Marker spec for a dense (non-DSA) MTP draft layer of a KDA-hybrid DSA
-    model.
-
-    Field-identical to MergedMLAIndexerSpec (same merged page layout, so
-    page unification with the target is unaffected); the subclass only
-    exists so the draft forms its own attention group instead of sharing
-    the target's, whose per-step scheduler metadata requires a consistent
-    topk across kernel calls. The draft's indexer section is registered but
-    never written or read.
-    """
 
 
 @dataclass(frozen=True, kw_only=True)

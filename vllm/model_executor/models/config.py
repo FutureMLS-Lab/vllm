@@ -1249,7 +1249,6 @@ MODELS_CONFIG_MAP: dict[str, type[VerifyAndUpdateConfig]] = {
     "JinaForRanking": JinaForRankingConfig,
     "JinaVLForRanking": JinaVLForSequenceClassificationConfig,
     "KimiK3ForConditionalGeneration": KimiK3ForConditionalGenerationConfig,
-    "KimiK3MTPModel": KimiK3ForConditionalGenerationConfig,
     "KimiK31ForConditionalGeneration": KimiK3ForConditionalGenerationConfig,
     "LlamaBidirectionalForSequenceClassification": LlamaBidirectionalConfig,
     "LlamaBidirectionalModel": LlamaBidirectionalConfig,

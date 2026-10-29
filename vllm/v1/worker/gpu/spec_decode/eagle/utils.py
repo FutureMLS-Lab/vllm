@@ -141,13 +141,6 @@ def load_eagle_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mod
         target_buffer = target_inner.topk_indices_buffer
         if target_buffer is not None:
             for _, module in draft_inner.named_modules():
-                # Dense-draft indexers own a wider full-range candidate
-                # buffer that the sparse attention impl was constructed
-                # with; retargeting it to the target's indexer-width
-                # buffer detaches the fill from the impl and silently
-                # zeroes the draft's attention.
-                if getattr(module, "dense_draft", False):
-                    continue
                 if hasattr(module, "topk_indices_buffer"):
                     module.topk_indices_buffer = target_buffer
 

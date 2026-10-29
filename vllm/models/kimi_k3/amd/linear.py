@@ -66,7 +66,6 @@ from vllm.model_executor.models.interfaces import (
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
     PPMissingLayer,
-    get_spec_layer_idx_from_weight_name,
     is_pp_missing_parameter,
     make_layers,
     maybe_prefix,
@@ -587,18 +586,7 @@ class KimiDecoderLayer(nn.Module):
             assert v_head_dim is not None
             assert kv_lora_rank is not None
             assert mla_use_nope, "Kimi-K3 MLA (MultiHeadLatentAttention) is NoPE-only"
-            is_dsa_layer = config.is_dsa_layer(layer_idx)
-            # A dense (non-DSA) MTP draft of a DSA model has no indexer
-            # weights; on ROCm only the target model's DSA layers are
-            # supported.
-            is_dense_draft = (
-                config.dsa_config is not None and layer_idx >= config.num_hidden_layers
-            )
-            if is_dense_draft:
-                raise NotImplementedError(
-                    "Kimi-K3.1 DSA MTP draft layers are not supported on ROCm yet."
-                )
-            if is_dsa_layer:
+            if config.is_dsa_layer(layer_idx):
                 self.self_attn = KimiK3DSAAttention(
                     config=config,
                     hidden_size=self.hidden_size,
@@ -957,8 +945,7 @@ class KimiLinearModel(nn.Module, EagleModelMixin):
                     {"hidden_states": hidden_states, "residual": residual}
                 )
 
-            # NOTE: the final norm is applied in compute_logits instead of here,
-            # so the MTP draft model receives the pre-norm hidden states.
+            # NOTE: the final norm is applied in compute_logits instead of here.
             if residual is not None:
                 hidden_states = hidden_states + residual
             if aux_hidden_states:
@@ -1004,8 +991,7 @@ class KimiLinearModel(nn.Module, EagleModelMixin):
             attn_res_block_num,
             delta=prefix_delta,
         )
-        # NOTE: the final norm is applied in compute_logits instead of here, so
-        # the MTP draft model receives the pre-norm hidden states.
+        # NOTE: the final norm is applied in compute_logits instead of here.
         if aux_hidden_states:
             return hidden_states, aux_hidden_states
         return hidden_states
@@ -1070,9 +1056,6 @@ class KimiLinearModel(nn.Module, EagleModelMixin):
             if experts_unpacked and name.endswith(".weight_packed"):
                 name = name.replace(".weight_packed", ".weight")
 
-            spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
-            if spec_layer is not None:
-                continue  # skip spec decode layers for main model
             if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
                 # Models trained using ColossalAI may include these tensors in
                 # the checkpoint. Skip them.
@@ -1270,8 +1253,7 @@ class KimiLinearForCausalLM(
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
-        # The model's final norm is applied here (not at the end of forward) so
-        # that the pre-norm hidden states can be fed to the MTP draft model.
+        # The model's final norm is applied here, not at the end of forward.
         self.after_specialized_decode_step()
         hidden_states = self.model.norm(hidden_states, None)
         return self.logits_processor(self.lm_head, hidden_states)

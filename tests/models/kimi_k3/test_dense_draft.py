@@ -39,9 +39,7 @@ GQA_DRAFT = SimpleNamespace(num_key_value_heads=16)
         ("dspark", MLA_DRAFT, (AttentionBackendEnum.FLASHINFER_MLA, "fp8")),
         # A GQA draft (Qwen3 DSpark) keeps its own cache, off the sparse MLA path.
         ("dspark", GQA_DRAFT, (AttentionBackendEnum.FLASH_ATTN, "auto")),
-        # Other methods are left alone: K3.1's MTP layers keep the sparse path, and
-        # n-gram has no draft layers.
-        ("mtp", None, (None, None)),
+        # Other methods are left alone: n-gram has no draft layers.
         ("ngram", None, (None, None)),
     ],
 )
