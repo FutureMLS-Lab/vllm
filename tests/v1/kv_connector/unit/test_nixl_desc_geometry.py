@@ -1854,3 +1854,38 @@ def test_shared_base_regions_with_distinct_block_lens_stay_separate():
     np.testing.assert_array_equal(
         descs[:, 0], [base[0], base[0] + 256, base[0], base[0] + 256]
     )
+
+
+@pytest.mark.parametrize(
+    ("layout", "transfer_block_size"),
+    [(KVCacheLayout.BLHNC, 1024), (KVCacheLayout.LBNHC, 64)],
+)
+def test_packed_blocks_transfer_whole_for_small_kernel_block_drafts(
+    monkeypatch, layout, transfer_block_size
+):
+    """A Kimi-K3.1 DSpark draft's FLASHINFER_MLA takes 32/64-token kernel
+    blocks. In a packed layout it views them inside each block, so transfers
+    keep whole blocks; otherwise its block size splits them."""
+    from vllm.distributed.kv_transfer.kv_connector import utils as kv_utils
+    from vllm.v1.attention.backends.mla.flashinfer_mla import FlashInferMLABackend
+    from vllm.v1.worker.utils import select_common_block_size
+
+    spec = MLAAttentionSpec(
+        block_size=1024, num_kv_heads=1, head_size=576, dtype=torch.uint8
+    )
+    layer = SimpleNamespace(get_attn_backend=lambda: FlashInferMLABackend)
+    monkeypatch.setattr(
+        kv_utils, "get_layers_from_vllm_config", lambda *_: {"draft": layer}
+    )
+    vllm_config = SimpleNamespace(
+        cache_config=SimpleNamespace(get_resolved_kv_cache_layout=lambda: layout)
+    )
+    kv_cache_config = SimpleNamespace(
+        transfer_groups=[KVCacheGroupSpec(["draft"], spec)]
+    )
+
+    backends, specs = kv_utils.get_current_attn_backends_and_specs(
+        vllm_config, kv_cache_config, [FlashInferMLABackend]
+    )
+
+    assert select_common_block_size(1024, backends, specs) == transfer_block_size
