@@ -36,8 +36,8 @@ from vllm.model_executor.layers.mla import (
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
-from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
 from vllm.model_executor.utils import is_weights_pre_processed
+from vllm.models.kimi_k3.common.dsa_cache import KimiK3IndexerCache
 from vllm.models.kimi_k3.nvidia.index_rope import index_rope
 from vllm.models.kimi_k3.nvidia.low_latency_gemm import (
     low_latency_linear,
@@ -113,7 +113,6 @@ class KimiK3DSAIndexer(nn.Module):
         cache_config: CacheConfig | None = None,
         quant_config: QuantizationConfig | None = None,
         topk_indices_buffer: torch.Tensor | None = None,
-        use_merged_cache: bool = False,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -187,16 +186,13 @@ class KimiK3DSAIndexer(nn.Module):
             )
         # NOTE: fp8 naive index cache: value in fp8 plus one fp32
         # scale per quant_block_size elements (derived, never hardcoded).
-        self.use_merged_cache = use_merged_cache
-        self.k_cache = DeepseekV32IndexerCache(
+        self.k_cache = KimiK3IndexerCache(
             head_dim=self.index_head_dim
             + self.index_head_dim // self.quant_block_size * 4,
             dtype=torch.uint8,
             prefix=f"{prefix}.k_cache",
             cache_config=cast(CacheConfig, cache_config),
         )
-        if self.use_merged_cache:
-            self.k_cache.merged_into_mla_cache = True
         self.max_model_len = vllm_config.model_config.max_model_len
         self.max_total_seq_len = v32_indexer.get_max_prefill_buffer_size(vllm_config)
         self.topk_indices_buffer = topk_indices_buffer
@@ -563,11 +559,6 @@ class KimiK3DSAAttention(nn.Module):
                 f"(index share), got {dsa_config.index_topk_freq}."
             )
 
-        # KDA-hybrid models merge the indexer cache into the MLA layer's
-        # merged per-layer cache (MergedMLAIndexerSpec); non-hybrid DSA keeps the
-        # stock standalone indexer cache.
-        use_merged_cache = getattr(config, "linear_attn_config", None) is not None
-
         index_q_input_size = (
             self.q_lora_rank if self.q_lora_rank is not None else self.hidden_size
         )
@@ -584,7 +575,6 @@ class KimiK3DSAAttention(nn.Module):
             cache_config=cache_config,
             quant_config=quant_config,
             topk_indices_buffer=self.topk_indices_buffer,
-            use_merged_cache=use_merged_cache,
             prefix=f"{prefix}.dsa_indexer",
         )
 
@@ -640,16 +630,6 @@ class KimiK3DSAAttention(nn.Module):
         if getattr(mla_layer.impl, "use_shardq", False):
             mla_layer.use_shardq = True
             indexer.shardq_layer_name = mla_layer.layer_name
-
-        # Merged cache mode (MergedMLAIndexerSpec): the registered MLA layer is
-        # the wrapper's inner mla_attn; mark it with the indexer geometry so
-        # its get_kv_cache_spec returns the merged spec and the runner binds
-        # the indexer's section view of the merged cache to it.
-        if self.dsa_indexer.use_merged_cache:
-            mla_layer = cast(Any, self.mla_attn.mla_attn)
-            mla_layer.ds_index_head_size = self.dsa_indexer.k_cache.head_dim
-            mla_layer.ds_index_head_dim = self.index_head_dim
-            mla_layer.ds_indexer_layer_name = self.dsa_indexer.k_cache.prefix
 
         offload = vllm_config.offload_config
         self.weights_offloaded = (

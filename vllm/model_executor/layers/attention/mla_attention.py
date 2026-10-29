@@ -785,15 +785,10 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             )
 
             row_width = self.kv_cache.shape[-1]
-            if self.kv_cache.stride(0) % row_width == 0:
-                block_stride_rows = self.kv_cache.stride(0) // row_width
-            else:
-                # MergedMLAIndexerSpec: the block stride also spans the
-                # indexer section; the kernel addresses per-block token slots.
-                block_stride_rows = self.kv_cache.shape[1]
+            assert self.kv_cache.stride(0) % row_width == 0
             _CONVERT_REQ_INDEX_TO_GLOBAL_INDEX_KERNEL.register_warmup(
                 self._vllm_config,
-                block_stride_rows=block_stride_rows,
+                block_stride_rows=self.kv_cache.stride(0) // row_width,
             )
 
     def _uses_flat_kv_cache(self) -> bool:
@@ -1440,33 +1435,6 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             # See flashmla_sparse.py.
             state_content_bytes=DS_MLA_STATE_CONTENT_BYTES.get(self.kv_cache_dtype),
         )
-        if getattr(self, "ds_index_head_size", 0):
-            # Merged DSA cache: the indexer's bytes live in this layer's spec.
-            from vllm.v1.kv_cache_interface import MergedMLAIndexerSpec
-
-            # Only the FlashMLA sparse (NVIDIA) and ROCm AITER sparse MLA
-            # kernels understand the merged layout.
-            backend_name = self.attn_backend.get_name()
-            if backend_name not in ("FLASHMLA_SPARSE", "ROCM_AITER_MLA_SPARSE"):
-                raise RuntimeError(
-                    f"{self.layer_name}: the MergedMLAIndexerSpec merged KV cache "
-                    "requires the FLASHMLA_SPARSE or ROCM_AITER_MLA_SPARSE "
-                    f"attention backend, got {backend_name}. Other backends "
-                    "address the cache as dense MLA pages and would silently "
-                    "read wrong addresses. Set VLLM_ATTENTION_BACKEND to one of "
-                    "the supported backends."
-                )
-            return MergedMLAIndexerSpec.from_mla_and_indexer(
-                block_size=vllm_config.cache_config.block_size,
-                mla_head_size=self.head_size,
-                mla_dtype=kv_cache_dtype,
-                cache_dtype_str=self.kv_cache_dtype,
-                index_head_size=self.ds_index_head_size,
-                index_head_dim=self.ds_index_head_dim,
-                # FlashMLA sparse decode and DeepGEMM paged logits use
-                # 64-token blocks.
-                kernel_block_size=64,
-            )
         if self.sliding_window is not None:
             return SlidingWindowMLASpec(
                 **common_kwargs,

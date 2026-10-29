@@ -25,23 +25,23 @@ pytestmark = pytest.mark.skipif(
 HEAD_DIM = 128
 NUM_HEADS = 32
 ENTRY = HEAD_DIM + 4  # fp8 values + one fp32 scale per token
-BLOCK = 64  # K3.1 kernel block (merged-cache unit) size
-MLA_BYTES = 656  # fp8_ds_mla bytes per token ahead of the indexer section
-UNIT_STRIDE = 50512  # padded merged unit: 64 x (656 + 132), 656-aligned
+BLOCK = 64  # K3.1 kernel block size
+MLA_BYTES = 656  # fp8_ds_mla bytes per token ahead of the indexer page
+ROW_STRIDE = 50512  # packed block row: 64 x (656 + 132), 656-aligned
 TOPK = 2048
 
 
-def _make_cache(merged: bool, num_blocks: int) -> tuple[torch.Tensor, torch.Tensor]:
+def _make_cache(packed: bool, num_blocks: int) -> tuple[torch.Tensor, torch.Tensor]:
     """Return (backing bytes, indexer cache view [num_blocks, BLOCK, ENTRY])."""
-    if not merged:
+    if not packed:
         raw = torch.zeros(num_blocks, BLOCK, ENTRY, dtype=torch.uint8, device="cuda")
         return raw, raw
-    # Same section view as split_merged_dsa_cache_views (after the squeeze).
-    raw = torch.zeros(num_blocks, UNIT_STRIDE, dtype=torch.uint8, device="cuda")
+    # One DSA layer's indexer page inside a packed block row.
+    raw = torch.zeros(num_blocks, ROW_STRIDE, dtype=torch.uint8, device="cuda")
     view = torch.as_strided(
         raw,
         size=(num_blocks, BLOCK, ENTRY),
-        stride=(UNIT_STRIDE, ENTRY, 1),
+        stride=(ROW_STRIDE, ENTRY, 1),
         storage_offset=BLOCK * MLA_BYTES,
     )
     return raw, view
@@ -66,10 +66,10 @@ def _dequant(view: torch.Tensor) -> torch.Tensor:
     return torch.cat(rows)
 
 
-@pytest.mark.parametrize("merged", [False, True])
+@pytest.mark.parametrize("packed", [False, True])
 @pytest.mark.parametrize("num_tokens", [1, 7, 300])
 @torch.inference_mode()
-def test_k_norm_quant_insert_matches_unfused(merged: bool, num_tokens: int):
+def test_k_norm_quant_insert_matches_unfused(packed: bool, num_tokens: int):
     torch.manual_seed(0)
     num_blocks = (num_tokens + 2 * BLOCK - 1) // BLOCK + 1
     # The merged wkv GEMM output is [k | weights]; k is a strided view of it.
@@ -87,7 +87,7 @@ def test_k_norm_quant_insert_matches_unfused(merged: bool, num_tokens: int):
         slots[1] = -1
     slots = slots.to(torch.int64)
 
-    ref_raw, ref_view = _make_cache(merged, num_blocks)
+    ref_raw, ref_view = _make_cache(packed, num_blocks)
     ref_k = F.layer_norm(k.float(), (HEAD_DIM,), weight, bias, eps).to(k.dtype)
     ops.indexer_k_quant_and_cache(
         ref_k[:num_slots].contiguous(),
@@ -97,7 +97,7 @@ def test_k_norm_quant_insert_matches_unfused(merged: bool, num_tokens: int):
         "mxfp8" if mqa_logits_use_mx_scales() else "ue8m0",
     )
 
-    out_raw, out_view = _make_cache(merged, num_blocks)
+    out_raw, out_view = _make_cache(packed, num_blocks)
     topk = torch.full((num_tokens + 5, TOPK), 7, dtype=torch.int32, device="cuda")
     indexer_k_norm_quant_insert(k, weight, bias, eps, slots, out_view, topk, num_tokens)
 
@@ -108,7 +108,7 @@ def test_k_norm_quant_insert_matches_unfused(merged: bool, num_tokens: int):
     torch.testing.assert_close(
         _dequant(out_view), _dequant(ref_view), atol=0.07, rtol=0.07
     )
-    if merged:
+    if packed:
         # The MLA section of each unit is untouched.
         mla = out_raw[:, : BLOCK * MLA_BYTES]
         assert torch.count_nonzero(mla) == 0
@@ -165,24 +165,24 @@ def _rms_norm_ref(x: torch.Tensor, w: torch.Tensor, eps: float) -> torch.Tensor:
     return y.to(x.dtype)
 
 
-def _dsa_caches(merged: bool, num_blocks: int) -> tuple[torch.Tensor, torch.Tensor]:
-    """(fp8_ds_mla cache, indexer cache) views, both sections of one unit when
-    merged."""
-    if not merged:
+def _dsa_caches(packed: bool, num_blocks: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """(fp8_ds_mla cache, indexer cache) views, both pages of one block row
+    when packed."""
+    if not packed:
         mla = torch.zeros(
             num_blocks, BLOCK, MLA_BYTES, dtype=torch.uint8, device="cuda"
         )
         return mla, _make_cache(False, num_blocks)[1]
     raw, index = _make_cache(True, num_blocks)
     return torch.as_strided(
-        raw, (num_blocks, BLOCK, MLA_BYTES), (UNIT_STRIDE, MLA_BYTES, 1)
+        raw, (num_blocks, BLOCK, MLA_BYTES), (ROW_STRIDE, MLA_BYTES, 1)
     ), index
 
 
-@pytest.mark.parametrize("merged", [False, True])
+@pytest.mark.parametrize("packed", [False, True])
 @pytest.mark.parametrize("num_tokens", [1, 7, 300])
 @torch.inference_mode()
-def test_fused_prologue_matches_unfused(merged: bool, num_tokens: int):
+def test_fused_prologue_matches_unfused(packed: bool, num_tokens: int):
     """dsa_fused_prologue == q/kv RMSNorm + fp8_ds_mla insert + indexer key insert
     + top-k fill, on strided views of the projection outputs."""
     torch.manual_seed(0)
@@ -206,7 +206,7 @@ def test_fused_prologue_matches_unfused(merged: bool, num_tokens: int):
         slots[1] = -1
     slots = slots.to(torch.int64)
 
-    ref_mla, ref_index = _dsa_caches(merged, num_blocks)
+    ref_mla, ref_index = _dsa_caches(packed, num_blocks)
     ref_kv = _rms_norm_ref(kv_c, kv_w, eps)
     ops.concat_and_cache_mla(
         ref_kv[:num_slots].contiguous(),
@@ -225,7 +225,7 @@ def test_fused_prologue_matches_unfused(merged: bool, num_tokens: int):
         "mxfp8" if mqa_logits_use_mx_scales() else "ue8m0",
     )
 
-    mla, index = _dsa_caches(merged, num_blocks)
+    mla, index = _dsa_caches(packed, num_blocks)
     topk = torch.full((num_tokens + 5, TOPK), 7, dtype=torch.int32, device="cuda")
     q_out, kv_out = dsa_fused_prologue(
         q_c, kv_c, k_pe, k, q_w, kv_w, k_w, k_b, eps, topk, mla, slots, index, slots

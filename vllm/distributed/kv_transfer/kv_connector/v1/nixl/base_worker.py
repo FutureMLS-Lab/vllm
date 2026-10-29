@@ -1647,9 +1647,9 @@ class NixlBaseConnectorWorker:
                 physical_ratio = self._physical_blocks_per_logical_kv_block
                 block_len = physical_page_size // physical_ratio
                 block_stride = physical_page_size
-                if self._is_csa_linear and cache.ndim != 1:
-                    # CSA-linear packs multiple cache owners in each block, so
-                    # state views advance by the packed block stride.
+                if self._has_packed_cache and cache.ndim != 1:
+                    # Packed blocks hold several layers' pages, so state views
+                    # advance by the packed block stride.
                     block_stride = cache.stride(0) * cache.element_size()
                 assert block_stride % physical_ratio == 0
                 region_specs = [

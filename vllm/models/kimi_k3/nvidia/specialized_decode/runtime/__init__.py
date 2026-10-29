@@ -78,7 +78,6 @@ def unsupported(vllm_config) -> str | None:
     )
     compilation = vllm_config.compilation_config
     graphs = compilation.cudagraph_mode
-    # Kimi K3.1: sparse (DSA) MLA layers over the merged fp8_ds_mla + indexer cache.
     dsa = getattr(text, "dsa_config", None) is not None
     checks = (
         (not current_platform.is_device_capability_family(100), "this GPU (SM100/103)"),
@@ -135,9 +134,8 @@ def unsupported(vllm_config) -> str | None:
             spec is not None and envs.VLLM_KIMI_K3_AUX_ATTN_RES_STREAM,
             "the AttnRes aux stream",
         ),
-        (
-            dsa and vllm_config.cache_config.cache_dtype != "fp8_ds_mla",
-            "DSA layers on KV cache dtypes other than fp8_ds_mla",
-        ),
+        # The DSA core reads 64-token units of MLA rows followed by indexer
+        # rows; the packed cache keeps them in separate pages.
+        (dsa, "DSA layers (Kimi K3.1)"),
     )
     return next((reason for failed, reason in checks if failed), None)

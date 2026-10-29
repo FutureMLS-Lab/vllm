@@ -523,9 +523,7 @@ class KimiK3ForConditionalGenerationConfig(VerifyAndUpdateConfig):
     @classmethod
     def verify_and_update_config(cls, vllm_config: "VllmConfig") -> None:
         """Default the kv-cache dtype to "fp8_ds_mla" when the text backbone
-        carries DSA; hybrid (KDA + MLA) DSA models support fp8_ds_mla and
-        nvfp4_ds_mla.
-        """
+        carries DSA."""
         hf_config = vllm_config.model_config.hf_config
         # Multimodal composite configs carry dsa_config on text_config;
         # text-only models have it at the top level.
@@ -538,17 +536,6 @@ class KimiK3ForConditionalGenerationConfig(VerifyAndUpdateConfig):
         ):
             cache_config.cache_dtype = "fp8_ds_mla"
             logger.info("Using custom fp8 kv-cache format for Kimi K3 DSA")
-        elif (
-            getattr(hf_text_config, "linear_attn_config", None) is not None
-            and cache_config.cache_dtype != "nvfp4_ds_mla"
-        ):
-            raise ValueError(
-                "The MergedMLAIndexerSpec merged KV cache of hybrid (KDA + MLA) "
-                "DSA models only supports fp8_ds_mla and nvfp4_ds_mla; explicit "
-                f"cache_dtype={cache_config.cache_dtype!r} is not servable (a "
-                "dense MLA cannot address the flat merged layout). Use "
-                "--kv-cache-dtype fp8_ds_mla, nvfp4_ds_mla or auto."
-            )
         if vllm_config.speculative_config is not None:
             from vllm.models.kimi_k3.nvidia.dense_draft import configure_dense_draft
 

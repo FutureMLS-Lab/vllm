@@ -359,8 +359,8 @@ def get_current_attn_backends_and_specs(
 ) -> tuple[list[type[AttentionBackend]], list[AttentionSpec | None]]:
     """Distinct (backend, spec) pairs of the transfer layers, else ``fallback``.
 
-    Compressed caches are skipped: their kernel pages never split transferred
-    blocks.
+    Caches written from their block table (compressed ones, or as their backend
+    declares) are skipped: their kernel pages never split transferred blocks.
     """
     pairs: dict[tuple[type[AttentionBackend], AttentionSpec | None], None] = {}
     layer_type = cast(type[Any], AttentionLayerBase)
@@ -369,13 +369,16 @@ def get_current_attn_backends_and_specs(
         layers = get_layers_from_vllm_config(vllm_config, layer_type, group.layer_names)
         for name, layer in layers.items():
             spec = specs.get(name, group.kv_cache_spec)
-            if isinstance(spec, AttentionSpec) and spec.tokens_per_state > 1:
+            backend = layer.get_attn_backend()
+            if isinstance(spec, AttentionSpec) and (
+                spec.tokens_per_state > 1 or backend.writes_kv_cache_from_block_table()
+            ):
                 layout = vllm_config.cache_config.get_resolved_kv_cache_layout()
-                assert layout.is_block_outermost, "Compressed caches must be packed"
+                assert layout.is_block_outermost, "Kernel-paged caches must be packed"
                 continue
             if not isinstance(spec, AttentionSpec):
                 spec = None
-            pairs[layer.get_attn_backend(), spec] = None
+            pairs[backend, spec] = None
     if not pairs:
         return fallback, [None] * len(fallback)
     return [backend for backend, _ in pairs], [spec for _, spec in pairs]

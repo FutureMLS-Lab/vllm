@@ -104,6 +104,10 @@ class BaseSpeculator(ABC):
 
 
 class DraftModelSpeculator(BaseSpeculator):
+    # Whether every slot mapping the speculator builds goes through its attention
+    # groups' map_to_kernel_slot_mapping, so packed token caches may split.
+    maps_slot_mapping = False
+
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         self.vllm_config = vllm_config
         self.device = device
@@ -295,6 +299,7 @@ class DraftModelSpeculator(BaseSpeculator):
             self.attn_vllm_config,
             self.device,
             active_layer_names=self.draft_attn_layer_names,
+            maps_slot_mapping=self.maps_slot_mapping,
         )
         self.block_tables = block_tables
         # The target model runner's buffers and attention groups. Draft

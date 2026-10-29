@@ -57,7 +57,6 @@ from vllm.v1.attention.ops.shardq import shard_q, unshard_out
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     KVQuantMode,
-    MergedMLAIndexerSpec,
     is_quantized_kv_cache,
 )
 from vllm.v1.worker.workspace import current_workspace_manager
@@ -190,30 +189,13 @@ class FlashMLASparseBackend(AttentionBackend):
 
     @staticmethod
     def get_supported_kernel_block_sizes(kv_cache_spec=None) -> list[int | MultipleOf]:
-        if isinstance(kv_cache_spec, MergedMLAIndexerSpec):
-            # The merged MLA + indexer cache is addressed in its padded units.
-            return [kv_cache_spec.kernel_block_size]
-        if (
-            isinstance(kv_cache_spec, AttentionSpec)
-            and kv_cache_spec.kv_quant_mode != KVQuantMode.NONE
-            and current_platform.is_device_capability_family(100)
-        ):
-            return [64]
         return [MultipleOf(64)]
 
     @classmethod
     def customize_spec(cls, spec: AttentionSpec) -> AttentionSpec:
-        if isinstance(spec, MergedMLAIndexerSpec):
-            # Whole padded units apart; the unit pad already keeps the MLA
-            # rows aligned for TMA.
-            return replace(
-                spec, block_stride_alignment=MultipleOf(spec.kernel_block_size)
-            )
-        # Off SM100 the quantized kernel reads 64-token pages, only needed
-        # when blocks span several.
-        if spec.kv_quant_mode != KVQuantMode.NONE and (
-            not current_platform.is_device_capability_family(100)
-        ):
+        # The quantized kernel reads 64-token pages, only needed when blocks
+        # span several.
+        if spec.kv_quant_mode != KVQuantMode.NONE:
             return replace(spec, block_stride_alignment=MultipleOf(64))
         return align_blocks_to_rows(spec)
 

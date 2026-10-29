@@ -12,7 +12,7 @@ from enum import Enum, IntEnum
 from fractions import Fraction
 from functools import cached_property
 from math import prod
-from typing import TYPE_CHECKING, Self, TypeVar, cast
+from typing import TYPE_CHECKING, Self, TypeVar
 
 import torch
 
@@ -382,14 +382,6 @@ def compute_layout_strides(
     )
     order = layout.stride_order
     padded_page_size = getattr(spec, "page_size_padded", None)
-    if (
-        padded_page_size is None
-        and kernel_block_size is None
-        and getattr(spec, "padded_unit_bytes", 0) != 0
-    ):
-        # MergedMLAIndexerSpec pads each 64-token unit, not the page tail;
-        # page_size_bytes already includes the pads.
-        padded_page_size = spec.page_size_bytes
     if padded_page_size is not None:
         assert kernel_block_size is None or kernel_block_size == spec.block_size, (
             "Padded KV pages do not support kernel block splitting."
@@ -434,26 +426,23 @@ def create_kv_cache_views(
     ratio = shape_bytes[0] // num_blocks
     if ratio > 1:
         # Kernel blocks subdivide a manager block into `ratio` equal pieces, so
-        # they sit a constant stride apart only if a block is one uniform page:
-        # no page-tail padding, and no other layer's page before the next block.
-        # MergedMLAIndexerSpec pads each unit, so its stride is the padded unit.
+        # they sit a constant stride apart only if a block is one dense page: no
+        # padding at its end, and no other layer's page before the next block.
         dense_page_size = prod(compute_layer_kv_cache_shape_bytes(spec, 1)[1:])
-        padded_unit = getattr(spec, "padded_unit_bytes", 0)
-        expected = ratio * padded_unit if padded_unit else dense_page_size
-        if block_stride != expected:
+        if block_stride != dense_page_size:
             raise ValueError(
                 f"The resolved KV cache layout ({layout.name}) does not store "
-                "blocks as uniform pages (block stride "
-                f"{block_stride} != page {expected}), so a manager "
+                "blocks as dense, unpadded pages (block stride "
+                f"{block_stride} != page {dense_page_size}), so a manager "
                 f"block cannot be split into {ratio} kernel blocks of "
                 f"{kernel_block_size} tokens. Reduce --block-size to "
                 f"{kernel_block_size} or set VLLM_KV_CACHE_LAYOUT to a "
                 "layer-compact layout (e.g. LBNHC)."
             )
-        assert expected % ratio == 0, (
-            f"Page {expected} must divide into {ratio} equal kernel blocks."
+        assert block_stride % ratio == 0, (
+            f"Block stride {block_stride} must divide into {ratio} equal kernel blocks."
         )
-        block_stride = expected // ratio
+        block_stride //= ratio
 
     logical_shape = (num_layers, *shape_bytes)
     strides = compute_layout_strides(
@@ -803,170 +792,6 @@ class MLAAttentionSpec(FullAttentionSpec):
                     "the same attention spec."
                 )
         return merged_spec
-
-
-@dataclass(frozen=True, kw_only=True)
-class MergedMLAIndexerSpec(MLAAttentionSpec):
-    """MLA + DSA indexer merged per-layer KV cache spec (KDA-hybrid DSA models).
-
-    The MLA KV (fp8_ds_mla, 656 bytes/token) and the DSA indexer data
-    (132 bytes/token: 128 fp8 + 4 fp32 scale) live in one flat uint8 cache
-    per layer instead of two registered caches. Physical layout per 64-token
-    merged unit: ``[64x656 MLA | 64x128 indexer data | 64x4 scale | pad]``.
-
-    The SM100 sparse-decode kernel requires the cache block stride to be a
-    multiple of its 656B TMA row width, which the dense 50432B unit
-    violates; each unit is tail-padded to 50512B (``padded_unit_bytes``),
-    which no kernel ever addresses.
-
-    nvfp4_ds_mla rows are 352 bytes. Their unit is padded to hold 64 plain fp8
-    MLA rows (64 x 576B, rounded up to 352B rows: 36960B), since a dense MLA
-    draft (EAGLE3 / DSpark) binds those at the head of each unit.
-    """
-
-    # indexer per-token bytes (data + scale), e.g. 132 for head_dim 128.
-    index_head_size: int = 0
-    # indexer per-token data-section bytes (no scale), e.g. 128.
-    index_head_dim: int = 0
-    # MLA per-token element count (kv_lora_rank + qk_rope_head_dim).
-    mla_head_size: int = 0
-    # kernel contract granularity for the merged unit (always 64).
-    kernel_block_size: int = 0
-    # Bytes per 64-token merged unit including the TMA-alignment tail pad;
-    # 0 means dense units (no padding).
-    padded_unit_bytes: int = 0
-
-    @classmethod
-    def merged_padded_unit_bytes(
-        cls,
-        cache_dtype_str: str | None,
-        mla_head_size: int,
-        mla_dtype: torch.dtype,
-        index_head_size: int,
-        kernel_block_size: int,
-    ) -> int:
-        """Bytes per merged unit, including the tail pad (fp8_ds_mla:
-        TMA row alignment; nvfp4_ds_mla: room for a dense draft's fp8 rows)."""
-        mla_bytes = DS_MLA_STATE_CONTENT_BYTES.get(
-            cache_dtype_str, mla_head_size * get_dtype_size(mla_dtype)
-        )
-        unit_bytes = kernel_block_size * (mla_bytes + index_head_size)
-        if cache_dtype_str == "nvfp4_ds_mla":
-            unit_bytes = max(unit_bytes, kernel_block_size * mla_head_size)
-        if cache_dtype_str in DS_MLA_STATE_CONTENT_BYTES:
-            unit_bytes = round_up(unit_bytes, mla_bytes)
-        return unit_bytes
-
-    @classmethod
-    def from_mla_and_indexer(
-        cls,
-        block_size: int,
-        mla_head_size: int,
-        mla_dtype: torch.dtype,
-        cache_dtype_str: str | None,
-        index_head_size: int,
-        index_head_dim: int,
-        kernel_block_size: int,
-    ) -> Self:
-        assert 0 < index_head_dim < index_head_size, (
-            f"index_head_dim ({index_head_dim}) must be in "
-            f"(0, index_head_size={index_head_size})"
-        )
-        assert (index_head_size - index_head_dim) % 4 == 0, (
-            f"indexer scale section ({index_head_size - index_head_dim} B) "
-            "must be a multiple of 4 (fp32 scale)"
-        )
-        assert kernel_block_size > 0 and block_size % kernel_block_size == 0, (
-            f"block_size ({block_size}) must be a multiple of "
-            f"kernel_block_size ({kernel_block_size}); the merged-unit layout "
-            "cannot align otherwise"
-        )
-        mla_bytes = DS_MLA_STATE_CONTENT_BYTES.get(
-            cache_dtype_str, mla_head_size * get_dtype_size(mla_dtype)
-        )
-        padded_unit_bytes = cls.merged_padded_unit_bytes(
-            cache_dtype_str,
-            mla_head_size,
-            mla_dtype,
-            index_head_size,
-            kernel_block_size,
-        )
-        dense_unit_bytes = kernel_block_size * (mla_bytes + index_head_size)
-        return cls(
-            block_size=block_size,
-            num_kv_heads=1,
-            head_size=mla_bytes + index_head_size,
-            dtype=torch.uint8,
-            cache_dtype_str=cache_dtype_str,
-            state_content_bytes=mla_bytes + index_head_size,
-            index_head_size=index_head_size,
-            index_head_dim=index_head_dim,
-            mla_head_size=mla_head_size,
-            kernel_block_size=kernel_block_size,
-            padded_unit_bytes=(
-                padded_unit_bytes if padded_unit_bytes != dense_unit_bytes else 0
-            ),
-        )
-
-    @property
-    def page_size_bytes(self) -> int:
-        if self.padded_unit_bytes:
-            units_per_page = self.block_size // self.kernel_block_size
-            return units_per_page * self.padded_unit_bytes
-        return super().page_size_bytes
-
-    @property
-    def mla_bytes_per_token(self) -> int:
-        return self.head_size - self.index_head_size
-
-    @classmethod
-    def merge(cls, specs: list[Self]) -> Self:
-        assert all(type(spec) is cls for spec in specs), (
-            "All attention layers in the same KV cache group must be "
-            "MergedMLAIndexerSpec."
-        )
-        key_fields = (
-            "head_size",
-            "index_head_size",
-            "mla_head_size",
-            "kernel_block_size",
-            "padded_unit_bytes",
-        )
-        for name in key_fields:
-            values = {getattr(spec, name) for spec in specs}
-            assert len(values) == 1, (
-                f"All MergedMLAIndexerSpec layers in the same KV cache group must "
-                f"share {name}, got {values}."
-            )
-        # Delegate common field merging to the parent, then reattach the
-        # merged-cache fields (mirrors RSWASpec.merge).
-        base = MLAAttentionSpec.merge(cast(list[MLAAttentionSpec], specs))
-        first = specs[0]
-        return cls(
-            block_size=base.block_size,
-            block_stride_alignment=base.block_stride_alignment,
-            num_kv_heads=base.num_kv_heads,
-            head_size=base.head_size,
-            dtype=base.dtype,
-            kv_quant_mode=base.kv_quant_mode,
-            dcp_sharded=base.dcp_sharded,
-            max_tp_shards=base.max_tp_shards,
-            page_size_padded=base.page_size_padded,
-            num_head_slots=base.num_head_slots,
-            state_content_bytes=base.state_content_bytes,
-            cache_dtype_str=base.cache_dtype_str,
-            topk_buffer_width=base.topk_buffer_width,
-            tokens_per_state=base.tokens_per_state,
-            model_version=base.model_version,
-            cache_role=base.cache_role,
-            is_index_group_leader=base.is_index_group_leader,
-            non_causal_multi_token_decode=base.non_causal_multi_token_decode,
-            index_head_dim=first.index_head_dim,
-            index_head_size=first.index_head_size,
-            mla_head_size=first.mla_head_size,
-            kernel_block_size=first.kernel_block_size,
-            padded_unit_bytes=first.padded_unit_bytes,
-        )
 
 
 @dataclass(frozen=True, kw_only=True)

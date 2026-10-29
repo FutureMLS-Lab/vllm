@@ -958,7 +958,6 @@ class Platform:
         from vllm.v1.kv_cache_interface import (
             FullAttentionSpec,
             MambaSpec,
-            MergedMLAIndexerSpec,
             MLAAttentionSpec,
             get_kv_quant_mode,
         )
@@ -975,7 +974,6 @@ class Platform:
         kv_quant_mode = get_kv_quant_mode(cache_config.cache_dtype)
 
         # Compute attention page size for 1 token
-        merged_unit_bytes: int | None = None
         if model_config.use_mla:
             from vllm.v1.kv_cache_interface import DS_MLA_STATE_CONTENT_BYTES
 
@@ -990,28 +988,6 @@ class Platform:
                     cache_config.cache_dtype
                 ),
             ).page_size_bytes
-
-            dsa_config = getattr(model_config.hf_text_config, "dsa_config", None)
-            if (
-                dsa_config is not None
-                and getattr(model_config.hf_text_config, "linear_attn_config", None)
-                is not None
-            ):
-                # Merged DSA cache (MergedMLAIndexerSpec): the indexer bytes ride
-                # in the MLA layer's merged cache, and each 64-token merged
-                # unit is tail-padded up to the fp8 decode kernel's TMA row
-                # stride (656B), so the block anchor must work in whole
-                # padded units instead of per-token bytes.
-                index_head_size = (
-                    dsa_config.index_head_dim + 4
-                )  # + fp32 scale per token (quant_block = head_dim)
-                merged_unit_bytes = MergedMLAIndexerSpec.merged_padded_unit_bytes(
-                    cache_config.cache_dtype,
-                    model_config.get_head_size(),
-                    kv_cache_dtype,
-                    index_head_size,
-                    kernel_block_size=64,
-                )
         elif (
             cache_config.cache_dtype.startswith("turboquant_")
             or cache_config.cache_dtype == "ultraquant_4bit"
@@ -1122,34 +1098,38 @@ class Platform:
                 # For hybrid MLA/Mamba models, make the manager block size a
                 # multiple of 128 so split kernel blocks keep that invariant.
                 kernel_block_alignment_size = max(kernel_block_alignment_size, 128)
+        checkpoint_alignment = 1
         if cache_config.mamba_cache_mode == "align":
             # Internal prefill checkpoints land on block boundaries.
+            checkpoint_alignment = (
+                get_mamba_prefill_checkpoint_alignment(vllm_config) or 1
+            )
             kernel_block_alignment_size = lcm(
-                kernel_block_alignment_size,
-                get_mamba_prefill_checkpoint_alignment(vllm_config) or 1,
+                kernel_block_alignment_size, checkpoint_alignment
             )
 
-        if merged_unit_bytes is not None:
-            # Merged DSA cache (MergedMLAIndexerSpec): the attention page is a
-            # whole number of padded 64-token units, so anchor the block
-            # size in units and skip the per-token formula entirely. The
-            # padded unit is only 16 B aligned, but FlashInfer's KDA decode
-            # needs the shared page stride 16-element (64 B fp32) aligned.
-            attn_block_size = 64 * cdiv(mamba_page_size, merged_unit_bytes)
-            backend_block_alignment = lcm(
-                backend_block_alignment,
-                64 * (64 // math.gcd(merged_unit_bytes, 64)),
+        # Models that pack every layer's page into one block row (BLHNC) size
+        # the row themselves; no page is padded then.
+        packed_block_size = None
+        if hasattr(model_cls, "get_packed_hybrid_block_size"):
+            packed_block_size = model_cls.get_packed_hybrid_block_size(
+                vllm_config,
+                attn_page_size_1_token,
+                mamba_page_size,
+                lcm(backend_block_alignment, checkpoint_alignment),
             )
+        if packed_block_size is not None:
+            attn_block_size = packed_block_size
         else:
-            # Use minimum block size that satisfies both backend alignment
-            # and mamba page size compatibility
+            # Use minimum block size that satisfies both backend alignment and
+            # mamba page size compatibility
             attn_block_size = kernel_block_alignment_size * cdiv(
                 mamba_page_size,
                 kernel_block_alignment_size * attn_page_size_1_token,
             )
-        attn_block_size = backend_block_alignment * cdiv(
-            attn_block_size, backend_block_alignment
-        )
+            attn_block_size = backend_block_alignment * cdiv(
+                attn_block_size, backend_block_alignment
+            )
 
         if cache_config.block_size < attn_block_size:
             cache_config.block_size = attn_block_size
@@ -1162,11 +1142,11 @@ class Platform:
         if cache_config.mamba_cache_mode == "align":
             cache_config.mamba_block_size = cache_config.block_size
 
+        if packed_block_size is not None:
+            return
+
         # Pad mamba page size to exactly match attention page size
-        if merged_unit_bytes is not None:
-            attn_page_size = (cache_config.block_size // 64) * merged_unit_bytes
-        else:
-            attn_page_size = cache_config.block_size * attn_page_size_1_token
+        attn_page_size = cache_config.block_size * attn_page_size_1_token
         assert attn_page_size >= mamba_page_size
 
         if attn_page_size == mamba_page_size:

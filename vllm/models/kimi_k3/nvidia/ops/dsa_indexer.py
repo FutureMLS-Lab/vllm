@@ -139,7 +139,7 @@ def indexer_k_norm_quant_insert(
     fill of the top-k rows ``[:num_tokens]``.
 
     ``kv_cache`` is ``[num_blocks, block_size, head_dim + 4]`` uint8, possibly
-    a strided section of the merged cache. Rows past ``slot_mapping`` or with
+    a strided page view of a packed cache. Rows past ``slot_mapping`` or with
     a negative slot are not inserted.
     """
     if num_tokens == 0:
@@ -400,7 +400,7 @@ def dsa_fused_prologue(
 
     ``mla_cache`` (``[num_blocks, block_size, 656]``) and ``index_cache``
     (``[num_blocks, block_size, head_dim + 4]``) are uint8, possibly strided
-    sections of the merged cache; ``None`` (profile runs) skips the insert. Rows
+    page views of a packed cache; ``None`` (profile runs) skips the insert. Rows
     past a slot mapping or with a negative slot are not inserted.
 
     Returns ``(q_c_normed, kv_c_normed)``.

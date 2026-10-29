@@ -32,6 +32,8 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.pull_worker import (
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.push_worker import (
     NixlPushConnectorWorker,
 )
+from vllm.models.kimi_k3.common.dsa_cache import KimiK3IndexerBackend
+from vllm.v1.attention.backends.mla.indexer import Glm5NextIndexerBackend
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheGroupSpec,
@@ -694,11 +696,19 @@ def _make_mla_hybrid_worker(
 
 
 @pytest.mark.cpu_test
-def test_nixl_keeps_packed_sparse_mla_manager_block():
+@pytest.mark.parametrize(
+    ("indexer_backend", "tokens_per_state"),
+    [
+        # GLM-5.3-Flash: a compressed kpool indexer.
+        (Glm5NextIndexerBackend, 4),
+        # Kimi-K3.1: a token indexer, written at kernel slots.
+        (KimiK3IndexerBackend, 1),
+    ],
+)
+def test_nixl_keeps_packed_sparse_mla_manager_block(indexer_backend, tokens_per_state):
     """Like the worker, NIXL keeps packed sparse MLA + indexer manager blocks."""
     from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
     from vllm.v1.attention.backends.mla.flashmla_sparse import FlashMLASparseBackend
-    from vllm.v1.attention.backends.mla.indexer import Glm5NextIndexerBackend
     from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs
 
     specs = {
@@ -706,10 +716,14 @@ def test_nixl_keeps_packed_sparse_mla_manager_block():
             1152, num_kv_heads=1, head_size=512, dtype=torch.bfloat16
         ),
         "indexer": MLAAttentionSpec(
-            1152, num_kv_heads=1, head_size=128, dtype=torch.uint8, tokens_per_state=4
+            1152,
+            num_kv_heads=1,
+            head_size=128,
+            dtype=torch.uint8,
+            tokens_per_state=tokens_per_state,
         ),
     }
-    backends = {"mla": FlashMLASparseBackend, "indexer": Glm5NextIndexerBackend}
+    backends = {"mla": FlashMLASparseBackend, "indexer": indexer_backend}
     layers = {
         name: MagicMock(spec=AttentionLayerBase, **{"get_attn_backend.return_value": b})
         for name, b in backends.items()

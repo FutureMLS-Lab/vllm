@@ -4,13 +4,13 @@
 
 Ports ``nvidia/dsa.py``: the indexer runs through
 ``SparseAttnIndexer.forward_hip`` (the DeepSeek V3.2 ROCm pattern) and the
-sparse MLA layers are served by ROCM_AITER_MLA_SPARSE over the merged
-fp8_ds_mla cache (MergedMLAIndexerSpec). The DeepGEMM-only 32/64 index-head
-zero padding is dropped: the ROCm indexer kernels take the native head count.
+sparse MLA layers are served by ROCM_AITER_MLA_SPARSE over the fp8_ds_mla
+cache. The DeepGEMM-only 32/64 index-head zero padding is dropped: the ROCm
+indexer kernels take the native head count.
 """
 
 import math
-from typing import Any, cast
+from typing import cast
 
 import torch
 import torch.nn.functional as F
@@ -35,7 +35,7 @@ from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     per_token_group_quant_fp8,
 )
 from vllm.model_executor.layers.sparse_attn_indexer import SparseAttnIndexer
-from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
+from vllm.models.kimi_k3.common.dsa_cache import KimiK3IndexerCache
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 from vllm.v1.attention.backends.mla import indexer as v32_indexer
 
@@ -73,10 +73,9 @@ class KimiK3DSAIndexer(nn.Module):
 
     Forward quantizes the indexer query, folds the scales into the per-head
     weights and drives ``torch.ops.vllm.rocm_aiter_sparse_attn_indexer`` via
-    ``SparseAttnIndexer.forward_hip``. Merged-cache layers pass
-    ``cache_layout="NORMAL"``: the MergedMLAIndexerSpec indexer section is
-    block-flat, which the Triton insert wrapper cannot infer from the cache
-    shape alone.
+    ``SparseAttnIndexer.forward_hip`` with ``cache_layout="NORMAL"``: the
+    indexer pages are block-flat, which the Triton insert wrapper cannot infer
+    from the cache shape alone.
     """
 
     def __init__(
@@ -92,7 +91,6 @@ class KimiK3DSAIndexer(nn.Module):
         cache_config: CacheConfig | None = None,
         quant_config: QuantizationConfig | None = None,
         topk_indices_buffer: torch.Tensor | None = None,
-        use_merged_cache: bool = False,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -147,15 +145,12 @@ class KimiK3DSAIndexer(nn.Module):
         self.index_softmax_scale = self.index_head_dim**-0.5
         # fp8 naive index cache: fp8 value bytes plus one fp32 scale per head
         # (quant_block_size == index_head_dim by contract), hence +4 bytes.
-        self.use_merged_cache = use_merged_cache
-        self.k_cache = DeepseekV32IndexerCache(
+        self.k_cache = KimiK3IndexerCache(
             head_dim=self.index_head_dim + 4,
             dtype=torch.uint8,
             prefix=f"{prefix}.k_cache",
             cache_config=cast(CacheConfig, cache_config),
         )
-        if self.use_merged_cache:
-            self.k_cache.merged_into_mla_cache = True
         self.max_model_len = vllm_config.model_config.max_model_len
         self.max_total_seq_len = v32_indexer.get_max_prefill_buffer_size(vllm_config)
         self.topk_indices_buffer = topk_indices_buffer
@@ -168,7 +163,7 @@ class KimiK3DSAIndexer(nn.Module):
             self.max_model_len,
             self.max_total_seq_len,
             topk_indices_buffer,
-            cache_layout="NORMAL" if use_merged_cache else None,
+            cache_layout="NORMAL",
         )
 
     def _quantize_index_q_and_weights(
@@ -385,11 +380,6 @@ class KimiK3DSAAttention(nn.Module):
                 f"(index share), got {dsa_config.index_topk_freq}."
             )
 
-        # KDA-hybrid models merge the indexer cache into the MLA layer's
-        # merged per-layer cache (MergedMLAIndexerSpec); non-hybrid DSA keeps
-        # the stock standalone indexer cache.
-        use_merged_cache = getattr(config, "linear_attn_config", None) is not None
-
         index_q_input_size = (
             self.q_lora_rank if self.q_lora_rank is not None else self.hidden_size
         )
@@ -405,7 +395,6 @@ class KimiK3DSAAttention(nn.Module):
             cache_config=cache_config,
             quant_config=quant_config,
             topk_indices_buffer=self.topk_indices_buffer,
-            use_merged_cache=use_merged_cache,
             prefix=f"{prefix}.dsa_indexer",
         )
 
@@ -437,7 +426,7 @@ class KimiK3DSAAttention(nn.Module):
         )
         # The plain wrapper, not the AMD KimiK3MultiHeadLatentAttentionWrapper:
         # its fused decode Q-prep path writes dense 576-wide rows, which the
-        # 656-byte merged fp8_ds_mla records cannot take.
+        # 656-byte fp8_ds_mla records cannot take.
         self.mla_attn = MultiHeadLatentAttentionWrapper(
             self.hidden_size,
             self.num_local_heads,
@@ -452,16 +441,6 @@ class KimiK3DSAAttention(nn.Module):
             quant_config,
             prefix,
         )
-
-        # Merged cache mode (MergedMLAIndexerSpec): the registered MLA layer is
-        # the wrapper's inner mla_attn; mark it with the indexer geometry so
-        # its get_kv_cache_spec returns the merged spec and the runner binds
-        # the indexer's section view of the merged cache to it.
-        if self.dsa_indexer.use_merged_cache:
-            mla_layer = cast(Any, self.mla_attn.mla_attn)
-            mla_layer.ds_index_head_size = self.dsa_indexer.k_cache.head_dim
-            mla_layer.ds_index_head_dim = self.index_head_dim
-            mla_layer.ds_indexer_layer_name = self.dsa_indexer.k_cache.prefix
 
     def forward(
         self,

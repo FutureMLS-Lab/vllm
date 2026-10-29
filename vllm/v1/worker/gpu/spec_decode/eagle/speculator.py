@@ -15,8 +15,4 @@ class EagleSpeculator(TargetDependentARSpeculator):
         target_model: nn.Module,
         target_attn_layer_names: set[str],
     ) -> nn.Module:
-        model = load_eagle_model(target_model, self.vllm_config)
-        # Lets the target fit the drafter to its own KV cache layout.
-        if (adapt := getattr(target_model, "adapt_drafter", None)) is not None:
-            adapt(model, self.vllm_config)
-        return model
+        return load_eagle_model(target_model, self.vllm_config)

@@ -36,7 +36,6 @@ from vllm.v1.kv_cache_interface import (
     KVCacheLayout,
     KVCacheSpec,
     MambaSpec,
-    MergedMLAIndexerSpec,
     UniformTypeKVCacheSpecs,
     create_kv_cache_views,
 )
@@ -164,11 +163,6 @@ class KVBlockZeroer:
             for layer_name in group.layer_names:
                 if layer_name in runner_only_attn_layers:
                     continue
-                if layer_name not in static_forward_context:
-                    # Dense MTP draft's indexer facade: registered in the
-                    # merged group's metadata-only indexer AttentionGroup
-                    # but not a real module -- nothing to zero.
-                    continue
                 kv = static_forward_context[layer_name].kv_cache
                 if not isinstance(kv, torch.Tensor):
                     continue
@@ -280,6 +274,10 @@ class AttentionGroup:
     # Persistent per ubatch: CUDA graphs capture the mapped block table.
     kernel_block_table: torch.Tensor | None = None
     kernel_block_offsets: torch.Tensor | None = None
+    # Set by runners that also map token caches' slot mappings to kernel blocks
+    # (map_to_kernel_slot_mapping), which lets packed token caches split.
+    maps_slot_mapping: bool = False
+    kernel_slot_mapping: torch.Tensor | None = None
     # When ubatching is enabled we will have a metadata builder for each ubatch
     # so that if they use internal persistent buffers for cudagraphs, and they
     # won't have to worry about conflicting with the other ubatches.
@@ -333,6 +331,13 @@ class AttentionGroup:
                 dtype=torch.int32,
                 device=device,
             )
+            if self.maps_slot_mapping and spec.tokens_per_state <= 1:
+                self.kernel_slot_mapping = torch.zeros(
+                    num_metadata_builders,
+                    vllm_config.scheduler_config.max_num_batched_tokens,
+                    dtype=torch.int64,
+                    device=device,
+                )
         self.metadata_builders = [
             builder_cls(
                 kv_cache_spec_builder,
@@ -381,6 +386,9 @@ class AttentionGroup:
             block_table_tensor=self.map_to_kernel_block_table(
                 common_attn_metadata.block_table_tensor, ubatch_idx
             ),
+            slot_mapping=self.map_to_kernel_slot_mapping(
+                common_attn_metadata.slot_mapping, ubatch_idx
+            ),
         )
 
     def map_to_kernel_block_table(
@@ -400,6 +408,27 @@ class AttentionGroup:
         )
         return out
 
+    def map_to_kernel_slot_mapping(
+        self,
+        slot_mapping: torch.Tensor,
+        ubatch_idx: int = 0,
+        out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """A token cache's slots in the kernel blocks of a packed cache: offset
+        ``t`` of block ``b`` moves to ``b * kernel_block_stride * kernel_block_size
+        + t``. Padded (negative) slots stay. Written into ``out`` or this group's
+        persistent per-ubatch buffer."""
+        if not self.kernel_block_stride or self.kernel_slot_mapping is None:
+            return slot_mapping
+        assert self.kernel_block_size is not None
+        block_size = self.kv_cache_spec.block_size
+        shift = self.kernel_block_stride * self.kernel_block_size - block_size
+        if out is None:
+            out = self.kernel_slot_mapping[ubatch_idx, : slot_mapping.shape[0]]
+        torch.floor_divide(slot_mapping, block_size, out=out)
+        out.mul_(shift).add_(slot_mapping)
+        return torch.where(slot_mapping < 0, slot_mapping, out, out=out)
+
     def map_kv_cache_to_kernel_blocks(self, kv_cache: torch.Tensor) -> torch.Tensor:
         """Views a packed cache in manager blocks as kernel blocks."""
         assert self.kernel_block_size is not None
@@ -407,11 +436,16 @@ class AttentionGroup:
         kernel_rows = spec.get_num_kernel_states(self.kernel_block_size)
         if kv_cache.shape[-2] == kernel_rows:
             return kv_cache
-        # Token and pooled caches are written through manager-block slot
-        # mappings, so only compressed caches (written from their block table)
-        # can be mapped.
+        # Token caches are written through manager-block slot mappings, so only
+        # caches written from their block table (compressed ones, or as their
+        # backend declares) or whose slot mappings are mapped too
+        # (maps_slot_mapping) can be mapped.
         if (
-            spec.tokens_per_state <= 1
+            (
+                spec.tokens_per_state <= 1
+                and not self.backend.writes_kv_cache_from_block_table()
+                and not self.maps_slot_mapping
+            )
             or kv_cache.shape[1] != 1
             or kv_cache.stride(0) % (kernel_rows * kv_cache.stride(-2))
         ):
@@ -814,67 +848,6 @@ def add_kv_sharing_layers_to_kv_cache_groups(
             runner_only_attn_layers.add(layer_name)
 
 
-def split_merged_dsa_cache_views(
-    kv_caches: dict[str, torch.Tensor],
-    forward_context: dict[str, Attention],
-    kv_cache_groups: Sequence[KVCacheGroupSpec] | None,
-) -> None:
-    """Bind each merged (MergedMLAIndexerSpec) layer's MLA/indexer section views.
-
-    The indexer module registered no spec of its own, so its section view is
-    created here; both views are plain dense-row views at the (padded) unit
-    stride.
-    """
-    if kv_cache_groups is None:
-        return
-    for group in kv_cache_groups:
-        # Callers may pass layer-name-only groups (no spec): nothing merged.
-        spec = getattr(group, "kv_cache_spec", None)
-        if not isinstance(spec, MergedMLAIndexerSpec):
-            continue
-        mla_bytes = spec.mla_bytes_per_token
-        index_head_size = spec.index_head_size
-        unit_tokens = spec.kernel_block_size
-        for layer_name in group.layer_names:
-            if layer_name not in kv_caches:
-                continue  # PP: this layer lives on another stage
-            module = forward_context.get(layer_name)
-            indexer_name = getattr(module, "ds_indexer_layer_name", None)
-            if indexer_name is None:
-                continue  # no indexer (a dense draft): the layer binds its own view
-            raw = kv_caches[layer_name]
-            num_units = raw.shape[0]
-            unit_stride = raw.stride(0)
-            expected_unit = spec.padded_unit_bytes or unit_tokens * (
-                mla_bytes + index_head_size
-            )
-            assert unit_stride == expected_unit, (
-                f"merged cache unit stride {unit_stride} != spec "
-                f"{expected_unit} for {layer_name}"
-            )
-            assert raw.shape[-1] == mla_bytes + index_head_size, (
-                f"merged cache width {raw.shape[-1]} != spec "
-                f"{mla_bytes + index_head_size} for {layer_name}"
-            )
-            mla_view = torch.as_strided(
-                raw,
-                size=(num_units, 1, unit_tokens, mla_bytes),
-                stride=(unit_stride, mla_bytes, mla_bytes, 1),
-            )
-            if spec.cache_dtype_str == "fp8_ds_mla":
-                mla_view = mla_view.view(current_platform.fp8_dtype())
-            kv_caches[layer_name] = mla_view
-            # Indexer envelope: [data | scale] section split is derived by
-            # the kernels from the shape; the row stride is bookkeeping
-            # (same contract as kv_cache_as_quant_view).
-            kv_caches[indexer_name] = torch.as_strided(
-                raw,
-                size=(num_units, 1, unit_tokens, index_head_size),
-                stride=(unit_stride, index_head_size, index_head_size, 1),
-                storage_offset=raw.storage_offset() + unit_tokens * mla_bytes,
-            )
-
-
 def bind_kv_cache(
     kv_caches: dict[str, torch.Tensor],
     forward_context: dict[str, Attention],
@@ -907,10 +880,6 @@ def bind_kv_cache(
     """
     # Bind kv_caches to ModelRunner
     assert len(runner_kv_caches) == 0
-
-    # Merged DSA cache mode (MergedMLAIndexerSpec): split each merged layer's
-    # cache into the MLA/indexer section views before binding.
-    split_merged_dsa_cache_views(kv_caches, forward_context, kv_cache_groups)
 
     # Convert kv_caches dict to a list of tensors in the order of layer_index.
     index2name = defaultdict(list)

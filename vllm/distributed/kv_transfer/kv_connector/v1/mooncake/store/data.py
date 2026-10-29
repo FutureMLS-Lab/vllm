@@ -36,9 +36,9 @@ def group_compact_kernel_blocks(
 
     Decided on the kernel-block view, before grouping: a manager block is a run
     of consecutive kernel blocks, so it is compact whenever each kernel block
-    is. The grouped ``cache[0]`` alone cannot tell: a merged DSA cache (Kimi
-    K3.1) pads every 64-token kernel block, which makes it non-dense although
-    no other block's data sits in the gaps.
+    is. The grouped ``cache[0]`` alone cannot tell: tail padding in every
+    kernel block makes it non-dense although no other block's data sits in the
+    gaps.
     """
     compact = is_non_overlapping_and_dense(cache[0])
     return group_kernel_blocks(cache, num_blocks), compact

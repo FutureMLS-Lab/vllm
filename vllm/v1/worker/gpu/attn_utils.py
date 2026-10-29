@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Collection, Iterable, Mapping, Sequence
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, cast
@@ -20,11 +20,9 @@ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.platforms import current_platform
 from vllm.v1.attention.backend import (
-    AttentionBackend,
     AttentionCGSupport,
     CommonAttentionMetadata,
 )
-from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerBackend
 from vllm.v1.attention.backends.utils import create_fast_prefill_custom_backend
 from vllm.v1.hisparse.binding import (
     init_hisparse_kv_cache,
@@ -35,7 +33,6 @@ from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheSpec,
     MambaSpec,
-    MergedMLAIndexerSpec,
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.worker.gpu.model_states.interface import ModelSpecificAttnMetadata
@@ -48,7 +45,6 @@ from vllm.v1.worker.utils import (
     customize_attention_spec,
     map_kv_caches_to_kernel_blocks,
     prepare_kernel_block_sizes,
-    split_merged_dsa_cache_views,
 )
 
 logger = init_logger(__name__)
@@ -148,9 +144,6 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
         if getattr(attn_module, "kv_sharing_target_layer_name", None):
             # This layer will use KV cache of the sharing target layer.
             continue
-        if getattr(attn_module, "merged_into_mla_cache", False):
-            # Its bytes live in the parent MLA layer's MergedMLAIndexerSpec.
-            continue
         # Skip modules that don't need KV cache (eg encoder-only attention)
         if spec := attn_module.get_kv_cache_spec(vllm_config):
             if isinstance(spec, AttentionSpec):
@@ -208,7 +201,12 @@ def init_attn_backend(
     device: torch.device,
     active_layer_names: set[str] | None = None,
     draft_layer_names: set[str] | None = None,
+    maps_slot_mapping: bool = False,
+    slot_mapped_layers: Collection[str] = (),
 ) -> tuple[list[list[AttentionGroup]], AttentionCGSupportInfo, list[int]]:
+    """``maps_slot_mapping``: the caller maps every slot mapping it builds to
+    kernel blocks (AttentionGroup.map_to_kernel_slot_mapping); or only for the
+    ``slot_mapped_layers``, which another runner (a speculator) writes."""
     # Phase 1: discover attention groups for each kv cache group.
     attn_groups: list[list[AttentionGroup]] = []
 
@@ -262,36 +260,22 @@ def init_attn_backend(
             # metadata builders.
             num_heads_q = getattr(attn_layers[layer_name], "num_heads", 0)
             key = (attn_backend.full_cls_name(), layer_kv_cache_spec, num_heads_q)
+            maps = maps_slot_mapping or layer_name in slot_mapped_layers
             if key not in group_map:
                 group_map[key] = AttentionGroup(
-                    attn_backend, [layer_name], layer_kv_cache_spec, kv_cache_group_id
+                    attn_backend,
+                    [layer_name],
+                    layer_kv_cache_spec,
+                    kv_cache_group_id,
+                    maps_slot_mapping=maps,
                 )
                 group_order.append(key)
             else:
+                assert group_map[key].maps_slot_mapping == maps, (
+                    f"{layer_name}: its slot mappings must be mapped as its "
+                    "attention group's are"
+                )
                 group_map[key].layer_names.append(layer_name)
-
-        # Merged-cache indexers registered no spec but still need a metadata
-        # builder: add a metadata-only indexer group.
-        if isinstance(kv_cache_group_spec.kv_cache_spec, MergedMLAIndexerSpec):
-            indexer_names = [
-                attn_layers[name].ds_indexer_layer_name
-                for name in layer_names
-                if getattr(attn_layers[name], "ds_indexer_layer_name", None)
-            ]
-            if indexer_names:
-                backend = cast(type[AttentionBackend], DeepseekV32IndexerBackend)
-                key = (
-                    backend.full_cls_name(),
-                    kv_cache_group_spec.kv_cache_spec,
-                    0,
-                )
-                group_map[key] = AttentionGroup(
-                    backend,
-                    indexer_names,
-                    kv_cache_group_spec.kv_cache_spec,
-                    kv_cache_group_id,
-                )
-                group_order.append(key)
 
         attn_groups.append([group_map[key] for key in group_order])
 
@@ -466,11 +450,6 @@ def init_kv_cache(
         {name: cache for name, cache in kv_caches.items() if name in forward_context},
         attn_groups,
     )
-    # Merged DSA cache mode (MergedMLAIndexerSpec): split each merged layer's
-    # cache into the MLA/indexer section views before binding.
-    split_merged_dsa_cache_views(
-        bindable_caches, forward_context, kv_cache_config.kv_cache_groups
-    )
     bind_kv_cache_to_layers(
         bindable_caches,
         forward_context,
@@ -481,13 +460,25 @@ def init_kv_cache(
 
 
 def build_slot_mappings_by_layer(
-    slot_mappings: torch.Tensor, kv_cache_config: KVCacheConfig
+    slot_mappings: torch.Tensor,
+    kv_cache_config: KVCacheConfig,
+    attn_groups: list[list[AttentionGroup]] | None = None,
+    ubatch_idx: int = 0,
 ) -> dict[str, torch.Tensor]:
     slot_mappings_by_layer: dict[str, torch.Tensor] = {}
     kv_cache_groups = kv_cache_config.kv_cache_groups
-    for slot_mapping, kv_cache_group in zip(slot_mappings, kv_cache_groups):
+    for i, (slot_mapping, kv_cache_group) in enumerate(
+        zip(slot_mappings, kv_cache_groups)
+    ):
         for layer_name in kv_cache_group.layer_names:
             slot_mappings_by_layer[layer_name] = slot_mapping
+        # Token caches split into the kernel blocks of a packed cache.
+        for attn_group in attn_groups[i] if attn_groups else ():
+            if attn_group.kernel_slot_mapping is None:
+                continue
+            mapped = attn_group.map_to_kernel_slot_mapping(slot_mapping, ubatch_idx)
+            for layer_name in attn_group.layer_names:
+                slot_mappings_by_layer[layer_name] = mapped
     return slot_mappings_by_layer
 
 

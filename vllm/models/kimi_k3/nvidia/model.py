@@ -19,7 +19,6 @@ from vllm.distributed import (
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul, SituAndMul
-from vllm.model_executor.layers.attention.mla_attention import MLAAttention
 from vllm.model_executor.layers.fused_moe import (
     FusedMoEFactory,
     fused_moe_make_expert_params_mapping,
@@ -98,7 +97,7 @@ from vllm.models.common.ops.sequence_parallel import (
     sp_reduce_scatter,
     sp_shard,
 )
-from vllm.models.kimi_k3.nvidia.dense_draft import place_dense_draft_in_merged_cache
+from vllm.models.kimi_k3.common.dsa_cache import packed_dsa_block_size
 from vllm.models.kimi_k3.nvidia.dsa import KimiK3DSAAttention
 from vllm.models.kimi_k3.nvidia.gqa_draft import GQADraftKVCacheGrouping
 from vllm.models.kimi_k3.nvidia.kda import KimiK3DeltaAttention
@@ -2090,13 +2089,18 @@ class KimiK3ForConditionalGeneration(
     def get_mamba_state_copy_func(cls):
         return KimiLinearForCausalLM.get_mamba_state_copy_func()
 
+    @classmethod
+    def get_packed_hybrid_block_size(
+        cls,
+        vllm_config: VllmConfig,
+        attn_page_size_1_token: int,
+        mamba_page_size: int,
+        alignment: int,
+    ) -> int | None:
+        return packed_dsa_block_size(
+            vllm_config, attn_page_size_1_token, mamba_page_size, alignment
+        )
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         loader = AutoWeightsLoader(self)
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
-
-    def adapt_drafter(self, drafter: nn.Module, vllm_config: VllmConfig) -> None:
-        """Let a dense MLA drafter (EAGLE3) share this model's merged DSA pages
-        (Kimi-K3.1; a no-op on Kimi-K3)."""
-        for module in drafter.modules():
-            if isinstance(module, MLAAttention):
-                place_dense_draft_in_merged_cache(module, vllm_config)

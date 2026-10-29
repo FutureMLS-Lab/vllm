@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar
 
 import numpy as np
@@ -40,11 +40,7 @@ from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
     rocm_sparse_attn_prefill,
     rocm_sparse_decode_bf16_num_splits,
 )
-from vllm.v1.kv_cache_interface import (
-    AttentionSpec,
-    KVCacheLayout,
-    MergedMLAIndexerSpec,
-)
+from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheLayout
 from vllm.v1.worker.workspace import current_workspace_manager
 
 if TYPE_CHECKING:
@@ -364,18 +360,10 @@ class ROCMAiterMLASparseBackend(AttentionBackend):
 
     @staticmethod
     def get_supported_kernel_block_sizes(kv_cache_spec=None) -> list[int | MultipleOf]:
-        if isinstance(kv_cache_spec, MergedMLAIndexerSpec):
-            # The merged MLA + indexer cache is addressed in its padded units.
-            return [kv_cache_spec.kernel_block_size]
         return [1, MultipleOf(16)]
 
     @classmethod
     def customize_spec(cls, spec: AttentionSpec) -> AttentionSpec:
-        if isinstance(spec, MergedMLAIndexerSpec):
-            # Whole padded units apart.
-            return replace(
-                spec, block_stride_alignment=MultipleOf(spec.kernel_block_size)
-            )
         return align_blocks_to_rows(spec)
 
     @staticmethod

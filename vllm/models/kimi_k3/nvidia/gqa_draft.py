@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """GQA drafts (e.g. a Qwen3 sliding-window DSpark) on Kimi-K3: their KV cache grouping.
 
-Dense MLA drafts share the target's pages instead (``dense_draft.py``)."""
+Dense MLA drafts keep their own MLA cache (``dense_draft.py``)."""
 
 from dataclasses import replace
 
