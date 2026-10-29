@@ -158,10 +158,26 @@ class Attention:
             self.core.prepare_cache(caches[0])
 
     def run_dsa(self, projected, local, caches, metadata, slot_mapping, q):
-        layer = self.layer.self_attn.mla_attn.mla_attn
-        slots = slot_mapping[layer.layer_name]
+        from vllm.forward_context import get_forward_context
+        from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadata
+
+        attention = self.layer.self_attn
+        slots = slot_mapping[attention.mla_attn.mla_attn.layer_name]
+        # The packed indexer splits into kernel pages; its metadata builder
+        # derives the write slots from their block table.
+        indexer = get_forward_context().attn_metadata[
+            attention.dsa_indexer.k_cache.prefix
+        ]
+        assert isinstance(indexer, DeepseekV32IndexerMetadata)
+        index_slots = indexer.slot_mapping
         self.core.run(
-            projected, local, cache=caches[0], slots=slots, metadata=metadata, q=q
+            projected,
+            local,
+            cache=caches[0],
+            slots=slots,
+            index_slots=index_slots,
+            metadata=metadata,
+            q=q,
         )
         self.prefetch.fork("attention_moe", self.layer.layer_idx, projected.shape[0])
 

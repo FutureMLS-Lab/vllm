@@ -6,8 +6,8 @@
   with one power-of-two scale per head (per_token_group_quant_fp8, ue8m0), the scale
   folded into the head weights: (bf16(wv / sqrt(32)) * scale) / sqrt(128);
 - the shared indexer key: LayerNorm (FP32) of the wk projection, BF16, then FP8 with
-  a power-of-two scale (indexer_k_quant_and_cache, ue8m0) into the merged cache's
-  indexer section of the token's 64-token unit.
+  a power-of-two scale (indexer_k_quant_and_cache, ue8m0) into the indexer cache:
+  per block, the FP8 keys of its tokens, then their FP32 scales.
 
 A half-warp owns one head (8 columns per lane); warp 0's low half also owns the key.
 """
@@ -27,11 +27,6 @@ from ..common.primitives import (
 from ..mla.query import half_warp_max, pow2_ceil
 
 HEADS, DIM = 32, 128
-# Merged MLA + indexer cache unit (64 tokens): 64 x 656 B MLA rows, then 64 x 128 B
-# FP8 keys, then 64 FP32 key scales.
-UNIT_TOKENS, MLA_ROW = 64, 656
-KEYS = UNIT_TOKENS * MLA_ROW
-KEY_SCALES = KEYS + UNIT_TOKENS * DIM
 
 
 @cute.jit
@@ -101,13 +96,15 @@ class DsaIndex:
             amax = half_warp_max(amax)
             scale = pow2_ceil(cute.arch.fmax(amax, Float32(1e-4)) / Float32(448))
             inverse = Float32(1) / scale
-            page, offset = slot // UNIT_TOKENS, slot % UNIT_TOKENS
+            tokens = cache.shape[1]
+            page, offset = slot // tokens, slot % tokens
             base = at(cache, page, 0, 0)
             if half == 0:
                 words = [
                     pack_fp8(tuple(key[4 * w + i] * inverse for i in range(4)))
                     for w in range(2)
                 ]
-                store_words(base + KEYS + offset * DIM + column, tuple(words))
+                store_words(base + offset * DIM + column, tuple(words))
                 if lane == 0:
-                    store_words(base + KEY_SCALES + offset * 4, (float_bits(scale),))
+                    scales = base + tokens * DIM
+                    store_words(scales + offset * 4, (float_bits(scale),))

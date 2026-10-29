@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Prepared DSA core (Kimi K3.1 sparse MLA layers) over the merged fp8_ds_mla +
-indexer cache:
+"""Prepared DSA core (Kimi K3.1 sparse MLA layers) over the packed fp8_ds_mla and
+indexer caches (FlashMLA sparse reads whole blocks, the indexer 64-entry pages):
 
   MlaQuery (dsa)   BF16 query rows [B, 64 (padded heads), 576], the fp8_ds_mla KV
                    insert and the normalized q_c rows
@@ -72,9 +72,10 @@ def gate_columns(heads):
 @cache
 def compile_core(batch, heads, pitch, specs, device, q=1, dcp=0, q_heads=0, sms=148):
     """CuTe kernels (query, index, value) of one batch of rows (``q`` per request).
+    ``specs``: the layouts of the weights, the MLA cache and the indexer cache.
     Under DCP (``dcp``: its size, ``q_heads``: the gathered query's padded heads) the
     query also publishes into the q mailbox and the value is DcpValue."""
-    qnorm, kvnorm, qb, uk, uv, kv = (
+    qnorm, kvnorm, qb, uk, uv, kv, index_kv = (
         fake(shape, stride, dtype, 4 if dtype == torch.float32 else 16)
         for shape, stride, dtype in specs
     )
@@ -104,7 +105,7 @@ def compile_core(batch, heads, pitch, specs, device, q=1, dcp=0, q_heads=0, sms=
     norm = fake((DIM,), (1,), torch.float32, 4)
     q_out = fake((batch, HEADS, DIM), None, torch.uint8)
     w_out = fake((batch, HEADS), None, torch.float32, 4)
-    i_args = (projected, iq, norm, norm, kv, slots, q_out, w_out, f32(1e-6))
+    i_args = (projected, iq, norm, norm, index_kv, slots, q_out, w_out, f32(1e-6))
     latent = fake((batch, heads, 512), (QUERY_HEADS * 512, 512, 1))
     gate = fake((batch, heads * 128), (pitch, 1))
     lengths = fake((batch // q,), (1,), torch.int32, 4)
@@ -213,7 +214,8 @@ class PreparedDsa:
         self.topk = self.indexer.topk_tokens
 
     def prepare_cache(self, kv):
-        specs = tuple(layout(w) for w in (*self.weights, kv.view(torch.uint8)))
+        caches = kv.view(torch.uint8), self.indexer.k_cache.kv_cache
+        specs = tuple(layout(w) for w in (*self.weights, *caches))
         sms = torch.cuda.get_device_properties(self.device).multi_processor_count
         for batch, q in self.shapes:
             args: tuple = (batch, self.heads, self.pitches[batch], specs)
@@ -222,7 +224,7 @@ class PreparedDsa:
                 args += (self.dcp, self.box.q_heads, sms)
             self.kernels[batch, q] = compile_core(*args)
             if self.cores[batch, q] == "cute":
-                sparse = batch, self.heads, specs[-1], self.device.index, q
+                sparse = batch, self.heads, specs[5], self.device.index, q
                 self.sparse[batch, q] = compile_sparse(*sparse)
         return self
 
@@ -257,6 +259,7 @@ class PreparedDsa:
 
     def sparse_core(self, cache, topk, metadata, batch, q):
         """Sparse decode of the padded BF16 query rows -> [B, 64, 512]-strided."""
+        from vllm.v1.attention.backends.mla.flashmla_sparse import _fp8_kv_pages
         from vllm.v1.attention.ops.flashmla import flash_mla_with_kvcache
 
         impl = self.impl
@@ -272,17 +275,19 @@ class PreparedDsa:
                 query, rows, table, kv, latent, scale, stream(self.device)
             )
             return self.latent[:batch]
+        # As the stock decode: the packed blocks as 64-row pages of flat rows.
+        pages, stride_rows = _fp8_kv_pages(cache, metadata.block_size)
         impl.record_logical_topk_ready()
         physical = impl._convert_logical_to_physical_topk(
             topk[:batch],
             metadata,
-            block_stride_rows=None,
+            block_stride_rows=stride_rows,
             return_valid_counts=False,
         )
         kernel_metadata = metadata.fp8_extra_metadata
         latent, _ = flash_mla_with_kvcache(
             q=self.query[:batch].unsqueeze(0),
-            k_cache=cache.view(torch.uint8).unsqueeze(-2),
+            k_cache=pages.view(torch.uint8).unsqueeze(-2),
             block_table=kernel_metadata.dummy_block_table,
             head_dim_v=512,
             cache_seqlens=kernel_metadata.cache_lens,
@@ -338,7 +343,7 @@ class PreparedDsa:
         # A rank owning none of a row's entries: DcpValue drops it (LSE -inf).
         return rows, lse.masked_fill((valid == 0).view(-1, 1, 1), float("-inf"))
 
-    def run_dcp(self, projected, out, cache, slots, metadata, q):
+    def run_dcp(self, projected, out, cache, slots, index_slots, metadata, q):
         """``run`` under DCP: the query publishes into the q mailbox and DcpValue
         merges every rank's partial rows of this rank's heads (global lengths)."""
         batch, s = projected.shape[0], stream(self.device)
@@ -353,9 +358,7 @@ class PreparedDsa:
         q_args = (x, qnorm, kvnorm, qb, uk, kv, q_slots, unit, unit, self.eps)
         publish = (mailbox, box.mc(p), cutlass.Int32(box.rank))
         mq(*q_args, to_cute(self.query[:batch]), to_cute(self.qc[:batch]), *publish, s)
-        iq = self.index_projection.run(self.qc[:batch], self.iq[:batch])
-        rows = to_cute(self.q_fp8[:batch]), to_cute(self.head_w[:batch], 4)
-        index(x, to_cute(iq), *self.key_norm, kv, q_slots, *rows, self.key_eps, s)
+        self.run_index(x, index_slots, batch, index)
         topk = self.indexer_core(projected, batch)
         latent, lse = self.dcp_core(cache, topk, metadata, batch)
         lens = to_cute(lengths[:reqs], 4)
@@ -370,11 +373,21 @@ class PreparedDsa:
         value(*v_args, gate, lens, to_cute(out), cutlass.Int32(p), publish[2], s)
         return out
 
-    def run(self, projected, out, *, cache, slots, metadata, q=1):
+    def run_index(self, x, index_slots, batch, index):
+        """FP8 indexer query and head weights; the key into the indexer cache."""
+        iq = self.index_projection.run(self.qc[:batch], self.iq[:batch])
+        rows = to_cute(self.q_fp8[:batch]), to_cute(self.head_w[:batch], 4)
+        key = to_cute(self.indexer.k_cache.kv_cache), to_cute(index_slots[:batch], 8)
+        s = stream(self.device)
+        index(x, to_cute(iq), *self.key_norm, *key, *rows, self.key_eps, s)
+
+    def run(self, projected, out, *, cache, slots, index_slots, metadata, q=1):
         """``projected``: the packed projection rows; ``out`` [B, H * 128] gets the
-        gated attention output. Rows beyond the requests run as empty requests."""
+        gated attention output; ``slots`` / ``index_slots``: the MLA and indexer
+        cache slots. Rows beyond the requests run as empty requests."""
         if self.box is not None:
-            return self.run_dcp(projected, out, cache, slots, metadata, q)
+            args = cache, slots, index_slots, metadata, q
+            return self.run_dcp(projected, out, *args)
         batch, s = projected.shape[0], stream(self.device)
         reqs = batch // q
         lengths = metadata.seq_lens
@@ -386,9 +399,7 @@ class PreparedDsa:
         x, q_slots = to_cute(projected), to_cute(slots[:batch], 8)
         q_args = (x, qnorm, kvnorm, qb, uk, kv, q_slots, unit, unit, self.eps)
         mq(*q_args, to_cute(self.query[:batch]), to_cute(self.qc[:batch]), s)
-        iq = self.index_projection.run(self.qc[:batch], self.iq[:batch])
-        rows = to_cute(self.q_fp8[:batch]), to_cute(self.head_w[:batch], 4)
-        index(x, to_cute(iq), *self.key_norm, kv, q_slots, *rows, self.key_eps, s)
+        self.run_index(x, index_slots, batch, index)
         topk = self.indexer_core(projected, batch)
         latent = self.sparse_core(cache, topk, metadata, batch, q)
         gate = to_cute(projected[:, slice(*gate_columns(self.heads))])

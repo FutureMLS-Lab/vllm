@@ -22,7 +22,7 @@ import math
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Float16, Float32, Int32, Uint32
+from cutlass import Float16, Float32, Int32, Int64, Uint32
 
 from ..common.primitives import (
     alloc,
@@ -44,8 +44,6 @@ from ..common.primitives import (
 from ..mla.query import half_warp_max
 
 TOPK, CHUNK, ROW, PITCH = 2048, 64, 656, 584  # PITCH: BF16 KV / query row
-UNIT = 64  # tokens per cache unit (the block table's granularity)
-UNIT_BYTES = 50512
 LOG2E = 1.4426950408889634
 
 
@@ -135,7 +133,8 @@ class SparseMlaDecode:
             index = topk[row, first + i]
             slot = Int32(-1)
             if index >= 0:
-                slot = table[request, index // UNIT] * UNIT + index % UNIT
+                block = cache.shape[1]  # tokens per block-table entry
+                slot = table[request, index // block] * block + index % block
             slots[i] = slot
         cute.arch.sync_threads()
         self.gather(cache, raw, slots, full, 0, tid)
@@ -261,10 +260,11 @@ class SparseMlaDecode:
         if tid == 0:
             cute.arch.mbarrier_arrive_and_expect_tx(full + buf, CHUNK * ROW)
         if tid < CHUNK:
-            slot = slots[chunk * CHUNK + tid]
+            slot = Int64(slots[chunk * CHUNK + tid])
             if slot < 0:
-                slot = Int32(0)
-            source = at(cache, slot // UNIT, slot % UNIT, 0)
+                slot = Int64(0)
+            # 64-bit: a layer's view of a packed cache spans the whole pool.
+            source = at(cache, slot // cache.shape[1], slot % cache.shape[1], 0)
             target = raw.iterator + (buf * CHUNK + tid) * ROW
             copy_g2s(target, source, ROW, full + buf)
 
