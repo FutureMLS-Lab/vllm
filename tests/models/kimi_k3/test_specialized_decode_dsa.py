@@ -15,6 +15,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 UNIT, MLA_ROW, INDEX_ROW = 64, 656, 132  # indexer page tokens; cache row bytes
+FP8_ROW = 576  # per-tensor FP8 MLA row (FlashInfer sparse)
 GAP = 36  # rows of the other layers' pages between two blocks of a packed cache
 FAR = 5 << 30  # bytes a far packed cache spans: its later blocks lie past 2 GiB
 HEADS = 12  # TP8
@@ -45,7 +46,7 @@ def rms_norm(x, weight):
     return (x * weight.float()).to(torch.bfloat16)
 
 
-def kernels(batch, mla, index, *weights):
+def kernels(batch, mla, index, *weights, fp8=False):
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.common.host import (
         layout,
     )
@@ -55,7 +56,7 @@ def kernels(batch, mla, index, *weights):
 
     specs = tuple(layout(w) for w in (*weights, mla, index))
     return compile_core(
-        batch, HEADS, PITCH, specs, torch.accelerator.current_device_index(), 1
+        batch, HEADS, PITCH, specs, torch.accelerator.current_device_index(), 1, fp8=fp8
     )
 
 
@@ -115,6 +116,62 @@ def test_query_and_cache_insert(batch, block, gap):
     live = slots[slots >= 0]
     ours, ref = (c.reshape(-1, MLA_ROW)[live] for c in (mla, stock))
     assert torch.equal(ours[:, 512:], ref[:, 512:])  # tile scales and k_pe
+    # Latent bytes differ only where the RMSNorm rounds differently.
+    assert (ours[:, :512] != ref[:, :512]).float().mean() < 0.01
+
+
+@pytest.mark.parametrize("gap", [GAP, FAR])
+@pytest.mark.parametrize("batch", [1, 5, 64])
+def test_fp8_query_and_cache_insert(batch, gap):
+    """FlashInfer core: the per-tensor FP8 query rows [B, H, 576] and the FP8 KV row
+    in the packed MLA blocks, as the stock FlashInfer path quantizes and writes them
+    (concat_and_cache_mla "fp8"), with non-unit scales."""
+    import cutlass
+
+    from vllm import _custom_ops as ops
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.common.host import (
+        stream,
+        to_cute,
+    )
+
+    torch.manual_seed(batch)
+    bf, dev, fp8 = torch.bfloat16, "cuda", torch.float8_e4m3fn
+    projected = torch.randn(batch, PITCH, device=dev, dtype=bf)
+    q_norm = torch.rand(1536, device=dev, dtype=bf) + 0.5
+    kv_norm = torch.rand(512, device=dev, dtype=bf) + 0.5
+    q_b = torch.randn(HEADS * 192, 1536, device=dev, dtype=bf) / 40
+    w_uk = torch.randn(HEADS, 128, 512, device=dev, dtype=bf) / 12
+    w_uv = torch.randn(HEADS, 128, 512, device=dev, dtype=bf).transpose(1, 2)
+    blocks, block = 4, 64
+    mla = packed_cache(blocks, block, FP8_ROW, gap)
+    index = packed_cache(8, UNIT, INDEX_ROW)
+    slots = torch.randperm(blocks * block - 1, device=dev)[:batch]
+    slots[0] = blocks * block - 1  # the last row
+    if batch > 2:
+        slots[1] = -1  # a padded row writes nothing
+    weights = q_norm, kv_norm, q_b, w_uk, w_uv
+    query_kernel, _, _ = kernels(batch, mla, index, *weights, fp8=True)
+    query = torch.zeros(batch, HEADS, 576, device=dev, dtype=torch.uint8)
+    q_c = torch.zeros(batch, 1536, device=dev, dtype=bf)
+    q_scale = torch.full((1,), 0.5, device=dev)
+    k_scale = torch.full((1,), 2.0, device=dev)
+    args = (to_cute(projected), *(to_cute(w) for w in weights[:4]), to_cute(mla))
+    args += (to_cute(slots, 8), to_cute(1 / q_scale, 4), to_cute(1 / k_scale, 4))
+    query_kernel(*args, cutlass.Float32(EPS), to_cute(query), to_cute(q_c), stream(dev))
+
+    ref_q_c = rms_norm(projected[:, :1536], q_norm)
+    torch.testing.assert_close(q_c, ref_q_c, atol=1e-2, rtol=1e-2)
+    q = (ref_q_c @ q_b.T).view(batch, HEADS, 192)
+    latent = torch.bmm(q[..., :128].transpose(0, 1), w_uk).transpose(0, 1)
+    ref_query = torch.cat([latent, q[..., 128:]], -1).float() / q_scale
+    torch.testing.assert_close(query.view(fp8).float(), ref_query, atol=3e-2, rtol=7e-2)
+
+    stock = packed_cache(blocks, block, FP8_ROW, gap)
+    kv = rms_norm(projected[:, 1536:2048], kv_norm)
+    ops.concat_and_cache_mla(kv, projected[:, 2048:2112], stock, slots, "fp8", k_scale)
+    live = slots[slots >= 0]
+    ours, ref = (c[live // block, live % block] for c in (mla, stock))
+    assert torch.equal(ours[:, 512:], ref[:, 512:])  # k_pe
     # Latent bytes differ only where the RMSNorm rounds differently.
     assert (ours[:, :512] != ref[:, :512]).float().mean() < 0.01
 

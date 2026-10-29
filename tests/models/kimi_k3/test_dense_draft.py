@@ -50,6 +50,7 @@ def test_kimi_k31_defaults_draft_attention(method, draft_text_config, expected):
     vllm_config = SimpleNamespace(
         model_config=SimpleNamespace(hf_config=K31_TEXT_CONFIG),
         cache_config=SimpleNamespace(cache_dtype="auto"),
+        attention_config=SimpleNamespace(backend=None),
         speculative_config=spec_config,
     )
 
@@ -58,15 +59,45 @@ def test_kimi_k31_defaults_draft_attention(method, draft_text_config, expected):
     assert (spec_config.attention_backend, spec_config.kv_cache_dtype) == expected
 
 
-@pytest.mark.parametrize("cache_dtype", ["fp8_ds_mla", "nvfp4_ds_mla"])
-def test_kimi_k31_accepts_ds_mla_cache_dtypes(cache_dtype):
+def _k31_cache_dtype(cache_dtype, backend=None):
     vllm_config = SimpleNamespace(
         model_config=SimpleNamespace(hf_config=K31_TEXT_CONFIG),
         cache_config=SimpleNamespace(cache_dtype=cache_dtype),
+        attention_config=SimpleNamespace(backend=backend),
         speculative_config=None,
     )
     KimiK3ForConditionalGenerationConfig.verify_and_update_config(vllm_config)
-    assert vllm_config.cache_config.cache_dtype == cache_dtype
+    return vllm_config.cache_config.cache_dtype
+
+
+@pytest.mark.parametrize("cache_dtype", ["fp8_ds_mla", "nvfp4_ds_mla"])
+def test_kimi_k31_accepts_ds_mla_cache_dtypes(cache_dtype):
+    assert _k31_cache_dtype(cache_dtype) == cache_dtype
+
+
+@pytest.mark.parametrize(
+    ("sm100", "backend", "cache_dtype", "expected"),
+    [
+        # SM10x defaults to FlashInfer sparse MLA, which reads per-tensor fp8.
+        (True, None, "auto", "fp8_e4m3"),
+        (True, None, "fp8", "fp8"),
+        (True, AttentionBackendEnum.FLASHINFER_MLA_SPARSE, "auto", "fp8_e4m3"),
+        # FlashMLA sparse, explicit or the default elsewhere, reads fp8_ds_mla.
+        (True, AttentionBackendEnum.FLASHMLA_SPARSE, "auto", "fp8_ds_mla"),
+        (True, AttentionBackendEnum.FLASHMLA_SPARSE, "fp8", "fp8_ds_mla"),
+        (False, None, "auto", "fp8_ds_mla"),
+    ],
+)
+def test_kimi_k31_defaults_kv_cache_to_its_sparse_backend(
+    monkeypatch, sm100, backend, cache_dtype, expected
+):
+    from vllm.platforms import current_platform
+
+    monkeypatch.setattr(current_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(
+        current_platform, "is_device_capability_family", lambda family: sm100
+    )
+    assert _k31_cache_dtype(cache_dtype, backend) == expected
 
 
 @pytest.mark.parametrize(

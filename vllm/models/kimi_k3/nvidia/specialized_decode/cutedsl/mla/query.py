@@ -3,10 +3,10 @@
 """Cluster MLA query RMSNorm, Q_B projection, W_UK absorption and paged FP8 KV insert.
 Static weights load before the PDL wait; current-token data is consumed after it.
 
-DSA (``dsa=True``, Kimi K3.1): the query rows are BF16 (FlashMLA sparse reads a BF16
-query against the FP8 cache), the KV row is written in the fp8_ds_mla layout (per
-128-column power-of-two scales, BF16 k_pe) and the normalized q_c rows are also
-stored for the indexer query projection."""
+DSA (``dsa=True``, Kimi K3.1): the normalized q_c rows are also stored for the indexer
+query projection. On FlashMLA sparse the query rows are BF16 and the KV row is written
+in the fp8_ds_mla layout (per 128-column power-of-two scales, BF16 k_pe); with ``fp8``
+(FlashInfer sparse) both are per-tensor FP8 as for dense MLA."""
 
 import cutlass
 import cutlass.cute as cute
@@ -95,14 +95,17 @@ class MlaQuery:
         q_b_cp_async: bool = False,
         dcp: int = 0,
         dsa: bool = False,
+        fp8: bool = False,
         q_heads: int = 0,
     ):
         tiled = TILED_FROM[heads]
         self.heads, self.batch, self.wide = heads, batch, batch >= tiled
         self.dcp, self.dsa = dcp, dsa
+        # fp8_ds_mla cache with a BF16 query (FlashMLA sparse), else per-tensor FP8.
+        self.ds = dsa and not fp8
         # q mailbox geometry: rows per token, element bytes, args index of the box.
         self.q_heads = q_heads or dcp * heads
-        self.q_bytes, self.box_arg = (2, 12) if dsa else (1, 11)
+        self.q_bytes, self.box_arg = 2 if self.ds else 1, 12 if dsa else 11
         self.cluster = 16 if heads == 6 and not self.wide else 8
         self.rows, self.latent = 192 // self.cluster, 512 // self.cluster
         self.groups, self.p_per_group = 256 // self.latent, self.latent // 2
@@ -287,7 +290,7 @@ class MlaQuery:
             j, b = i % R, i // R
             p = R * part + j
             if (p >= 128) & self.live(tok0 + b):
-                if cutlass.const_expr(self.dsa):
+                if cutlass.const_expr(self.ds):
                     output[tok0 + b, head, 512 + p - 128] = BFloat16(qrow[j, b])
                 else:
                     output[tok0 + b, head, 512 + p - 128] = fp8_bits(qrow[j, b] * qsi)
@@ -308,7 +311,7 @@ class MlaQuery:
             for g in cutlass.range_constexpr(G):
                 value += red[g, b, ll]
             if self.live(tok0 + b):
-                if cutlass.const_expr(self.dsa):
+                if cutlass.const_expr(self.ds):
                     output[tok0 + b, head, L * part + ll] = BFloat16(value)
                 else:
                     rounded = Float32(BFloat16(value))
@@ -316,7 +319,7 @@ class MlaQuery:
         if cutlass.const_expr(self.dcp):
             self.publish(args, tok0, tid)
         valid = (head == 0) & (part < B) & self.live(tok0 + part)
-        if cutlass.const_expr(self.dsa):
+        if cutlass.const_expr(self.ds):
             self.insert_ds(args, ss, tok0, part, valid, tid)
         else:
             self.insert(args, ss, tok0, part, valid, tid)
@@ -487,7 +490,7 @@ class MlaQuery:
         qsi = q_scale_inv[0]
         # The KV insert overlaps the staging of x (CTA j of the tile owns request j).
         j = head * self.cluster + part
-        if cutlass.const_expr(self.dsa):
+        if cutlass.const_expr(self.ds):
             self.insert_ds(args, ss, tok0, j, (j < T) & self.live(tok0 + j), tid)
         else:
             self.insert(args, ss, tok0, j, (j < T) & self.live(tok0 + j), tid)
@@ -558,7 +561,7 @@ class MlaQuery:
             if p < 128:
                 qblk[t, r] = BFloat16(value)
             elif self.live(tok0 + t):
-                if cutlass.const_expr(self.dsa):
+                if cutlass.const_expr(self.ds):
                     output[tok0 + t, head, 512 + p - 128] = BFloat16(value)
                 else:
                     output[tok0 + t, head, 512 + p - 128] = fp8_bits(value * qsi)
@@ -587,7 +590,7 @@ class MlaQuery:
                 row = 16 * m + group + 8 * h
                 if self.live(tok0 + row):
                     col = L * part + 8 * warp + 2 * quarter
-                    if cutlass.const_expr(self.dsa):
+                    if cutlass.const_expr(self.ds):
                         pair = at(output, tok0 + row, head, col)
                         store_bf16_pair(pair, out[2 * h], out[2 * h + 1])
                     else:

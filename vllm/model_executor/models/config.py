@@ -596,16 +596,30 @@ class KimiK3ForConditionalGenerationConfig(VerifyAndUpdateConfig):
 
     @classmethod
     def verify_and_update_config(cls, vllm_config: "VllmConfig") -> None:
-        """Default the kv-cache dtype to "fp8_ds_mla" when the text backbone
-        carries DSA."""
+        """Default the kv-cache dtype when the text backbone carries DSA:
+        per-tensor fp8 for FLASHINFER_MLA_SPARSE, the default on SM10x, and
+        "fp8_ds_mla" otherwise."""
         hf_config = vllm_config.model_config.hf_config
         # Multimodal composite configs carry dsa_config on text_config;
         # text-only models have it at the top level.
         hf_text_config = getattr(hf_config, "text_config", hf_config)
         if getattr(hf_text_config, "dsa_config", None) is None:
             return
+        from vllm.platforms import current_platform
+        from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
         cache_config = vllm_config.cache_config
-        if cache_config.cache_dtype == "auto" or cache_config.cache_dtype.startswith(
+        backend = vllm_config.attention_config.backend
+        if backend == AttentionBackendEnum.FLASHINFER_MLA_SPARSE or (
+            backend is None
+            and current_platform.is_cuda()
+            and current_platform.is_device_capability_family(100)
+        ):
+            # FlashInfer reads per-tensor fp8 MLA rows, not the ds_mla formats.
+            if cache_config.cache_dtype == "auto":
+                cache_config.cache_dtype = "fp8_e4m3"
+                logger.info("Using per-tensor fp8 kv-cache for Kimi K3 DSA")
+        elif cache_config.cache_dtype == "auto" or cache_config.cache_dtype.startswith(
             "fp8"
         ):
             cache_config.cache_dtype = "fp8_ds_mla"

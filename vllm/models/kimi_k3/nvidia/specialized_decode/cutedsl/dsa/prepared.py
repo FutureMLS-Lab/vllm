@@ -10,7 +10,10 @@ indexer caches (FlashMLA sparse reads whole blocks, the indexer 64-entry pages):
   indexer core     the stock decode scoring and top-k (sparse_attn_indexer, key
                    insert skipped)
   sparse core      SparseMlaDecode over the local heads (core "cute"), or logical ->
-                   physical top-k and FlashMLA sparse decode (core "flashmla")
+                   physical top-k and FlashMLA sparse decode (core "flashmla"); on a
+                   per-tensor FP8 cache (FLASHINFER_MLA_SPARSE) the query and KV row
+                   are FP8 and FlashInfer's trtllm-gen sparse decode reads the flat
+                   rows of the packed blocks (core "flashinfer")
   MlaValue         W_UV and the sigmoid gate of the BF16 latent
 
 Under DCP (= TP) each rank's cache holds 1 / DCP of every context: the query and
@@ -52,7 +55,7 @@ QUERY_HEADS = 64  # FlashMLA sparse FP8 decode reads 64 or 128 query heads
 # cute vs FlashMLA: B1 11.8/21.4, B4 12.1/21.9, B8 16.6/21.1, B16 27.4/24.4,
 # B32 27.9/34.9, B64 52.0/52.8).
 SPARSE_CORE = "1-8:cute,9-16:flashmla,17-32:cute,33-64:flashmla"
-CORES = ("cute", "flashmla")
+CORES = ("cute", "flashmla", "flashinfer")
 
 
 def core_for(batch, core="auto"):
@@ -70,17 +73,25 @@ def gate_columns(heads):
 
 
 @cache
-def compile_core(batch, heads, pitch, specs, device, q=1, dcp=0, q_heads=0, sms=148):
+def compile_core(
+    batch, heads, pitch, specs, device, q=1, dcp=0, q_heads=0, sms=148, fp8=False
+):
     """CuTe kernels (query, index, value) of one batch of rows (``q`` per request).
     ``specs``: the layouts of the weights, the MLA cache and the indexer cache.
     Under DCP (``dcp``: its size, ``q_heads``: the gathered query's padded heads) the
-    query also publishes into the q mailbox and the value is DcpValue."""
+    query also publishes into the q mailbox and the value is DcpValue. ``fp8``: a
+    per-tensor FP8 query [B, H, 576] and cache, and the value reads FlashInfer's
+    [B, H, 512] latent."""
     qnorm, kvnorm, qb, uk, uv, kv, index_kv = (
         fake(shape, stride, dtype, 4 if dtype == torch.float32 else 16)
         for shape, stride, dtype in specs
     )
     scalar = fake((1,), (1,), torch.float32, 4)
-    query = fake((batch, QUERY_HEADS, 576), (QUERY_HEADS * 576, 576, 1))
+    query_heads = heads if fp8 else QUERY_HEADS
+    if fp8:
+        query = fake((batch, heads, 576), (heads * 576, 576, 1), torch.uint8)
+    else:
+        query = fake((batch, QUERY_HEADS, 576), (QUERY_HEADS * 576, 576, 1))
     qc = fake((batch, 1536), (1536, 1))
     projected = fake((batch, pitch), (pitch, 1))
     slots = fake((batch,), (1,), torch.int64, 8)
@@ -91,6 +102,7 @@ def compile_core(batch, heads, pitch, specs, device, q=1, dcp=0, q_heads=0, sms=
         batch,
         q_b_cp_async=heads == 12 and batch == 1,
         dsa=True,
+        fp8=fp8,
         dcp=dcp,
         q_heads=q_heads,
     )
@@ -106,7 +118,7 @@ def compile_core(batch, heads, pitch, specs, device, q=1, dcp=0, q_heads=0, sms=
     q_out = fake((batch, HEADS, DIM), None, torch.uint8)
     w_out = fake((batch, HEADS), None, torch.float32, 4)
     i_args = (projected, iq, norm, norm, index_kv, slots, q_out, w_out, f32(1e-6))
-    latent = fake((batch, heads, 512), (QUERY_HEADS * 512, 512, 1))
+    latent = fake((batch, heads, 512), (query_heads * 512, 512, 1))
     gate = fake((batch, heads * 128), (pitch, 1))
     lengths = fake((batch // q,), (1,), torch.int32, 4)
     output = fake((batch, heads * 128), (heads * 128, 1))
@@ -163,19 +175,25 @@ class PreparedDsa:
         dcp=None,
         parity=0,
     ):
+        from vllm.v1.attention.backends.mla.flashinfer_mla_sparse import (
+            FlashInferMLASparseImpl,
+        )
         from vllm.v1.attention.backends.mla.flashmla_sparse import FlashMLASparseImpl
 
         wrapper = attention.mla_attn
         self.layer = layer = wrapper.mla_attn
         self.impl, self.indexer = layer.impl, attention.dsa_indexer
-        if not isinstance(self.impl, FlashMLASparseImpl):
+        self.fp8 = isinstance(self.impl, FlashInferMLASparseImpl)
+        if not (self.fp8 or isinstance(self.impl, FlashMLASparseImpl)):
             raise ValueError(
-                "Kimi K3.1 specialized decode needs the FLASHMLA_SPARSE backend, got "
-                f"{type(self.impl).__name__}"
+                "Kimi K3.1 specialized decode needs the FLASHMLA_SPARSE or "
+                f"FLASHINFER_MLA_SPARSE backend, got {type(self.impl).__name__}"
             )
+        if self.fp8 and dcp is not None:
+            raise ValueError("Kimi K3.1 DSA on FlashInfer: no DCP specialized decode")
         self.box, self.parity = dcp, parity
         self.dcp = dcp.size if dcp is not None else 1
-        if dcp is None:
+        if dcp is None and not self.fp8:
             assert self.impl.fp8_decode_padded_heads == QUERY_HEADS
         self.heads = layer.W_UK_T.shape[0]
         norms = wrapper.q_a_layernorm.weight, wrapper.kv_a_layernorm.weight
@@ -193,6 +211,16 @@ class PreparedDsa:
         self.query, self.qc, self.iq, self.q_fp8, self.head_w, self.latent = scratch
         self.shapes = [(b, q) for b in pitches for q in queries if b % q == 0]
         self.cores = {(b, q): core_for(b, core) for b, q in self.shapes}
+        # Inverse per-tensor scales of the FP8 query and KV row (FlashMLA: unused).
+        self.scales_inv = self.unit, self.unit
+        if self.fp8:
+            self.cores = dict.fromkeys(self.shapes, "flashinfer")
+            self.scales_inv = tuple(
+                (1 / scale.float()).reshape(1).to(self.device)
+                for scale in (layer._q_scale, layer._k_scale)
+            )
+            shape = (max(pitches), self.heads, 576)
+            self.query = torch.zeros(shape, dtype=torch.uint8, device=self.device)
         if self.dcp > 1:
             self.cores = dict.fromkeys(self.shapes, "dcp")
             rows, device = max(pitches), self.device
@@ -222,7 +250,7 @@ class PreparedDsa:
             args += (self.device.index, q)
             if self.box is not None:
                 args += (self.dcp, self.box.q_heads, sms)
-            self.kernels[batch, q] = compile_core(*args)
+            self.kernels[batch, q] = compile_core(*args, fp8=self.fp8)
             if self.cores[batch, q] == "cute":
                 sparse = batch, self.heads, specs[5], self.device.index, q
                 self.sparse[batch, q] = compile_sparse(*sparse)
@@ -263,6 +291,28 @@ class PreparedDsa:
         from vllm.v1.attention.ops.flashmla import flash_mla_with_kvcache
 
         impl = self.impl
+        if self.cores[batch, q] == "flashinfer":
+            # As the stock decode: top-k -> flat rows of the packed blocks.
+            from vllm.v1.attention.backends.mla.sparse_utils import flat_kv_row_view
+
+            impl.record_logical_topk_ready()
+            _, block_rows = flat_kv_row_view(cache, metadata.block_size)
+            physical, valid = impl._convert_logical_to_physical_topk(
+                topk[:batch],
+                metadata,
+                block_stride_rows=block_rows,
+                return_valid_counts=True,
+            )
+            latent, _ = impl._forward_mqa_kernel(
+                self.query[:batch].view(torch.float8_e4m3fn),
+                cache,
+                physical,
+                valid,
+                layer=self.layer,
+                block_size=metadata.block_size,
+                is_decode=True,
+            )
+            return latent
         if self.cores[batch, q] == "cute":
             reqs = batch // q
             table, _, _ = pad_requests(reqs, metadata.block_table, metadata.seq_lens)
@@ -395,9 +445,10 @@ class PreparedDsa:
         mq, index, value = self.kernels[batch, q]
         qnorm, kvnorm, qb, uk, uv = self.views
         kv = to_cute(cache.view(torch.uint8))
-        unit = to_cute(self.unit, 4)
+        q_scale_inv, k_scale_inv = (to_cute(t, 4) for t in self.scales_inv)
         x, q_slots = to_cute(projected), to_cute(slots[:batch], 8)
-        q_args = (x, qnorm, kvnorm, qb, uk, kv, q_slots, unit, unit, self.eps)
+        scales = q_scale_inv, k_scale_inv, self.eps
+        q_args = (x, qnorm, kvnorm, qb, uk, kv, q_slots, *scales)
         mq(*q_args, to_cute(self.query[:batch]), to_cute(self.qc[:batch]), s)
         self.run_index(x, index_slots, batch, index)
         topk = self.indexer_core(projected, batch)
