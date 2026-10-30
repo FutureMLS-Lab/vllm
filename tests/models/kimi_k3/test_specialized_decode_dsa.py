@@ -346,3 +346,124 @@ def test_sparse_decode_ignores_masked_rows():
     ref = sparse_reference(query, topk, table, mla, 0.07, 1)
     assert latent.isfinite().all()
     torch.testing.assert_close(latent[:, :HEADS].float(), ref, atol=3e-2, rtol=3e-2)
+
+
+@pytest.mark.parametrize("kernel", ["trtllm", "prims_ts"])
+def test_flashinfer_dcp_core_merges_to_full_attention(
+    default_vllm_config, dist_init, kernel
+):
+    """DCP8 on FlashInfer sparse (per-tensor FP8): each rank's dcp_core over its
+    shard of a packed cache, its gathered 96-head query padded to 128 and the
+    global top-k, merged by LSE in the kernel's base, is the sparse attention
+    over the whole context. Request 0 lies on rank 0 only (empty shards)."""
+    from types import SimpleNamespace
+
+    from vllm.model_executor.layers.linear import ColumnParallelLinear
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.dsa.prepared import (
+        PreparedDsa,
+    )
+    from vllm.utils.flashinfer import has_flashinfer_prims_ts_sparse_mla
+    from vllm.v1.attention.backends.mla.flashinfer_mla_sparse import (
+        FlashInferMLASparseImpl,
+    )
+
+    if kernel == "prims_ts" and not has_flashinfer_prims_ts_sparse_mla():
+        pytest.skip("FlashInfer has no prims_ts sparse MLA")
+    default_vllm_config.kernel_config.flashinfer_sparse_mla_kernel = kernel
+    text = SimpleNamespace(kv_lora_rank=512, qk_rope_head_dim=64)
+    object.__setattr__(
+        default_vllm_config, "model_config", SimpleNamespace(hf_text_config=text)
+    )
+    dcp, heads, topk, block, reqs, context = 8, HEADS * 8, 2048, UNIT, 4, 5000
+    impl = FlashInferMLASparseImpl(
+        num_heads=heads,
+        head_size=FP8_ROW,
+        scale=192**-0.5,
+        num_kv_heads=1,
+        alibi_slopes=None,
+        sliding_window=None,
+        kv_cache_dtype="fp8_e4m3",
+        logits_soft_cap=None,
+        attn_type="decoder",
+        kv_sharing_target_layer_name=None,
+        q_lora_rank=None,
+        kv_lora_rank=512,
+        qk_nope_head_dim=128,
+        qk_rope_head_dim=64,
+        qk_head_dim=192,
+        v_head_dim=128,
+        kv_b_proj=ColumnParallelLinear(512, heads * 256, bias=False),
+    )
+    impl.need_to_return_lse_for_decode = True
+    impl._workspace_buffer = torch.zeros(1 << 30, dtype=torch.int8, device="cuda")
+    layer = SimpleNamespace(_q_scale_float=1.0, _k_scale_float=1.0)
+    e4m3 = torch.float8_e4m3fn
+
+    gen = torch.Generator(device="cuda").manual_seed(0)
+    # Each rank's latents are offset differently and the scores are peaked, so the
+    # shards' partial outputs and LSEs differ: a wrong LSE base misweights them.
+    kv = torch.rand(reqs, context, FP8_ROW, generator=gen, device="cuda") - 0.5
+    owner = torch.arange(context, device="cuda") % dcp
+    kv[..., :512] += 0.2 * owner.view(1, -1, 1)
+    kv = kv.to(e4m3)
+    query = torch.zeros(reqs, 128, FP8_ROW, dtype=torch.uint8, device="cuda")
+    query[:, :heads] = (
+        (8 * (torch.rand(reqs, heads, FP8_ROW, generator=gen, device="cuda") - 0.5))
+        .to(e4m3)
+        .view(torch.uint8)
+    )
+    tokens = torch.full((reqs, topk), -1, dtype=torch.int32, device="cuda")
+    for r in range(reqs):
+        pool = torch.arange(0, context, dcp if r == 0 else 1, device="cuda")
+        pick = pool[torch.randperm(pool.numel(), generator=gen, device="cuda")]
+        n = min(topk - 37 * r, pick.numel())
+        tokens[r, :n] = pick[:n].int()
+
+    local = -(-context // dcp)
+    blocks_per_req = -(-local // block)
+    rows, lses = [], []
+    for rank in range(dcp):
+        # FlashInfer aligns packed block strides to its 32-row pages.
+        cache = packed_cache(reqs * blocks_per_req, block, FP8_ROW, gap=block)
+        order = torch.randperm(reqs * blocks_per_req, generator=gen, device="cuda")
+        table = order.view(reqs, blocks_per_req).int()
+        for r in range(reqs):
+            mine = torch.arange(rank, context, dcp, device="cuda")
+            slot = torch.arange(mine.numel(), device="cuda")
+            physical = table[r, slot // block].long()
+            cache[physical, slot % block] = kv[r, mine].view(torch.uint8)
+        md = SimpleNamespace(
+            req_id_per_token=torch.arange(reqs, dtype=torch.int32, device="cuda"),
+            block_table=table,
+            block_size=block,
+        )
+        box = torch.zeros(2, reqs, 128, FP8_ROW, dtype=torch.uint8, device="cuda")
+        box[0] = query
+        core = SimpleNamespace(
+            fp8=True,
+            impl=impl,
+            layer=layer,
+            dcp=dcp,
+            parity=0,
+            box=SimpleNamespace(q=box),
+            indexer=SimpleNamespace(dcp_rank=rank, cp_kv_cache_interleave_size=1),
+        )
+        row, lse = PreparedDsa.dcp_core(core, cache, tokens, md, reqs)
+        rows.append(row.view(reqs, -1, 512)[:, :heads].float())
+        lses.append(lse.view(reqs, -1)[:, :heads].float())
+        if rank:
+            assert torch.isinf(lses[-1][0]).all(), "an empty shard must not count"
+
+    lse = torch.stack(lses)
+    if not impl.lse_base_on_e:
+        lse = lse * torch.log(torch.tensor(2.0, device="cuda"))
+    weights = torch.softmax(lse, dim=0).unsqueeze(-1)
+    merged = (weights * torch.stack(rows).nan_to_num()).sum(0)
+
+    q = query[:, :heads].view(e4m3).float()
+    for r in range(reqs):
+        picked = tokens[r][tokens[r] >= 0].long()
+        keys = kv[r, picked].float()
+        probs = torch.softmax(q[r] @ keys.T * impl.scale, dim=-1)
+        ref = probs @ keys[:, :512]
+        torch.testing.assert_close(merged[r], ref, atol=3e-2, rtol=3e-2)

@@ -79,11 +79,8 @@ def unsupported(vllm_config) -> str | None:
     compilation = vllm_config.compilation_config
     graphs = compilation.cudagraph_mode
     # Kimi K3.1: sparse (DSA) MLA layers over the packed MLA and indexer caches,
-    # fp8_ds_mla on FlashMLA sparse or per-tensor FP8 on FlashInfer sparse (no DCP).
+    # fp8_ds_mla on FlashMLA sparse or per-tensor FP8 on FlashInfer sparse.
     dsa = getattr(text, "dsa_config", None) is not None
-    # Only FlashInfer sparse serves DSA on a per-tensor FP8 cache: FlashMLA
-    # sparse reads every FP8 dtype as fp8_ds_mla.
-    flashinfer = vllm_config.cache_config.cache_dtype in ("fp8", "fp8_e4m3")
     checks = (
         (not current_platform.is_device_capability_family(100), "this GPU (SM100/103)"),
         (
@@ -145,10 +142,6 @@ def unsupported(vllm_config) -> str | None:
             not in ("fp8_ds_mla", "fp8", "fp8_e4m3"),
             "DSA layers on KV cache dtypes other than fp8_ds_mla (FlashMLA sparse) "
             "or per-tensor fp8 (FlashInfer sparse)",
-        ),
-        (
-            dsa and flashinfer and parallel.decode_context_parallel_size > 1,
-            "DSA layers on FlashInfer sparse under decode context parallel",
         ),
     )
     return next((reason for failed, reason in checks if failed), None)

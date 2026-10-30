@@ -14,7 +14,7 @@ from vllm.model_executor.kernels.linear.cute_dsl.skinny_gemm import (
 from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
 
 from ..cutedsl.dsa.index import DIM, HEADS
-from ..cutedsl.dsa.prepared import QUERY_HEADS, PreparedDsa
+from ..cutedsl.dsa.prepared import QUERY_HEADS, PreparedDsa, dsa_on_flashinfer
 from ..cutedsl.gemm.projection import PreparedProjection
 from ..cutedsl.kda.prepared import PreparedKda
 from ..cutedsl.mla.dcp import DcpBox
@@ -114,7 +114,12 @@ class Attention:
             if runtime.dcp > 1:
                 heads = attention.num_local_heads
                 policy.update(
-                    dcp=dcp_box(runtime, heads, dsa=True),
+                    dcp=dcp_box(
+                        runtime,
+                        heads,
+                        dsa=True,
+                        flashinfer=dsa_on_flashinfer(attention),
+                    ),
                     parity=runtime.dsa_layers % 2,
                 )
             runtime.dsa_layers += 1
@@ -236,9 +241,10 @@ def dsa_scratch(runtime):
     )
 
 
-def dcp_box(runtime, heads, dsa=False):
+def dcp_box(runtime, heads, dsa=False, flashinfer=False):
     """The model's DCP mailboxes (one set for every MLA layer, one for every DSA
-    layer: a BF16 q mailbox padded to FlashMLA sparse's 64 or 128 heads)."""
+    layer: a q mailbox padded to the sparse decode's heads, BF16 for FlashMLA
+    sparse's 64 or 128, FP8 for FlashInfer's trtllm-gen / prims_ts query heads)."""
     name = "dsa_dcp_box" if dsa else "dcp_box"
     if getattr(runtime, name) is None:
         from vllm.distributed import get_dcp_group
@@ -250,8 +256,22 @@ def dcp_box(runtime, heads, dsa=False):
         args = group.device_group, runtime.device, group.world_size, group.rank_in_group
         parallel = get_current_vllm_config().parallel_config
         interleave = parallel.cp_kv_cache_interleave_size
-        q_heads = (64 if group.world_size * heads <= 64 else 128) if dsa else None
-        box = DcpBox(*args, heads, interleave=interleave, q_heads=q_heads)
+        q_heads = None
+        if dsa and flashinfer:
+            from vllm.v1.attention.backends.mla.flashinfer_mla_sparse import (
+                trtllm_gen_query_heads,
+            )
+
+            q_heads = trtllm_gen_query_heads(group.world_size * heads)
+        elif dsa:
+            q_heads = 64 if group.world_size * heads <= 64 else 128
+        box = DcpBox(
+            *args,
+            heads,
+            interleave=interleave,
+            q_heads=q_heads,
+            q_bf16=dsa and not flashinfer,
+        )
         setattr(runtime, name, box)
     return getattr(runtime, name)
 

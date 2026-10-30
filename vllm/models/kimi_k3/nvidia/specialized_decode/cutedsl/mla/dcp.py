@@ -61,14 +61,24 @@ class DcpBox:
     the KV cache's DCP interleave (global masking of spec verify rows)."""
 
     def __init__(
-        self, group, device, size, rank, heads, cap=64, interleave=1, q_heads=None
+        self,
+        group,
+        device,
+        size,
+        rank,
+        heads,
+        cap=64,
+        interleave=1,
+        q_heads=None,
+        q_bf16=False,
     ):
         self.size, self.rank, self.heads, self.cap = size, rank, heads, cap
         self.interleave = interleave
         empty = symm_mem.empty
-        # DSA: BF16 query rows, q_heads per token (the FlashMLA sparse padding).
+        # DSA: q_heads query rows per token (the sparse decode's head padding), BF16
+        # for FlashMLA sparse, FP8 bytes for FlashInfer.
         self.q_heads = q_heads or size * heads
-        q_dtype = torch.bfloat16 if q_heads else torch.uint8
+        q_dtype = torch.bfloat16 if q_bf16 else torch.uint8
         self.q = empty((2, cap, self.q_heads, 576), dtype=q_dtype, device=device)
         shape = (2, size, cap, heads)
         self.partial = empty((*shape, 512), dtype=torch.bfloat16, device=device)
@@ -277,12 +287,24 @@ class DcpValue:
 
 @cache
 def compile_value(
-    heads, size, batch, cap, uv, pitch, device, sms=148, q=1, dsa_heads=0
+    heads,
+    size,
+    batch,
+    cap,
+    uv,
+    pitch,
+    device,
+    sms=148,
+    q=1,
+    dsa_heads=0,
+    dsa_bf16=True,
+    lse_base_e=True,
 ):
     """DcpValue of one batch (``q`` rows per request); ``uv``: the (shape, stride,
     dtype) of W_UV, ``pitch``: the projected rows' (the gate follows the 2112 query /
-    KV columns). ``dsa_heads``: DSA (FlashMLA sparse) layout, its padded head count:
-    BF16 q mailbox rows, rows / natural-log LSE as FlashMLA returns them."""
+    KV columns). ``dsa_heads``: DSA layout, its padded head count: q mailbox rows
+    (BF16 for FlashMLA sparse, else FP8), rows / LSE as the sparse decode returns
+    them (``lse_base_e``: natural-log, else base 2)."""
     f32, i32 = torch.float32, torch.int32
     w_uv, gate = fake(*uv), fake((batch, heads * 128), (pitch, 1))
     rows = fake((batch, 1, size * heads, 512))
@@ -292,8 +314,10 @@ def compile_value(
     if dsa_heads:
         rows = fake((batch, 1, size * heads, 512), (dsa_heads * 512, 0, 512, 1))
         rows_lse = fake((batch, 1, size * heads), (dsa_heads, 0, 1), f32, 4)
-        mailbox = fake((cap, dsa_heads, 1152), None, torch.uint8)  # BF16 bytes
-        value = DcpValue(heads, size, batch, sms, q, 72, dsa_heads, math.log2(math.e))
+        row_bytes = 1152 if dsa_bf16 else 576
+        mailbox = fake((cap, dsa_heads, row_bytes), None, torch.uint8)
+        scale = math.log2(math.e) if lse_base_e else 1.0
+        value = DcpValue(heads, size, batch, sms, q, row_bytes // 16, dsa_heads, scale)
     lens = fake((batch // q,), None, i32, 4)
     box = fake((size, cap, heads, 512))
     lbox = fake((size, cap, heads), None, f32, 4)
