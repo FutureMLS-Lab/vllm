@@ -29,7 +29,7 @@ SPEC_SCHEDULE = {
 
 
 @cache
-def executable(specs, heads, gate_mode, has_bias, device, tokens=1):
+def executable(specs, heads, gate_mode, has_bias, device, tokens=1, record=False):
     args = tuple(fake(shape, stride, dtype) for shape, stride, dtype in specs)
     batch = specs[0][0][0]
     table = SCHEDULE if tokens == 1 else SPEC_SCHEDULE
@@ -38,7 +38,7 @@ def executable(specs, heads, gate_mode, has_bias, device, tokens=1):
     if schedule[0] >= 2 and specs[9][1][-2:] != (128, 1):  # staging needs whole rows
         schedule = (1, *schedule[1:4])  # no evict hint without staging
     requests = batch // tokens
-    kernel = KdaSplit(heads, requests, gate_mode, has_bias, schedule, tokens)
+    kernel = KdaSplit(heads, requests, gate_mode, has_bias, schedule, tokens, record)
     scalars = (cutlass.Float32(v) for v in (-5, 128**-0.5, 1e-6))
     with torch.accelerator.device_index(device):
         return cute.compile(
@@ -66,17 +66,20 @@ class PreparedKda:
         scalars = (attention.gate_lower_bound, 128**-0.5, attention.o_norm.eps)
         self.scalars = tuple(map(cutlass.Float32, scalars))
         self.conv_dim_first, self.kernels = conv_dim_first, {}
+        # RecoverSSM: verify steps leave the state checkpoint and write the records.
+        records = getattr(attention, "recoverssm_records", None)
+        self.records = (records.correction, records.key_gate) if records else ()
 
     def _operands(self, caches, projected, slots, out, accepted=None):
         """Kernel tensors in launch order: 13 before the scalars, then F_B (and the
-        verify step's accepted counts)."""
+        verify step's accepted counts and RecoverSSM records)."""
         conv, state = caches[:2]
         conv = conv if self.conv_dim_first else conv.transpose(-1, -2)
         w, bias, fb, a_log, dt, norm = self.weights
         d, h = self.dim, self.heads
         p = lambda start, width: projected[:, start : start + width]
         ops = (p(0, 3 * d), w, bias, conv, p(4 * d, 128), p(4 * d + 128, h), a_log, dt)
-        tail = (fb,) if accepted is None else (fb, accepted)
+        tail = (fb,) if accepted is None else (fb, accepted, *self.records)
         return ops + (slots, state, out, p(3 * d, d), norm) + tail
 
     def prepare_caches(self, caches):
@@ -87,23 +90,27 @@ class PreparedKda:
             projected = torch.empty((batch, pitch), dtype=torch.bfloat16, **meta)
             out = torch.empty(batch, self.dim, dtype=torch.bfloat16, **meta)
             accepted = torch.empty(requests, dtype=torch.int32, **meta)
-            shape = (requests, tokens) if tokens > 1 else (batch,)
+            record = tokens > 1 and bool(self.records)
+            # RecoverSSM verify steps have one state slot (the checkpoint).
+            shape = (requests, 1 if record else tokens) if tokens > 1 else (batch,)
             slots = torch.empty(shape, dtype=torch.int32, **meta)
             accepted = accepted if tokens > 1 else None
             operands = self._operands(caches, projected, slots, out, accepted)
             self.kernels[key] = executable(
                 tuple(map(layout, operands)),
                 *(self.heads, mode, self.has_bias, self.device.index, tokens),
+                record,
             )
         return self
 
-    def run(self, projected, out, *, caches, slots, accepted=None):
-        """``accepted`` [>= B] (verify steps): ``slots`` is [>= B, q] contiguous."""
+    def run(self, projected, out, *, caches, slots, accepted=None, q=1):
+        """``accepted`` [>= B] (verify steps of ``q`` tokens): ``slots`` is [>= B, q]
+        contiguous, or [>= B, 1] (the checkpoints) under RecoverSSM."""
         batch = projected.shape[0]
         key, rows = batch, batch
         if accepted is not None:
-            rows = batch // slots.shape[1]
-            key, accepted = (rows, slots.shape[1]), accepted[:rows]
+            rows = batch // q
+            key, accepted = (rows, q), accepted[:rows]
             if slots.stride() != (slots.shape[1], 1):  # e.g. a block-table slice
                 slots = slots.contiguous()
         tensors = self._operands(caches, projected, slots[:rows], out, accepted)

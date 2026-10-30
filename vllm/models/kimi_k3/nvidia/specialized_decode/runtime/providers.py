@@ -198,7 +198,12 @@ class Attention:
                 slots = metadata.spec_state_indices_tensor
                 accepted = metadata.num_accepted_tokens
                 self.core.run(
-                    projected, local, caches=caches, slots=slots, accepted=accepted
+                    projected,
+                    local,
+                    caches=caches,
+                    slots=slots,
+                    accepted=accepted,
+                    q=q,
                 )
             else:
                 slots = metadata.non_spec_state_indices_tensor

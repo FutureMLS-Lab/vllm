@@ -115,17 +115,11 @@ def unsupported(vllm_config) -> str | None:
             spec is not None and spec.enable_adaptive_verification,
             "adaptive verification",
         ),
-        # KdaSplit keeps a BF16 conv state and an FP32 recurrent state in place; it
-        # maintains neither other cache dtypes nor ReplaySSM / RecoverSSM records.
+        # KdaSplit keeps a BF16 conv state and an FP32 recurrent state in place.
         (
             kda_dtypes(vllm_config) != (torch.bfloat16, torch.float32),
             "KDA cache dtypes other than a BF16 conv state and an FP32 recurrent "
             "state (mamba cache dtype)",
-        ),
-        (
-            vllm_config.cache_config.use_replayssm
-            or vllm_config.cache_config.use_kda_recoverssm,
-            "ReplaySSM / RecoverSSM (--use-replayssm)",
         ),
         # The verify kernels take at most 8 tokens per request (KdaSplit's barriers).
         (
