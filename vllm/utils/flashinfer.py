@@ -540,7 +540,7 @@ def prims_ts_sparse_mla_format_error(kv_cache_format: str) -> str | None:
             1,
             128,
             max_topk=2048,
-            q_data_type=torch.float8_e4m3fn,
+            q_dtype=torch.float8_e4m3fn,
             qk_rope_head_dim=64,
             kv_cache_format=kv_cache_format,
             return_lse=True,

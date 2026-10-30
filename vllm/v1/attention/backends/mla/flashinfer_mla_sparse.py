@@ -616,7 +616,7 @@ class _PrimsTSPlans:
             max_topk=max_topk,
             max_seq_len_q=1,
             packed_query=True,
-            q_data_type=torch.float8_e4m3fn,
+            q_dtype=torch.float8_e4m3fn,
             qk_rope_head_dim=64,
             kv_cache_format=kv_cache_format,
             return_lse=return_lse,
