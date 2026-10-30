@@ -441,15 +441,28 @@ def test_select_kernel():
             hf_text_config=SimpleNamespace(kv_lora_rank=512, qk_rope_head_dim=64)
         ),
         attention_config=SimpleNamespace(hisparse_config=None),
-        parallel_config=SimpleNamespace(use_ubatching=False),
+        parallel_config=SimpleNamespace(
+            use_ubatching=False, decode_context_parallel_size=8
+        ),
         kernel_config=SimpleNamespace(flashinfer_sparse_mla_kernel="auto"),
     )
-    # auto/trtllm: per-tensor fp8 stays on trtllm-gen; nvfp4 needs prims_ts.
-    for choice in ("auto", "trtllm"):
-        config.kernel_config.flashinfer_sparse_mla_kernel = choice
-        assert not fims.use_prims_ts(config, "fp8")
-        assert not fims.use_prims_ts(config, "auto")
-        assert fims.use_prims_ts(config, "nvfp4_ds_mla")
+    # auto: prims_ts under DCP when it can run, else trtllm-gen (no error).
+    assert fims.use_prims_ts(config, "fp8")
+    assert fims.use_prims_ts(config, "nvfp4_ds_mla")
+    assert not fims.use_prims_ts(config, "auto")
+    config.parallel_config.use_ubatching = True
+    assert not fims.use_prims_ts(config, "fp8")
+    config.parallel_config.use_ubatching = False
+    # auto without DCP: trtllm-gen for fp8; nvfp4 still needs prims_ts.
+    config.parallel_config.decode_context_parallel_size = 1
+    assert not fims.use_prims_ts(config, "fp8")
+    assert fims.use_prims_ts(config, "nvfp4_ds_mla")
+    config.parallel_config.decode_context_parallel_size = 8
+    # trtllm: per-tensor fp8 stays on trtllm-gen; nvfp4 needs prims_ts.
+    config.kernel_config.flashinfer_sparse_mla_kernel = "trtllm"
+    assert not fims.use_prims_ts(config, "fp8")
+    assert not fims.use_prims_ts(config, "auto")
+    assert fims.use_prims_ts(config, "nvfp4_ds_mla")
     config.kernel_config.flashinfer_sparse_mla_kernel = "prims_ts"
     assert fims.use_prims_ts(config, "fp8")
     assert fims.use_prims_ts(config, "fp8_e4m3")

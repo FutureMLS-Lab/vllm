@@ -502,17 +502,21 @@ _PRIMS_TS_MAX_ROWS = 4096
 def use_prims_ts(vllm_config: VllmConfig, kv_cache_dtype: str) -> bool:
     """Whether FLASHINFER_MLA_SPARSE runs this model's sparse MLA on prims_ts.
 
-    nvfp4_ds_mla (no trtllm-gen kernel) always uses prims_ts. Per-tensor fp8
-    uses it only with kernel_config.flashinfer_sparse_mla_kernel="prims_ts";
-    "auto" keeps trtllm-gen for it, so models already served by this backend do
-    not change kernel when FlashInfer is upgraded. Raises if prims_ts is
-    required but cannot run."""
-    if not (
-        kv_cache_dtype == "nvfp4_ds_mla"
-        or vllm_config.kernel_config.flashinfer_sparse_mla_kernel == "prims_ts"
+    "auto" uses prims_ts under DCP when it can run (faster than trtllm-gen
+    for per-tensor fp8 prefill and decode on SM100 there) and trtllm-gen
+    otherwise, including TP-only (DCP 1). "trtllm" keeps trtllm-gen for
+    per-tensor fp8. nvfp4_ds_mla (no trtllm-gen kernel) always uses prims_ts.
+    Raises if prims_ts is required but cannot run."""
+    kernel = vllm_config.kernel_config.flashinfer_sparse_mla_kernel
+    required = kv_cache_dtype == "nvfp4_ds_mla" or kernel == "prims_ts"
+    if not required and (
+        kernel == "trtllm"
+        or vllm_config.parallel_config.decode_context_parallel_size <= 1
     ):
         return False
     reason = _prims_ts_unsupported_reason(vllm_config, kv_cache_dtype)
+    if not required:
+        return reason is None
     if reason is not None:
         raise ValueError(
             f"FLASHINFER_MLA_SPARSE cannot run the prims_ts kernel: {reason}"

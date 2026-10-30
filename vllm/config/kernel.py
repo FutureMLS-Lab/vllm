@@ -375,8 +375,8 @@ class KernelConfig:
     """Kernel of the SM100 FLASHINFER_MLA_SPARSE backend for D576 sparse MLA.
     Available options:
 
-    - "auto": trtllm-gen for a per-tensor fp8 or bf16 cache, prims_ts for
-      nvfp4_ds_mla
+    - "auto": prims_ts for nvfp4_ds_mla, and for a per-tensor fp8 cache under
+      DCP (decode_context_parallel_size > 1) when it can run; else trtllm-gen
     - "trtllm": trtllm-gen; nvfp4_ds_mla caches cannot use this backend
     - "prims_ts": FlashInfer's task-scheduled sparse MLA decode, also for a
       per-tensor fp8 cache
