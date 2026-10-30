@@ -324,25 +324,31 @@ class FlashInferMLASparseTRTLLMMetadataBuilder(FlashInferMLASparseMetadataBuilde
             and vllm_config.attention_config.hisparse_config is None
         )
 
-        # Under DCP the workspace must hold the trtllm-gen softmax-stats slab.
-        # The buffer address is baked into CUDA graphs, so it has to reach its
-        # final size here, before the first forward/capture (no lazy regrow).
-        # The prims_ts kernel owns its own (small) plan workspaces.
+        # trtllm-gen's buffers are baked into CUDA graphs, so they reach their
+        # final size here, before the first forward/capture (no lazy regrow):
+        # under DCP the workspace holds the softmax-stats slab, and the
+        # multi-CTA KV counters cover every launch. The prims_ts kernel owns its
+        # own (small) plan workspaces.
         kv_cache_dtype = (
             getattr(kv_cache_spec, "cache_dtype_str", None)
             or vllm_config.cache_config.cache_dtype
         )
-        if self.dcp_world_size > 1 and not use_prims_ts(vllm_config, kv_cache_dtype):
+        if not use_prims_ts(vllm_config, kv_cache_dtype):
             num_q_heads = vllm_config.model_config.get_num_attention_heads(
                 vllm_config.parallel_config
             )
-            _get_workspace_buffer(
+            max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+            if self.dcp_world_size > 1:
+                _get_workspace_buffer(
+                    device,
+                    _required_workspace_bytes(
+                        self.dcp_world_size, num_q_heads, max_tokens
+                    ),
+                )
+            _reserve_kv_counters(
                 device,
-                _required_workspace_bytes(
-                    self.dcp_world_size,
-                    num_q_heads,
-                    vllm_config.scheduler_config.max_num_batched_tokens,
-                ),
+                max_tokens,
+                trtllm_gen_query_heads(num_q_heads * self.dcp_world_size),
             )
 
     def update_draft_decode_metadata(
@@ -360,6 +366,8 @@ class FlashInferMLASparseTRTLLMMetadataBuilder(FlashInferMLASparseMetadataBuilde
 
 # Global workspace buffer (lazily initialized)
 _fi_sparse_workspace: torch.Tensor | None = None
+# Shared trtllm-gen multi-CTA KV counters (see _reserve_kv_counters).
+_fi_sparse_kv_counters: torch.Tensor | None = None
 
 # trtllm-gen carves a softmax-stats slab from the workspace whenever LSE is
 # requested (FlashInfer csrc/trtllm_fmha_kernel_launcher.cu, unchanged from
@@ -636,6 +644,41 @@ class _PrimsTSPlans:
 
 
 _prims_ts_plans = _PrimsTSPlans()
+
+
+def _kv_counter_bytes(num_rows: int, num_heads: int, device: torch.device) -> int:
+    from flashinfer.utils import (
+        get_device_sm_count,
+        get_trtllm_gen_multi_ctas_kv_counter_bytes,
+    )
+
+    return get_trtllm_gen_multi_ctas_kv_counter_bytes(
+        num_rows, num_heads, get_device_sm_count(device)
+    )
+
+
+def _reserve_kv_counters(device: torch.device, num_rows: int, num_heads: int) -> None:
+    """Allocates the zeroed trtllm-gen multi-CTA KV counters for launches of up
+    to ``num_rows`` x ``num_heads``, before CUDA graph capture. The kernel
+    resets them after each launch, so all layers share them, as they share the
+    workspace. Without them FlashInfer zero-allocates counters on every call."""
+    global _fi_sparse_kv_counters
+    nbytes = _kv_counter_bytes(num_rows, num_heads, device)
+    if _fi_sparse_kv_counters is None or _fi_sparse_kv_counters.nbytes < nbytes:
+        _fi_sparse_kv_counters = torch.zeros(nbytes, dtype=torch.uint8, device=device)
+
+
+def _kv_counters(
+    num_rows: int, num_heads: int, device: torch.device
+) -> dict[str, torch.Tensor]:
+    """``multi_ctas_kv_counter_buffer`` for one launch when the reserved
+    counters cover it; otherwise FlashInfer allocates its own."""
+    counters = _fi_sparse_kv_counters
+    if counters is None or counters.nbytes < _kv_counter_bytes(
+        num_rows, num_heads, device
+    ):
+        return {}
+    return {"multi_ctas_kv_counter_buffer": counters}
 
 
 class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
@@ -1000,7 +1043,7 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
         # ``out`` unwritten (flashinfer-ai/flashinfer#3125). Launch row chunks.
         for start in range(0, num_tokens, _TRTLLM_GEN_MAX_REQUESTS):
             end = min(start + _TRTLLM_GEN_MAX_REQUESTS, num_tokens)
-            extra_kwargs: dict[str, torch.Tensor] = {}
+            extra_kwargs = _kv_counters(end - start, padded_heads, q.device)
             if topk_lens is not None:
                 extra_kwargs["sparse_mla_top_k_lens"] = topk_lens[start:end]
             if lse is not None:

@@ -213,7 +213,7 @@ def test_indexer_inputs(batch, gap):
     )
     _, index_kernel, _ = kernels(batch, mla, index, *weights)
     q_fp8 = torch.zeros(batch, 32, 128, device=dev, dtype=torch.uint8)
-    head_w = torch.zeros(batch, 32, device=dev, dtype=torch.float32)
+    head_w = torch.zeros(batch, 32, device=dev, dtype=bf)
     args = (to_cute(projected), to_cute(iq), to_cute(norm_w, 4), to_cute(norm_b, 4))
     args += (to_cute(index), to_cute(slots, 8), to_cute(q_fp8), to_cute(head_w, 4))
     index_kernel(*args, cutlass.Float32(EPS), stream(dev))
@@ -224,7 +224,7 @@ def test_indexer_inputs(batch, gap):
     assert torch.equal(q_fp8.view(-1, 128), ref_q.view(torch.uint8))
     key = 2112 + GATE
     wv = projected[:, key + 128 : key + 160] * 32**-0.5
-    ref_w = wv.float() * ref_scale.view(batch, 32) * 128**-0.5
+    ref_w = (wv.float() * ref_scale.view(batch, 32) * 128**-0.5).to(bf)
     torch.testing.assert_close(head_w, ref_w, atol=0, rtol=0)
 
     stock = packed_cache(8, UNIT, INDEX_ROW, gap)

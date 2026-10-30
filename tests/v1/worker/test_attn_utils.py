@@ -998,6 +998,25 @@ def test_packed_token_cache_splits_with_mapped_slots():
         assert torch.equal(pages[slot // 64, 0, slot % 64], manager[block, 0, offset])
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_kernel_slot_mapping_cuda_matches_torch():
+    """The fused CUDA slot remap matches the elementwise torch path, padded
+    (negative) slots included."""
+    row, stride_rows = 8, 1280
+    group = _packed_group(1, row, [64])
+    group.maps_slot_mapping = True
+    group.create_metadata_builders(_VLLM_CONFIG, "cpu", kernel_block_size=1024)
+    manager = torch.zeros(3 * stride_rows, 1, row).view(3, 1, stride_rows, row)
+    map_kv_caches_to_kernel_blocks({"layer.0": manager[:, :, :1024]}, [group])
+
+    slots = torch.randint(-1, 3 * 1024, (3000,))
+    slots[:3] = torch.tensor([-1, 0, 3 * 1024 - 1])
+    expected = group.map_to_kernel_slot_mapping(slots).clone()
+    out = torch.empty(slots.shape, dtype=slots.dtype, device="cuda")
+    mapped = group.map_to_kernel_slot_mapping(slots.cuda(), out=out)
+    assert torch.equal(mapped.cpu(), expected)
+
+
 def test_copy_kv_cache_blocks_overlaid_views_copy_whole_block():
     """Hybrid overlays: a Mamba state view and an attention view of one tensor
     share a base address but span different bytes per block, and several such

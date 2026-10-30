@@ -4,7 +4,8 @@
 
 - the indexer query [32, 128] (the BF16 wq_b projection of the normalized q_c) in FP8
   with one power-of-two scale per head (per_token_group_quant_fp8, ue8m0), the scale
-  folded into the head weights: (bf16(wv / sqrt(32)) * scale) / sqrt(128);
+  folded into the BF16 head weights SM100's MQA logits take:
+  bf16(bf16(wv / sqrt(32)) * scale / sqrt(128));
 - the shared indexer key: LayerNorm (FP32) of the wk projection, BF16, then FP8 with
   a power-of-two scale (indexer_k_quant_and_cache, ue8m0) into the indexer cache:
   per block, the FP8 keys of its tokens, then their FP32 scales.
@@ -74,7 +75,7 @@ class DsaIndex:
             if lane % 16 == 0:
                 wv = Float32(projected[token, self.weight + head])
                 scaled = Float32(BFloat16(wv * Float32(HEADS**-0.5)))
-                w_out[token, head] = (scaled * scale) * Float32(DIM**-0.5)
+                w_out[token, head] = BFloat16((scaled * scale) * Float32(DIM**-0.5))
         slot = slots[token]
         if (warp == 0) & (slot >= 0):
             x = load_bf16x8(at(projected, token, self.key + column), mutable=True)

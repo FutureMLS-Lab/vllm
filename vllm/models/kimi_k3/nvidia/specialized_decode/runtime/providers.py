@@ -236,7 +236,7 @@ def dsa_scratch(runtime):
         scratch(runtime, "dsa.qc", (PREPARED_MAX, 1536)),
         scratch(runtime, "dsa.iq", (PREPARED_MAX, HEADS * DIM)),
         scratch(runtime, "dsa.q_fp8", (PREPARED_MAX, HEADS, DIM), torch.uint8),
-        scratch(runtime, "dsa.weights", (PREPARED_MAX, HEADS), torch.float32),
+        scratch(runtime, "dsa.weights", (PREPARED_MAX, HEADS)),
         scratch(runtime, "dsa.latent", (PREPARED_MAX, QUERY_HEADS, 512)),
     )
 

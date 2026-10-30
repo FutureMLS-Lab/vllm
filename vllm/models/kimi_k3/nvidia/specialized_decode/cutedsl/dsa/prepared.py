@@ -127,7 +127,7 @@ def compile_core(
     iq = fake((batch, HEADS * DIM), (HEADS * DIM, 1))
     norm = fake((DIM,), (1,), torch.float32, 4)
     q_out = fake((batch, HEADS, DIM), None, torch.uint8)
-    w_out = fake((batch, HEADS), None, torch.float32, 4)
+    w_out = fake((batch, HEADS), None, torch.bfloat16, 4)
     i_args = (projected, iq, norm, norm, index_kv, slots, q_out, w_out, f32(1e-6))
     latent = fake((batch, heads, 512), (query_heads * 512, 512, 1))
     gate = fake((batch, heads * 128), (pitch, 1))

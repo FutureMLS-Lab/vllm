@@ -57,6 +57,17 @@ def raise_if_nan_logits(num_nans_in_logits: Mapping[str, int]) -> None:
 
 
 @triton.jit
+def _kernel_slots_kernel(src, dst, n, block_size, shift, BLOCK: tl.constexpr):
+    """``dst = src + src // block_size * shift`` over contiguous 1-D slots;
+    negative (padded) slots stay."""
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < n
+    slot = tl.load(src + offs, mask=mask)
+    mapped = tl.where(slot < 0, slot, slot + slot // block_size * shift)
+    tl.store(dst + offs, mapped, mask=mask)
+
+
+@triton.jit
 def _zero_kv_blocks_kernel(
     seg_addrs_ptr,
     seg_block_strides_ptr,
@@ -425,6 +436,15 @@ class AttentionGroup:
         shift = self.kernel_block_stride * self.kernel_block_size - block_size
         if out is None:
             out = self.kernel_slot_mapping[ubatch_idx, : slot_mapping.shape[0]]
+        if slot_mapping.is_cuda:
+            # One launch instead of the five ops below: this runs per packed
+            # group on every forward, the drafter's included.
+            n = slot_mapping.numel()
+            grid = (triton.cdiv(n, 1024),)
+            _kernel_slots_kernel[grid](
+                slot_mapping, out, n, block_size, shift, BLOCK=1024
+            )
+            return out
         torch.floor_divide(slot_mapping, block_size, out=out)
         out.mul_(shift).add_(slot_mapping)
         return torch.where(slot_mapping < 0, slot_mapping, out, out=out)
