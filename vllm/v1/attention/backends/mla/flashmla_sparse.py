@@ -859,15 +859,15 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
             )
             if self.use_shardq:
                 # A ShardQ call attends this rank's token slice with all heads.
+                from vllm.v1.attention.ops.shardq import max_rank_tokens
+
                 tp_size = vllm_config.parallel_config.tensor_parallel_size
-                max_rank_tokens = min(
-                    max_tokens,
-                    -(-max_tokens // tp_size)
-                    + 2 * vllm_config.scheduler_config.max_num_seqs,
+                rank_tokens = max_rank_tokens(
+                    max_tokens, vllm_config.scheduler_config.max_num_seqs, tp_size
                 )
                 self.mixed_batch_profile_bytes = max(
                     self.mixed_batch_profile_bytes,
-                    self._mixed_batch_peak_bytes(max_rank_tokens, num_heads * tp_size),
+                    self._mixed_batch_peak_bytes(rank_tokens, num_heads * tp_size),
                 )
 
     def _mixed_batch_peak_bytes(self, num_tokens: int, num_heads: int) -> int:

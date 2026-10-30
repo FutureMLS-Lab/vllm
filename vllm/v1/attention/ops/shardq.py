@@ -154,6 +154,12 @@ def indexer_rows(
     return host, rows
 
 
+def max_rank_tokens(max_tokens: int, max_reqs: int, world: int) -> int:
+    """The most tokens a rank owns in a step of ``max_tokens`` tokens over
+    ``max_reqs`` requests: two pieces of ceil(n / (2 * world)) per request."""
+    return min(max_tokens, -(-max_tokens // world) + 2 * max_reqs)
+
+
 def reserve_shardq_buffers(
     max_tokens: int,
     max_reqs: int,
@@ -174,8 +180,7 @@ def reserve_shardq_buffers(
     ``qk_dim`` and ``v_dim`` are the MQA query and output widths.
     """
     world = get_tp_group().world_size
-    # A rank owns at most two pieces of ceil(n / (2 * world)) per request.
-    q_rows = -(-max_tokens // world) + 2 * max_reqs
+    q_rows = max_rank_tokens(max_tokens, max_reqs, world)
     q_numel = q_rows * world * num_local_heads * qk_dim
     out_numel = max_tokens * num_local_heads * v_dim
     if _use_sm(None):

@@ -929,19 +929,29 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
                     num_heads,
                     self.topk_indices_buffer.shape[1],
                 )
-        if self.use_shardq:
-            heads = max(heads, shardq_heads)
         # Claim the transient peak of one long prefill step in the profile run:
         # one chunk's head-padded query, output and LSE, and, for a step of
         # several chunks, the step output.
+        # A ShardQ step attends only this rank's token slice, with every head.
         vllm_config = get_current_vllm_config()
         max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
-        padded = self._prims_ts_query_heads(heads)
-        rows = self.prims_ts_buckets[-1]
-        peak = rows * padded * (self.kv_lora_rank + self.qk_rope_head_dim + 1024 + 4)
-        if max_tokens > rows:
-            peak += max_tokens * heads * self.kv_lora_rank * 2
+        steps = [(max_tokens, heads)]
+        if self.use_shardq:
+            from vllm.v1.attention.ops.shardq import max_rank_tokens
+
+            max_reqs = vllm_config.scheduler_config.max_num_seqs
+            world = get_tensor_model_parallel_world_size()
+            steps.append((max_rank_tokens(max_tokens, max_reqs, world), shardq_heads))
+        peak = max(self._prims_ts_peak_bytes(*step) for step in steps)
         _ = torch.empty(peak, dtype=torch.uint8, device=current_platform.device_type)
+
+    def _prims_ts_peak_bytes(self, num_tokens: int, heads: int) -> int:
+        padded = self._prims_ts_query_heads(heads)
+        rows = min(num_tokens, self.prims_ts_buckets[-1])
+        peak = rows * padded * (self.kv_lora_rank + self.qk_rope_head_dim + 1024 + 4)
+        if num_tokens > rows:
+            peak += num_tokens * heads * self.kv_lora_rank * 2
+        return peak
 
     def _forward_prims_ts(
         self,
