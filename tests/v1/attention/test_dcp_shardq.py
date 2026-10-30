@@ -914,13 +914,17 @@ def _dsa_layer(config, topk_buffer, layer_index=0):
     return attn
 
 
-def _common_metadata(lens, block_table):
+def _common_metadata(lens, block_table, dcp=None):
+    """The step's metadata, with the DCP-local sequence lengths that the runner
+    adds on rank ``dcp[1]`` of a DCP group of ``dcp[0]``."""
     from vllm.v1.attention.backend import CommonAttentionMetadata
+    from vllm.v1.attention.backends.utils import get_dcp_local_seq_lens
 
     new = [n for _, n in lens]
     qsl = torch.tensor(np.r_[0, np.cumsum(new)], dtype=torch.int32)
     seq_lens = torch.tensor([c + n for c, n in lens], dtype=torch.int32)
     num_tokens = int(qsl[-1])
+    local = None if dcp is None else get_dcp_local_seq_lens(seq_lens, *dcp)
     return CommonAttentionMetadata(
         query_start_loc=qsl.cuda(),
         query_start_loc_cpu=qsl,
@@ -933,6 +937,8 @@ def _common_metadata(lens, block_table):
         # The layer's own cache writes are not under test.
         slot_mapping=torch.full((num_tokens,), -1, dtype=torch.int64, device="cuda"),
         seq_lens_cpu_upper_bound=seq_lens,
+        dcp_local_seq_lens=None if local is None else local.cuda(),
+        dcp_local_seq_lens_cpu_upper_bound=local,
     )
 
 
@@ -1101,7 +1107,7 @@ def _layer_worker(rank, world, init_file, cache_dtype, kernel):
                 num_decode_tokens = sum(n for _, n in lens[:num_decodes])
                 expected_decode_topk = _separable_decode_keys(rep, num_decodes)
                 shard = _shard(rep, world, rank, seed=rank, mla_block=LAYER_BLOCK)
-                step = _common_metadata(lens, shard.mla_table)
+                step = _common_metadata(lens, shard.mla_table, (world, rank))
                 num_tokens = kv_c.shape[0]
                 torch.manual_seed(6)
                 q_all = torch.randn(
@@ -1122,7 +1128,7 @@ def _layer_worker(rank, world, init_file, cache_dtype, kernel):
                 hidden = torch.empty(num_tokens, 256, device="cuda").bfloat16()
                 layer.kv_cache = shard.mla
                 indexer.k_cache.kv_cache = shard.index
-                index_step = _common_metadata(lens, shard.index_table)
+                index_step = _common_metadata(lens, shard.index_table, (world, rank))
 
                 score = partial(
                     _indexer_topk,
@@ -1240,7 +1246,9 @@ def _layer_worker(rank, world, init_file, cache_dtype, kernel):
                 shard = _shard(rep, world, rank, seed=rank, mla_block=LAYER_BLOCK)
                 before = dict(builder.dcp_shardq.stats.total)
                 assert (
-                    builder.build(0, _common_metadata(lens, shard.mla_table)).shardq
+                    builder.build(
+                        0, _common_metadata(lens, shard.mla_table, (world, rank))
+                    ).shardq
                     is None
                 )
                 after = builder.dcp_shardq.stats.total
@@ -1435,12 +1443,14 @@ def _profile_worker(rank, world, init_file, cache_dtype, kernel):
             )
             layer.kv_cache = shard.mla
             indexer.k_cache.kv_cache = shard.index
-            metadata = builder.build(0, _common_metadata(lens, shard.mla_table))
+            metadata = builder.build(
+                0, _common_metadata(lens, shard.mla_table, (world, rank))
+            )
             assert metadata.shardq is None
             assert builder.dcp_shardq is not None
             assert set(builder.dcp_shardq.stats.total) == {dcp.WORKSPACE}
             index_metadata = index_builder.build(
-                0, _common_metadata(lens, shard.index_table)
+                0, _common_metadata(lens, shard.index_table, (world, rank))
             )
             num_a2a = len(a2a_sizes)
             monitoring[0] = True
