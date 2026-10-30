@@ -338,6 +338,15 @@ def _gid_bits(world_size: int) -> int:
 
 
 @cute.jit
+def _popc64(bits: Uint64) -> Int32:
+    return recast_val(
+        cute.arch.popc(Uint32(bits & Uint64(0xFFFFFFFF)))
+        + cute.arch.popc(Uint32(bits >> Uint64(32))),
+        Int32,
+    )
+
+
+@cute.jit
 def _ord16(bits: Uint32) -> Uint32:
     """Order-preserving bf16 key: flip negatives, set the sign bit of
     non-negatives."""
@@ -361,6 +370,8 @@ def _make_radix_select(
     selected ord16 (0x10000 when none). The select and the rescue share it, so
     both emit bit-identical rows for the same candidate set."""
     emit_rows = block_size > 0
+    # One selected-key bit per register key, in 64-bit words.
+    num_sel_words = -(-keys_per_thread // 64)
     tb_size = _TB_SIZE
     radix_bits = _RADIX_BITS
     num_bins = _NUM_BINS
@@ -389,9 +400,15 @@ def _make_radix_select(
         stride_rows: Int32,
     ) -> Int32:
         # scalars: [committed, owned, threshold, take_all]
-        committed = scalars.iterator
-        owned = scalars.iterator + 1
         sel_min = Int32(0x10000)
+        # Bit i % 64 of word i // 64: key i is selected. The ids and rows are
+        # written after the passes, in (thread, key) order at block-scan
+        # offsets, so they come out in the same order on every run (warp-order
+        # atomics would vary it, and with it the downstream sparse attention's
+        # summation order).
+        sel_bits = cute.make_rmem_tensor((num_sel_words,), Uint64)
+        for w in cutlass.range_constexpr(num_sel_words):
+            sel_bits[w] = Uint64(0)
         if tid == Int32(0):
             scalars[0] = Int32(0)
             scalars[1] = Int32(0)
@@ -421,14 +438,21 @@ def _make_radix_select(
                 need = Int32(topk) - scalars[0]
                 count = hist[Int32(num_bins - 1) - tid]
                 incl = _block_scan_inclusive(count, lane, warp, warp_totals, num_warps)
+                # The committed count grows by the keys selected below: the
+                # bins above the threshold (and the threshold bin when done).
+                # Every thread read scalars[0] before the scan's barriers.
                 if count > Int32(0) and incl >= need and incl - count < need:
                     scalars[2] = Int32(num_bins - 1) - tid
                     if incl == need:
                         scalars[3] = Int32(1)
+                        scalars[0] = scalars[0] + incl
+                    else:
+                        scalars[0] = scalars[0] + incl - count
                 if tid == Int32(tb_size - 1) and incl < need:
                     # Fewer matching candidates than needed: keep them all.
                     scalars[2] = Int32(0)
                     scalars[3] = Int32(1)
+                    scalars[0] = scalars[0] + incl
                 cute.arch.sync_threads()
 
                 thr = scalars[2]
@@ -446,68 +470,60 @@ def _make_radix_select(
                         score = Int32(key >> Uint64(gid_bits))
                         if score < sel_min:
                             sel_min = score
-                    mask = recast_val(cute.arch.vote_ballot_sync(selected), Uint32)
-                    if mask != Uint32(0):
-                        base = Int32(0)
-                        if lane == Int32(0):
-                            base = cute.arch.atomic_add(
-                                committed,
-                                recast_val(cute.arch.popc(mask), Int32),
-                                sem="relaxed",
-                                scope="cta",
-                            )
-                        base = cute.arch.shuffle_sync(base, 0)
-                        gid = Uint32(gid_mask) - Uint32(key & Uint64(gid_mask))
-                        if cutlass.const_expr(emit_ids):  # noqa: SIM102
-                            if selected:
-                                pos = base + recast_val(
-                                    cute.arch.popc(mask & cute.arch.lanemask_lt()),
-                                    Int32,
-                                )
-                                out[row, pos] = recast_val(gid, Int32)
-                        if cutlass.const_expr(emit_rows):
-                            self_owned = selected and (
-                                gid % Uint32(world_size) == recast_val(dcp_rank, Uint32)
-                            )
-                            local = recast_val(gid // Uint32(world_size), Int32)
-                            block = local // Int32(block_size)
-                            self_owned = self_owned and block < Int32(
-                                block_table.shape[1]
-                            )
-                            owned_mask = recast_val(
-                                cute.arch.vote_ballot_sync(self_owned), Uint32
-                            )
-                            if owned_mask != Uint32(0):
-                                obase = Int32(0)
-                                if lane == Int32(0):
-                                    obase = cute.arch.atomic_add(
-                                        owned,
-                                        recast_val(cute.arch.popc(owned_mask), Int32),
-                                        sem="relaxed",
-                                        scope="cta",
-                                    )
-                                obase = cute.arch.shuffle_sync(obase, 0)
-                                if self_owned:
-                                    opos = obase + recast_val(
-                                        cute.arch.popc(
-                                            owned_mask & cute.arch.lanemask_lt()
-                                        ),
-                                        Int32,
-                                    )
-                                    rows_out[row, opos] = block_table[
-                                        req_id[row], block
-                                    ] * stride_rows + (
-                                        local - block * Int32(block_size)
-                                    )
+                        sel_bits[i // 64] = sel_bits[i // 64] | Uint64(1 << (i % 64))
                 cute.arch.sync_threads()
                 if tid == Int32(0) and not done:
                     prefix_ptr.store((prefix << Uint64(radix_bits)) | Uint64(thr))
                 cute.arch.sync_threads()
 
         if cutlass.const_expr(emit_ids):
+            count = Int32(0)
+            for w in cutlass.range_constexpr(num_sel_words):
+                count += _popc64(sel_bits[w])
+            incl = _block_scan_inclusive(count, lane, warp, warp_totals, num_warps)
+            pos = incl - count
+            for i in cutlass.range_constexpr(keys_per_thread):
+                if ((sel_bits[i // 64] >> Uint64(i % 64)) & Uint64(1)) != Uint64(0):
+                    gid = Uint32(gid_mask) - Uint32(keys[i] & Uint64(gid_mask))
+                    out[row, pos] = recast_val(gid, Int32)
+                    pos += Int32(1)
             for i in cutlass.range(scalars[0] + tid, topk, tb_size, unroll=1):
                 out[row, i] = Int32(-1)
+            if cutlass.const_expr(emit_rows):
+                cute.arch.sync_threads()  # warp_totals is reused below
         if cutlass.const_expr(emit_rows):
+            # This rank's owned selected keys (a block past the table dropped).
+            owned_bits = cute.make_rmem_tensor((num_sel_words,), Uint64)
+            for w in cutlass.range_constexpr(num_sel_words):
+                owned_bits[w] = Uint64(0)
+            for i in cutlass.range_constexpr(keys_per_thread):
+                if ((sel_bits[i // 64] >> Uint64(i % 64)) & Uint64(1)) != Uint64(0):
+                    gid = Uint32(gid_mask) - Uint32(keys[i] & Uint64(gid_mask))
+                    local = recast_val(gid // Uint32(world_size), Int32)
+                    block = local // Int32(block_size)
+                    if gid % Uint32(world_size) == recast_val(
+                        dcp_rank, Uint32
+                    ) and block < Int32(block_table.shape[1]):
+                        owned_bits[i // 64] = owned_bits[i // 64] | Uint64(
+                            1 << (i % 64)
+                        )
+            count = Int32(0)
+            for w in cutlass.range_constexpr(num_sel_words):
+                count += _popc64(owned_bits[w])
+            incl = _block_scan_inclusive(count, lane, warp, warp_totals, num_warps)
+            if tid == Int32(tb_size - 1):
+                scalars[1] = incl
+            pos = incl - count
+            for i in cutlass.range_constexpr(keys_per_thread):
+                if ((owned_bits[i // 64] >> Uint64(i % 64)) & Uint64(1)) != Uint64(0):
+                    gid = Uint32(gid_mask) - Uint32(keys[i] & Uint64(gid_mask))
+                    local = recast_val(gid // Uint32(world_size), Int32)
+                    block = local // Int32(block_size)
+                    rows_out[row, pos] = block_table[
+                        req_id[row], block
+                    ] * stride_rows + (local - block * Int32(block_size))
+                    pos += Int32(1)
+            cute.arch.sync_threads()
             num_owned = scalars[1]
             for i in cutlass.range(
                 num_owned + tid, rows_out.shape[1], tb_size, unroll=1
@@ -547,10 +563,12 @@ class DCPTopkSelectKernel(VllmCuTeDSLJitKernel["DCPTopkSelectKernel.CompileKey"]
     resolved toward the lower global id. Rows with fewer than K candidates
     keep all of them.
 
-    ``emit_ids``: global ids, selected first (unordered), then -1.
+    ``emit_ids``: global ids, selected first (in a fixed order: the same ids in
+    the same order on every run), then -1.
     ``emit_rows``: the selected tokens owned by ``dcp_rank`` (``gid % W``) as
     physical rows ``block_table[req_id[t], local // B] * stride_rows +
-    local % B`` (``local = gid // W``), compacted to the front (unordered),
+    local % B`` (``local = gid // W``), compacted to the front (in a fixed
+    order: the same rows in the same order on every run),
     then -1; plus their count. A block id past the block table is dropped.
 
     ``exact``: also derive the row's saturation word ``(mask << 16) | tau16``
@@ -697,6 +715,7 @@ class DCPTopkSelectKernel(VllmCuTeDSLJitKernel["DCPTopkSelectKernel.CompileKey"]
                 scalars[5] = Int32(0)
             cute.arch.sync_threads()
             eq_run = Int32(0)
+            gt_run = Int32(0)
             for base in cutlass.range(0, end, tb_size, unroll=1):
                 loc_idx = base + tid
                 o = Uint32(0)
@@ -705,20 +724,22 @@ class DCPTopkSelectKernel(VllmCuTeDSLJitKernel["DCPTopkSelectKernel.CompileKey"]
                     if (bits & Uint32(0x7FFF)) <= Uint32(0x7F80):
                         o = _ord16(bits)
                 is_eq = o == v and o != Uint32(0)
-                eq_flag = Int32(0)
+                # One scan counts both, in a fixed order (the rescue round's
+                # keys, and so its rows, then come out the same on every run):
+                # keys above v in the high half, keys equal to it in the low.
+                flag = Int32(0)
                 if is_eq:
-                    eq_flag = Int32(1)
-                eq_incl = _block_scan_inclusive(
-                    eq_flag, lane, warp, warp_totals, num_warps
-                )
+                    flag = Int32(1)
+                if o > v:
+                    flag = Int32(1 << 16)
+                incl = _block_scan_inclusive(flag, lane, warp, warp_totals, num_warps)
                 if tid == Int32(tb_size - 1):
-                    scalars[6] = eq_incl
+                    scalars[6] = incl
                 cute.arch.sync_threads()
+                eq_incl = incl & Int32(0xFFFF)
                 pos = Int32(-1)
                 if o > v:
-                    pos = cute.arch.atomic_add(
-                        scalars.iterator + 5, Int32(1), sem="relaxed", scope="cta"
-                    )
+                    pos = gt_run + (incl >> Int32(16)) - Int32(1)
                 if is_eq:
                     idx = eq_run + eq_incl - Int32(1)
                     if idx < Int32(topk) - c_gt:
@@ -736,7 +757,8 @@ class DCPTopkSelectKernel(VllmCuTeDSLJitKernel["DCPTopkSelectKernel.CompileKey"]
                             sem="relaxed",
                             scope="cta",
                         )
-                eq_run += scalars[6]
+                eq_run += scalars[6] & Int32(0xFFFF)
+                gt_run += scalars[6] >> Int32(16)
                 cute.arch.sync_threads()
             # Store to every rank's slot, then release the flag.
             row_offset = (Int64(row) * Int64(num_slots) + Int64(slot)) * Int64(
