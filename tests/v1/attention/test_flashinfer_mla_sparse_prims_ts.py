@@ -227,13 +227,20 @@ def test_prims_ts_matches_reference(kv_cache_dtype, heads, case, holes):
 
 
 @pytest.mark.parametrize("kv_cache_dtype", ["fp8", "nvfp4_ds_mla"])
-def test_prims_ts_prefill_chunks(kv_cache_dtype):
-    """Rows beyond the largest capacity run in chunks (with a ragged tail)."""
-    counts = [(i * 37) % 300 for i in range(130)]
+@pytest.mark.parametrize("rows", [48, 49, 130])
+def test_prims_ts_prefill_chunks(kv_cache_dtype, rows):
+    """Rows beyond the largest capacity run in chunks (with a ragged tail) and
+    are copied back to the call's heads; up to the largest capacity, the call
+    returns views of the kernel's head-padded output and LSE."""
+    counts = [(i * 37) % 300 for i in range(rows)]
     cache, q8, indices, lengths = _problem(kv_cache_dtype, counts, 96, 1.0, 1.0, 2)
     layer = SimpleNamespace(_q_scale_float=1.0, _k_scale_float=1.0)
     impl = _impl(kv_cache_dtype, buckets=(1, 2, 4, 8, 16, 32, 48))
     out, lse = impl._forward_prims_ts(q8, cache, indices, lengths, layer, BLOCK_SIZE)
+    out_heads = 128 if rows <= 48 else 96
+    assert out.shape == (rows, 96, KV_LORA_RANK) and lse.shape == (rows, 96)
+    assert out.stride() == (out_heads * KV_LORA_RANK, KV_LORA_RANK, 1)
+    assert lse.stride() == (out_heads, 1)
     ref_out, ref_lse = _reference(
         q8, 1.0, _dequant_rows(cache, kv_cache_dtype, 1.0), indices, lengths
     )
@@ -475,3 +482,155 @@ def test_select_kernel():
     config.model_config.hf_text_config.qk_rope_head_dim = 0
     with pytest.raises(ValueError, match="qk_rope_head_dim"):
         fims.use_prims_ts(config, "nvfp4_ds_mla")
+
+
+def _f_pad_query_heads(query, heads):
+    """The zero head pad as the trtllm-gen call did it before (``F.pad``)."""
+    return torch.nn.functional.pad(query, (0, 0, 0, heads - query.shape[1]))
+
+
+def _masked_fill_dcp_partials(topk):
+    """trtllm-gen's empty-row guard before: an ``all(topk == -1)`` reduction,
+    then full ``masked_fill``s of the output and LSE views."""
+
+    def finish(out, lse, counts):
+        empty = (topk == -1).all(dim=-1)
+        out.masked_fill_(empty.view(-1, 1, 1), 0.0)
+        lse.masked_fill_(empty.view(-1, 1), float("-inf"))
+
+    return finish
+
+
+@pytest.mark.parametrize("dtype", [E4M3, torch.bfloat16])
+@pytest.mark.parametrize("tokens", [0, 1, 5, 333])
+@pytest.mark.parametrize(
+    "layout",
+    ["contiguous", "token_strided", "head_strided", "row_unaligned", "base_unaligned"],
+)
+def test_pad_query_heads(dtype, tokens, layout):
+    """The one-kernel head pad is bitwise the zero pad, for packed query rows
+    (contiguous, or a wider token stride) and through the fallback otherwise
+    (heads not packed, or rows or base not 8-byte aligned)."""
+    g = torch.Generator(device="cuda").manual_seed(tokens)
+    if layout == "head_strided":
+        q = torch.randn(96, tokens, 576, generator=g, device="cuda")
+        q = q.to(dtype).transpose(0, 1)
+    elif layout in ("row_unaligned", "base_unaligned"):
+        # A token stride of 96 * 576 + 1 elements, or a base 1 element off.
+        row = 96 * 576 + (layout == "row_unaligned")
+        base = torch.randn(tokens * row + 1, generator=g, device="cuda").to(dtype)
+        offset = int(layout == "base_unaligned")
+        q = base.as_strided((tokens, 96, 576), (row, 576, 1), offset)
+    else:
+        q = torch.randn(tokens, 128, 576, generator=g, device="cuda").to(dtype)
+        q = q[:, :96]
+        if layout == "contiguous":
+            q = q.contiguous()
+    padded = fims._pad_query_heads(q, 128)
+    assert padded.shape == (tokens, 128, 576) and padded.is_contiguous()
+    ref = _f_pad_query_heads(q, 128).contiguous()
+    assert torch.equal(padded.view(torch.uint8), ref.view(torch.uint8))
+
+
+@pytest.mark.parametrize("heads,buffer_heads", [(96, 128), (12, 12), (12, 16)])
+def test_finish_dcp_partials(heads, buffer_heads):
+    """The one-kernel finish of trtllm-gen's DCP partials writes bitwise what
+    the reduction and masked fills did: output 0 and LSE -inf for rows whose
+    entries are all -1 (count 0; the kernel leaves garbage there), the other
+    rows untouched, and nothing outside the call's heads, including the next
+    row of an unpadded buffer when the row is not a whole number of the
+    kernel's output blocks (12 heads)."""
+    g = torch.Generator(device="cuda").manual_seed(0)
+    tokens = 77
+    counts = torch.randint(0, 300, (tokens,), generator=g, device="cuda")
+    counts[::5] = 0
+    counts = counts.int()
+    slots = torch.arange(TOPK, device="cuda")
+    topk = torch.randint(0, 1 << 20, (tokens, TOPK), generator=g, device="cuda")
+    topk = topk.int().masked_fill(slots >= counts[:, None], -1)
+    out = torch.randn(tokens, buffer_heads, KV_LORA_RANK, generator=g, device="cuda")
+    out = out.bfloat16()
+    lse = torch.randn(tokens, buffer_heads, generator=g, device="cuda") * 30
+    out[counts == 0] = float("nan")
+    lse[counts == 0] = float("nan")
+    ref_out, ref_lse = out.clone(), lse.clone()
+    fims._finish_dcp_partials(out[:, :heads], lse[:, :heads], counts)
+    _masked_fill_dcp_partials(topk)(ref_out[:, :heads], ref_lse[:, :heads], counts)
+    assert torch.equal(out.view(torch.int16), ref_out.view(torch.int16))
+    assert torch.equal(lse.view(torch.int32), ref_lse.view(torch.int32))
+
+
+def _trtllm_gen_impl(kv_cache_dtype, device):
+    """A DCP8 decode impl on trtllm-gen (96 gathered heads, padded to 128)
+    with the state the backend's __init__ and metadata builder set up."""
+    impl = _impl(kv_cache_dtype)
+    impl.use_prims_ts = False
+    impl.kv_cache_dtype = kv_cache_dtype
+    impl.qk_nope_head_dim = 128
+    impl.is_nope_mla = False
+    impl.index_group = None
+    impl._workspace_buffer = impl.bmm1_scale = impl.bmm2_scale = None
+    fims._get_workspace_buffer(device, fims._required_workspace_bytes(8, 12, 1024))
+    return impl
+
+
+@pytest.mark.parametrize(
+    "kv_cache_dtype,kernel",
+    [("fp8", "trtllm"), ("fp8", "prims_ts"), ("nvfp4_ds_mla", "prims_ts")],
+)
+@pytest.mark.parametrize("case", ["dcp_local", "decode_b1"])
+def test_dcp_partials_in_padded_buffers(monkeypatch, kv_cache_dtype, kernel, case):
+    """A DCP rank's partials of the 96 gathered heads are views of the kernel's
+    128-head output and LSE (no copy back), bitwise those of the replaced head
+    pad and empty-row guard; rows without entries are (0, -inf). The same holds
+    in CUDA graph replay, with rows emptied in place between replays."""
+    k_scale = 0.5 if kv_cache_dtype == "fp8" else 1.0
+    cache, q8, indices, counts = _problem(
+        kv_cache_dtype, COUNTS[case], 96, k_scale, 1.0, 5
+    )
+    # The DCP index conversion fills the slots past a row's count with -1.
+    slots = torch.arange(TOPK, device=indices.device)
+    indices.masked_fill_(slots >= counts[:, None], -1)
+    layer = SimpleNamespace(_q_scale_float=1.0, _k_scale_float=k_scale)
+    if kernel == "trtllm":
+        impl = _trtllm_gen_impl(kv_cache_dtype, q8.device)
+    else:
+        impl = _impl(kv_cache_dtype)
+
+    def forward():
+        return impl._forward_mqa_kernel(
+            q8,
+            cache,
+            indices,
+            counts,
+            layer=layer,
+            block_size=BLOCK_SIZE,
+            is_decode=True,
+        )
+
+    def check(out, lse):
+        assert out.shape == (q8.shape[0], 96, KV_LORA_RANK)
+        assert out.stride() == (128 * KV_LORA_RANK, KV_LORA_RANK, 1)
+        assert lse.shape == (q8.shape[0], 96) and lse.stride() == (128, 1)
+        empty = counts == 0
+        assert (out[empty] == 0).all() and (lse[empty] == -math.inf).all()
+        assert torch.isfinite(lse[~empty]).all()
+        with monkeypatch.context() as m:
+            m.setattr(fims, "_pad_query_heads", _f_pad_query_heads)
+            m.setattr(fims, "_finish_dcp_partials", _masked_fill_dcp_partials(indices))
+            ref, ref_lse = forward()
+        assert torch.equal(out.view(torch.int16), ref.view(torch.int16))
+        assert torch.equal(lse.view(torch.int32), ref_lse.view(torch.int32))
+
+    check(*forward())
+    torch.accelerator.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out, lse = forward()
+    emptied = slice(0, 1) if case == "decode_b1" else slice(1, 3)
+    indices[emptied] = -1
+    counts[emptied] = 0
+    q8.copy_(_quant_q(torch.randn_like(q8, dtype=torch.bfloat16) * 4, 1.0))
+    graph.replay()
+    torch.accelerator.synchronize()
+    check(out, lse)

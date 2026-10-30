@@ -22,6 +22,7 @@ from vllm.model_executor.layers.attention.sparse_mla_attention import (
 )
 from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
+from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -685,6 +686,109 @@ def _kv_counters(
     return {"multi_ctas_kv_counter_buffer": counters}
 
 
+@triton.jit
+def _pad_query_heads_kernel(
+    src_ptr,
+    dst_ptr,
+    src_row_stride,
+    row_words,
+    padded_row_words,
+    BLOCK: tl.constexpr,
+):
+    """One query row of 8-byte words, zero-extended to the padded heads."""
+    row = tl.program_id(0).to(tl.int64)
+    words = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    value = tl.load(
+        src_ptr + row * src_row_stride + words, mask=words < row_words, other=0
+    )
+    tl.store(
+        dst_ptr + row * padded_row_words + words, value, mask=words < padded_row_words
+    )
+
+
+def _pad_query_heads(query: torch.Tensor, heads: int) -> torch.Tensor:
+    """``query`` [T, H, D] in a new contiguous [T, ``heads``, D] buffer whose
+    extra heads are zero (the head count a decode kernel runs), in one kernel."""
+    num_tokens, num_heads, dim = query.shape
+    padded = query.new_empty((num_tokens, heads, dim))
+    element_size = query.element_size()
+    if (
+        query.stride(2) != 1
+        or query.stride(1) != dim
+        or query.stride(0) * element_size % 8
+        or dim * element_size % 8
+        or query.data_ptr() % 8
+    ):
+        padded[:, num_heads:].zero_()
+        padded[:, :num_heads].copy_(query)
+        return padded
+    if num_tokens:
+        padded_row_words = heads * dim * element_size // 8
+        block = 1024
+        _pad_query_heads_kernel[(num_tokens, triton.cdiv(padded_row_words, block))](
+            query.view(torch.int64),
+            padded.view(torch.int64),
+            query.stride(0) * element_size // 8,
+            num_heads * dim * element_size // 8,
+            padded_row_words,
+            BLOCK=block,
+        )
+    return padded
+
+
+@triton.jit
+def _finish_dcp_partials_kernel(
+    out_ptr,
+    lse_ptr,
+    counts_ptr,
+    heads,
+    out_row_stride,
+    lse_row_stride,
+    HEAD_DIM: tl.constexpr,
+    HEADS_BLOCK: tl.constexpr,
+    OUT_BLOCK: tl.constexpr,
+):
+    """One row of a trtllm-gen DCP partial: without top-k entries (count 0) its
+    output is zeroed and its LSE set to -inf; other rows are not touched."""
+    row = tl.program_id(0).to(tl.int64)
+    if tl.load(counts_ptr + row) == 0:
+        head = tl.arange(0, HEADS_BLOCK)
+        lse_row = lse_ptr + row * lse_row_stride
+        tl.store(lse_row + head, float("-inf"), mask=head < heads)
+        out_row = out_ptr + row * out_row_stride
+        zeros = tl.zeros([OUT_BLOCK], dtype=out_ptr.dtype.element_ty)
+        for start in range(0, heads * HEAD_DIM, OUT_BLOCK):
+            item = start + tl.arange(0, OUT_BLOCK)
+            tl.store(out_row + item, zeros, mask=item < heads * HEAD_DIM)
+
+
+def _finish_dcp_partials(
+    out: torch.Tensor, lse: torch.Tensor, counts: torch.Tensor
+) -> None:
+    """In place, for trtllm-gen's DCP partials ``out`` [T, H, D] and ``lse``
+    [T, H] (views of its head-padded buffers): rows without top-k entries
+    (``counts`` 0; the DCP index conversion compacts a row's valid entries to
+    its front and counts them, so these are the rows whose entries are all -1)
+    get output 0 and LSE -inf, the empty-shard identity of the DCP combine. One
+    small kernel that writes only the empty rows."""
+    num_tokens, heads, head_dim = out.shape
+    assert out.stride(2) == 1 and out.stride(1) == head_dim and lse.stride(1) == 1
+    assert counts.shape == (num_tokens,) and counts.is_contiguous()
+    if num_tokens == 0:
+        return
+    _finish_dcp_partials_kernel[(num_tokens,)](
+        out,
+        lse,
+        counts,
+        heads,
+        out.stride(0),
+        lse.stride(0),
+        HEAD_DIM=head_dim,
+        HEADS_BLOCK=triton.next_power_of_2(heads),
+        OUT_BLOCK=4096,
+    )
+
+
 class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
     """FlashInfer MLA Sparse implementation.
 
@@ -828,13 +932,14 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
         if self.use_shardq:
             heads = max(heads, shardq_heads)
         # Claim the transient peak of one long prefill step in the profile run:
-        # one chunk's head-padded query, output and LSE, and the step output.
+        # one chunk's head-padded query, output and LSE, and, for a step of
+        # several chunks, the step output.
         vllm_config = get_current_vllm_config()
         max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
         padded = self._prims_ts_query_heads(heads)
         rows = self.prims_ts_buckets[-1]
         peak = rows * padded * (self.kv_lora_rank + self.qk_rope_head_dim + 1024 + 4)
-        if max_tokens > rows or padded != heads:
+        if max_tokens > rows:
             peak += max_tokens * heads * self.kv_lora_rank * 2
         _ = torch.empty(peak, dtype=torch.uint8, device=current_platform.device_type)
 
@@ -861,14 +966,19 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
         kv_descale = layer._k_scale_float if is_fp8 else 1.0
         softmax_scale = self.scale * layer._q_scale_float * kv_descale
         return_lse = self.need_to_return_lse_for_decode
-        out = q.new_empty((num_tokens, heads, self.kv_lora_rank), dtype=torch.bfloat16)
+        buckets = self.prims_ts_buckets
+        # A call of one chunk (every decode step) returns views of the kernel's
+        # head-padded output and LSE: the DCP combine reads them in place.
+        out_heads = padded if num_tokens <= buckets[-1] else heads
+        out = q.new_empty(
+            (num_tokens, out_heads, self.kv_lora_rank), dtype=torch.bfloat16
+        )
         lse = (
-            q.new_empty((num_tokens, heads), dtype=torch.float32)
+            q.new_empty((num_tokens, out_heads), dtype=torch.float32)
             if return_lse
             else None
         )
         plans = self._get_prims_ts_plans(q.device, heads, topk_indices.shape[1])
-        buckets = self.prims_ts_buckets
         for start in range(0, num_tokens, buckets[-1]):
             end = min(num_tokens, start + buckets[-1])
             n = end - start
@@ -882,13 +992,9 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
                 None if lse is None else lse[start:end],
             )
             if padded != heads:
-                # Zero query heads: computed, then dropped. The copies move
-                # 8-byte words (576 B query and 1 KiB output rows).
-                padded_query = query.new_empty((n, padded, query.shape[-1]))
-                words = padded_query.view(torch.int64)
-                words[:, heads:].zero_()
-                words[:, :heads].copy_(query.view(torch.int64))
-                query = padded_query
+                # Zero query heads: computed, then dropped.
+                query = _pad_query_heads(query, padded)
+            if out_heads != padded:
                 chunk_out = out.new_empty((n, padded, self.kv_lora_rank))
                 if lse is not None:
                     chunk_lse = lse.new_empty((n, padded))
@@ -904,14 +1010,15 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
                 lse=chunk_lse,
                 validate=False,
             )
-            if padded != heads:
+            if out_heads != padded:
+                # The copy moves 8-byte words (1 KiB output rows).
                 out[start:end].view(torch.int64).copy_(
                     chunk_out.view(torch.int64)[:, :heads]
                 )
                 if lse is not None:
                     assert chunk_lse is not None
                     lse[start:end] = chunk_lse[:, :heads]
-        return out, lse
+        return out[:, :heads], None if lse is None else lse[:, :heads]
 
     def autotune_hisparse_decode(self, layer: AttentionLayer) -> None:
         """Autotune the largest legal HiSparse decode batch."""
@@ -1004,7 +1111,7 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
         num_heads = q.shape[1]
         padded_heads = trtllm_gen_query_heads(num_heads)
         if padded_heads != num_heads:
-            q = torch.nn.functional.pad(q, (0, 0, 0, padded_heads - num_heads))
+            q = _pad_query_heads(q, padded_heads)
 
         # Single-token sparse decode. trtllm-gen requires the q_len_per_request
         # dim, but the sparse attention mask is fully per-token (each query token
@@ -1080,7 +1187,5 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
             else:
                 out.masked_fill_(empty_queries[:, None, None], 0.0)
         elif lse is not None:
-            empty_rows = (topk_indices == -1).all(dim=-1)
-            out.masked_fill_(empty_rows.view(-1, 1, 1), 0.0)
-            lse.masked_fill_(empty_rows.view(-1, 1), float("-inf"))
+            _finish_dcp_partials(out, lse, seq_lens)
         return out, lse
