@@ -631,7 +631,11 @@ def _dcp_a2a_send_recv_buffers(
     )
 
 
-@triton.jit
+# The batch size and the LSE layout (the attention backend's, e.g. a
+# transposed [H, B] buffer) change from step to step; only scalar loads use
+# them, so the kernel compiles once per NUM_SEQS_POW2 bucket instead of once
+# per their alignments (see dcp_shardq.context.warm_up_dcp_fallback).
+@triton.jit(do_not_specialize=["num_seqs", "lse_stride_B", "lse_stride_H"])
 def _dcp_a2a_pack_send_kernel(
     out_ptr,
     lse_ptr,
@@ -1470,6 +1474,14 @@ class MLADCPManager:
         self.max_num_tokens = get_dcp_workspace_max_num_tokens(vllm_config)
         self.use_a2a = parallel_config.dcp_comm_backend == "a2a"
         self.padded_num_heads = padded_num_heads
+        self.max_num_seqs = vllm_config.scheduler_config.max_num_seqs
+        self.num_heads = num_heads
+        self.query_head_dim = query_head_dim
+        self.output_head_dim = output_head_dim
+        self.query_dtype = query_dtype
+        self.output_dtype = output_dtype
+        self.is_lse_base_on_e = is_lse_base_on_e
+        self.direct_a2a: DirectDCPA2AWorkspace | None = None
 
         self.combine = self._init_combine(
             num_heads,
@@ -1516,6 +1528,7 @@ class MLADCPManager:
                 self.num_ubatches,
             )
         if direct_workspace is not None:
+            self.direct_a2a = direct_workspace
             logger.info_once("Using direct symmetric-memory DCP A2A for MLA.")
             return functools.partial(
                 self._direct_workspace_combine,

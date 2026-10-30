@@ -17,12 +17,20 @@ memory.
 
 import functools
 from dataclasses import dataclass, field
+from typing import Any
 
 import numpy as np
 import torch
 import torch.distributed as dist
 
 from vllm.distributed.parallel_state import get_tp_group
+from vllm.model_executor.warmup.jit_warmup import kernel_launcher
+from vllm.model_executor.warmup.jit_warmup_triton_helper import (
+    LaunchSpec,
+    TritonWarmupTensor,
+    VllmTritonJitKernel,
+    triton_scalar_specialization_rep,
+)
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.ops.cp_common import direct_cp_enabled, symm_mem
 
@@ -180,15 +188,75 @@ def reserve_shardq_buffers(
         _ = torch.empty(2 * nbytes, dtype=torch.uint8, device=device)
 
 
-@triton.jit
-def _push_rows_kernel(src, src_offsets, dst_addresses, width, BLOCK: tl.constexpr):
+class PushRowsKernel(VllmTritonJitKernel["PushRowsKernel.CompileKey"]):
     """Copy ``width`` elements per row from ``src`` to absolute peer addresses."""
-    row = tl.program_id(0)
-    col = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
-    mask = col < width
-    source = tl.load(src_offsets + row)
-    dst = tl.load(dst_addresses + row).to(tl.pointer_type(src.dtype.element_ty))
-    tl.store(dst + col, tl.load(src + source + col, mask=mask), mask=mask)
+
+    BLOCK = 1024
+
+    @dataclass(frozen=True)
+    class CompileKey:
+        dtype: torch.dtype
+        # Triton specializes the row width (1, multiples of 16, others) and
+        # the source address (16-byte aligned or not).
+        width: int
+        src_aligned: bool
+
+    @staticmethod
+    @triton.jit
+    def kernel(src, src_offsets, dst_addresses, width, BLOCK: tl.constexpr):
+        row = tl.program_id(0)
+        col = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+        mask = col < width
+        source = tl.load(src_offsets + row)
+        dst = tl.load(dst_addresses + row).to(tl.pointer_type(src.dtype.element_ty))
+        tl.store(dst + col, tl.load(src + source + col, mask=mask), mask=mask)
+
+    def dispatch(  # type: ignore[override]
+        self, *, dtype: torch.dtype, width: int, src_aligned: bool
+    ) -> CompileKey:
+        return self.CompileKey(
+            dtype=dtype,
+            width=triton_scalar_specialization_rep(width),
+            src_aligned=src_aligned,
+        )
+
+    def get_warmup_keys(  # type: ignore[override]
+        self, *, rows: tuple[tuple[torch.dtype, int], ...]
+    ) -> list[CompileKey]:
+        """Keys of exchanges of rows of ``width`` elements of ``dtype``, for
+        each ``(dtype, width)`` of ``rows``. A source of whole 16-byte rows
+        starts aligned, at any row."""
+        keys = []
+        for dtype, width in rows:
+            aligned = width * dtype.itemsize % 16 == 0
+            for src_aligned in dict.fromkeys((True, aligned)):
+                keys.append(
+                    self.dispatch(dtype=dtype, width=width, src_aligned=src_aligned)
+                )
+        return keys
+
+    def warmup_inputs(self, compile_key: CompileKey) -> dict[str, Any]:
+        return dict(
+            src=TritonWarmupTensor(compile_key.dtype, aligned=compile_key.src_aligned),
+            src_offsets=TritonWarmupTensor(torch.int64),
+            dst_addresses=TritonWarmupTensor(torch.int64),
+            width=compile_key.width,
+        )
+
+    @kernel_launcher
+    def __call__(
+        self,
+        src: torch.Tensor,
+        src_offsets: torch.Tensor,
+        dst_addresses: torch.Tensor,
+        width: int,
+    ) -> LaunchSpec:
+        return (src_offsets.shape[0], triton.cdiv(width, self.BLOCK)), dict(
+            BLOCK=self.BLOCK
+        )
+
+
+PUSH_ROWS_KERNEL = PushRowsKernel()
 
 
 @dataclass
@@ -239,10 +307,7 @@ def _push_rows(
 ) -> None:
     # Peers may still read the previous exchange from their buffers.
     handle.barrier()
-    block = 1024
-    _push_rows_kernel[(src_offsets.numel(), triton.cdiv(width, block))](
-        src, src_offsets, dst_addresses, width, BLOCK=block
-    )
+    PUSH_ROWS_KERNEL(src, src_offsets, dst_addresses, width)
     handle.barrier()
 
 

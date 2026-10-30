@@ -13,6 +13,7 @@ import torch
 from vllm import envs
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.config.cache import CacheDType
+from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.sparse_mla_attention import (
     SparseMLACommonImpl,
@@ -649,6 +650,12 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
     can_return_lse_for_decode: bool = True
     supports_dcp: bool = True
     lse_base_on_e: bool = False
+    supports_shardq: ClassVar[bool] = True
+    supports_dcp_shardq: ClassVar[bool] = True
+    # fp8 query quantization is required when using fp8 kv_cache,
+    # as the TRTLLM-GEN sparse MLA kernel requires matching dtypes
+    # for query and kv_cache (mixed bf16+fp8 is not supported).
+    supports_quant_query_input: bool = True
 
     def __init__(
         self,
@@ -706,11 +713,6 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
         # top-k length tensor.
         self.is_nope_mla = self.qk_rope_head_dim == 0
 
-        # fp8 query quantization is required when using fp8 kv_cache,
-        # as the TRTLLM-GEN sparse MLA kernel requires matching dtypes
-        # for query and kv_cache (mixed bf16+fp8 is not supported).
-        self.supports_quant_query_input = True
-
         # The layer quantizes the query with its static per-tensor q_scale (a
         # dynamic scale cannot reach the kernel's host-scalar softmax scale in a
         # CUDA graph) before the DCP query all-gather.
@@ -763,16 +765,21 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
         if not self.use_prims_ts:
             return
         heads = self.num_heads * self.dcp_world_size
+        # ShardQ steps attend their token slice with every TP rank's heads.
+        shardq_heads = self.num_heads * get_tensor_model_parallel_world_size()
         # Plan (and compile) every row capacity before serving starts.
         if self.topk_indices_buffer is not None:
-            self._get_prims_ts_plans(
-                torch.device(
-                    current_platform.device_type,
-                    torch.accelerator.current_device_index(),
-                ),
-                heads,
-                self.topk_indices_buffer.shape[1],
-            )
+            for num_heads in {heads, shardq_heads} if self.use_shardq else {heads}:
+                self._get_prims_ts_plans(
+                    torch.device(
+                        current_platform.device_type,
+                        torch.accelerator.current_device_index(),
+                    ),
+                    num_heads,
+                    self.topk_indices_buffer.shape[1],
+                )
+        if self.use_shardq:
+            heads = max(heads, shardq_heads)
         # Claim the transient peak of one long prefill step in the profile run:
         # one chunk's head-padded query, output and LSE, and the step output.
         vllm_config = get_current_vllm_config()

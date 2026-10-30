@@ -569,6 +569,9 @@ def sparse_attn_indexer(
     # The main MLA layer owns the ShardQ decision; follow its split so both
     # sides agree on which top-k rows exist.
     shardq = None
+    prefill_chunks = None
+    prefill_kv_cache = kv_cache
+    prefill_dcp_world_size = dcp_world_size
     if shardq_layer_name:
         mla_shardq = getattr(attn_metadata.get(shardq_layer_name), "shardq", None)
         if mla_shardq is not None:
@@ -576,6 +579,20 @@ def sparse_attn_indexer(
             # The MLA decode threshold is at least the indexer's, so rows the
             # indexer treats as prefill may be MLA decodes; those stay in place.
             assert num_decode_tokens <= shardq.num_decode_tokens
+        if shardq is not None and shardq.gathered_context is not None:
+            # A DCP ShardQ step scores its prefill rows over a gathered copy
+            # of their keys, as a non-DCP step does: no top-k merge across
+            # ranks. Its decode rows keep the DCP decode path.
+            assert num_decode_tokens == shardq.num_decode_tokens
+            mla_layer = forward_context.no_compile_layers[shardq_layer_name]
+            prefill_kv_cache = shardq.gathered_context.gather(
+                mla_layer.kv_cache,
+                attn_metadata[shardq_layer_name].block_table,
+                kv_cache,
+                attn_metadata_narrowed.block_table,
+            )
+            prefill_chunks = shardq.gathered_context.indexer_chunks
+            prefill_dcp_world_size = 1
 
     # The buffer must be pre-filled with -1 (the "no token" sentinel) before the
     # top-k kernels scatter valid indices into it. On the fused deepseek_v32
@@ -587,6 +604,8 @@ def sparse_attn_indexer(
     if has_prefill:
         prefill_metadata = attn_metadata_narrowed.prefill
         assert prefill_metadata is not None
+        if prefill_chunks is None:
+            prefill_chunks = prefill_metadata.chunks
 
         # Get the shared workspace buffers once, sized for this batch's largest
         # chunk rather than the profiled bound (total_seq_lens), so the scratch
@@ -596,7 +615,7 @@ def sparse_attn_indexer(
         # scales) based on use_fp4_cache.
         workspace_manager = current_workspace_manager()
         values_spec, scales_spec = _gather_workspace_shapes(
-            max(c.max_local_total_seq_lens for c in prefill_metadata.chunks),
+            max(c.max_local_total_seq_lens for c in prefill_chunks),
             head_dim,
             fp8_dtype,
             use_fp4_cache,
@@ -605,7 +624,7 @@ def sparse_attn_indexer(
         # and the de-interleaved result.
         pcp_chunks = [
             (c, c.pcp_deinterleave_idx)
-            for c in prefill_metadata.chunks
+            for c in prefill_chunks
             if c.pcp_deinterleave_idx is not None
         ]
         gather_specs: list[tuple[tuple[int, int], torch.dtype]] = []
@@ -624,7 +643,7 @@ def sparse_attn_indexer(
             *gather_specs,
         )
         assert shardq is None or candidate_blocks is None
-        for chunk in prefill_metadata.chunks:
+        for chunk in prefill_chunks:
             cu_seqlen_ks = chunk.cu_seqlen_ks
             cu_seqlen_ke = chunk.cu_seqlen_ke
             assert chunk.local_cu_seq_lens is not None
@@ -632,7 +651,7 @@ def sparse_attn_indexer(
             k_scale = k_scale_full[: chunk.max_local_total_seq_lens]
             if not chunk.skip_kv_gather and chunk.local_total_seq_lens > 0:
                 ops.cp_gather_indexer_k_quant_cache(
-                    kv_cache,
+                    prefill_kv_cache,
                     k_quant,
                     k_scale,
                     chunk.block_table,
@@ -727,7 +746,7 @@ def sparse_attn_indexer(
                     use_deep_select = (
                         topk_backend == "deep_select"
                         and logits.dtype == torch.bfloat16
-                        and dcp_world_size == 1
+                        and prefill_dcp_world_size == 1
                         and is_deep_select_supported(logits, topk_tokens)
                     )
                     if not use_deep_select:
@@ -773,7 +792,7 @@ def sparse_attn_indexer(
                     topk_indices,
                     topk_tokens,
                     dcp_rank,
-                    dcp_world_size,
+                    prefill_dcp_world_size,
                     cp_kv_cache_interleave_size,
                     row_starts=row_starts,
                 )
