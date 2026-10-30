@@ -57,6 +57,7 @@ from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 from vllm.utils.multi_stream_utils import maybe_execute_in_parallel
 from vllm.utils.torch_utils import _encode_layer_name
 from vllm.v1.attention.backends.mla import indexer as v32_indexer
+from vllm.v1.attention.ops.dcp_topk_merge import init_dcp_topk_merge
 
 logger = init_logger(__name__)
 
@@ -219,6 +220,9 @@ class KimiK3DSAIndexer(nn.Module):
         self.dcp_world_size = self._parallel_config.decode_context_parallel_size
         self.dcp_rank = get_dcp_group().rank_in_group if self.dcp_world_size > 1 else 0
         self._cp_kv_cache_interleave_size: int | None = None
+        # Same as the upstream SparseAttnIndexer: decode merges each rank's
+        # packed local top-N in one exchange (0 keeps the generic merge).
+        self.dcp_local_topk = init_dcp_topk_merge(vllm_config, index_topk)
 
     @property
     def cp_kv_cache_interleave_size(self) -> int:
@@ -360,6 +364,7 @@ class KimiK3DSAIndexer(nn.Module):
             skip_topk_buffer_clear=self.use_fused_k_insert,
             topk_backend=self.topk_backend,
             shardq_layer_name=self.shardq_layer_name,
+            dcp_local_topk=self.dcp_local_topk,
         )
 
 
