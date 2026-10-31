@@ -19,18 +19,20 @@ from ..common.primitives import (
     alloc,
     asm,
     bits_float,
-    div_rn,
     float_bits,
     launch,
     redux,
-    sigmoid,
+    routing_add,
+    routing_sigmoid,
+    routing_weight,
+    situ_and_mul,
     store_words,
     view,
 )
 from ..gemm.projection import PreparedProjection
 from ..gemm.ws_gemm import WsGemm
 from .experts import PLAN_BYTES, plan_chunk
-from .shared import compile_down, compile_shared, situ, weight_maps
+from .shared import compile_down, compile_shared, weight_maps
 from .tail_runtime import CAP
 
 
@@ -99,7 +101,7 @@ class RouteSitu:
                         if tid + 256 * i < self.shared:
                             gate = c.Float32(c.BFloat16(pair[i, 0]))
                             up = c.Float32(c.BFloat16(pair[i, 1]))
-                            value = situ(gate, up, beta, linear_beta)
+                            value = situ_and_mul(gate, up, beta, linear_beta)
                             hidden[token, tid + 256 * i] = c.BFloat16(value)
         # Late release: the persistent experts must not take SMs from the down GEMM.
         if c.const_expr(not self.early):
@@ -185,9 +187,7 @@ class RouteSitu:
             for shift in c.range_constexpr(4):
                 total += cute.arch.shuffle_sync_bfly(total, 1 << shift)
             if lane < 16:
-                value = value * scale
-                if c.const_expr(self.renorm):
-                    value = div_rn(value, total + c.Float32(1e-20))
+                value = routing_weight(value, total, scale, renorm=self.renorm)
                 weights[token, lane] = c.BFloat16(value)
 
     def expert(self, tid, i):
@@ -236,10 +236,10 @@ class RouteSitu:
                 for i in c.range_constexpr(4):
                     raw[i] = bits_float(got[0, i])
                 if c.const_expr(self.lean):  # all four experts: one block, no branches
-                    scores = [sigmoid(raw[i]) for i in range(4)]
+                    scores = [routing_sigmoid(raw[i]) for i in range(4)]
                     for i in c.range_constexpr(4):
                         sig[4 * tid + i] = scores[i]
-                        key[i] = ordered(scores[i] + offsets[i])
+                        key[i] = ordered(routing_add(scores[i], offsets[i]))
             if c.const_expr(not self.lean):
                 cute.arch.griddepcontrol_wait()
         else:
@@ -251,9 +251,9 @@ class RouteSitu:
             expert = self.expert(tid, i)
             if c.const_expr(not (self.lean and self.polled)):  # noqa: SIM102
                 if expert < self.experts:
-                    score = sigmoid(raw[i])
+                    score = routing_sigmoid(raw[i])
                     sig[expert] = score
-                    key[i] = ordered(score + offsets[i])
+                    key[i] = ordered(routing_add(score, offsets[i]))
             top = max(top, key[i])
         km[warp, lane] = top
         if c.const_expr(self.lean):  # noqa: SIM102
@@ -336,9 +336,7 @@ class RouteSitu:
             for shift in c.range_constexpr(4):
                 total += cute.arch.shuffle_sync_bfly(total, 1 << shift)
             if lane < 16:
-                value = value * scale
-                if c.const_expr(self.renorm):
-                    value = div_rn(value, total + c.Float32(1e-20))
+                value = routing_weight(value, total, scale, renorm=self.renorm)
                 weights[token, lane] = c.BFloat16(value)
 
 

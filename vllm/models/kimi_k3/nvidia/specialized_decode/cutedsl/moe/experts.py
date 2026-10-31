@@ -1279,7 +1279,7 @@ class ExpertsKernel(ExpertsGeometry):
         stage_base, scale_token = (self.off_misc + 3200 + (eg * 4 + ew) * 128, Int32(0))
         for t in cutlass.range_constexpr(self.width):
             peer = shared_max[(eg * 4 + (ew ^ 1)) * 8 + t]
-            scale = mx_exponent(cute.arch.fmax(maxima[t], peer), floor=self.tp == 8)
+            scale = mx_exponent(cute.arch.fmax(maxima[t], peer))
             if lane == t:
                 scale_token = scale
             if up:
@@ -1392,11 +1392,11 @@ class ExpertsKernel(ExpertsGeometry):
                     phase ^= 1
                 if kind == 0:
                     if self.partials(workspace, values, a, ranges, batch):
-                        self.store_hidden(sm, workspace, values, a, parity, scalars[:3])
+                        self.store_hidden(sm, workspace, values, a, parity, scalars[:4])
                 else:
                     self.fc2(sm, workspace, output, values, a, b, ranges)
         if cutlass.const_expr(self.publish):
-            self.finalize(workspace, output, batch, scalars[3:])
+            self.finalize(workspace, output, batch, scalars[4:])
 
     @cute.jit
     def __call__(self, *args):

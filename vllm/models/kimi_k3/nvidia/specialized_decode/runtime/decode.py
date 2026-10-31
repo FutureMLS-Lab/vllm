@@ -8,13 +8,14 @@ from typing import Any, NamedTuple
 
 import torch
 
-from vllm.config import CUDAGraphMode
+from vllm.config import CUDAGraphMode, get_current_vllm_config
 from vllm.distributed import get_tp_group
 from vllm.distributed import tensor_model_parallel_all_reduce as all_reduce
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.platforms import current_platform
 from vllm.utils.math_utils import round_up
 
+from ...ops import attn_res
 from ..cutedsl.attn_res.prepared import PreparedAttnRes
 from ..cutedsl.common.embedding import PreparedEmbedding
 from ..cutedsl.common.twoshot import TwoShot
@@ -27,12 +28,15 @@ from ..cutedsl.moe.tail_runtime import MoeTailBox, PreparedTail
 from ..cutedsl.oproj.prepared import OprojMailbox
 from .prefetch import PrefetchController
 from .providers import (
+    ATTENTION_MAX,
     BATCHES,
     PREPARED_MAX,
     Attention,
     attention_kind,
     pack_dsa_projection,
     pack_front,
+    step_cap,
+    wide_caps,
 )
 
 
@@ -40,6 +44,9 @@ class Step(NamedTuple):
     q: int  # tokens per request
     metadata: list  # per layer
     slot_mapping: Any
+    # A wide step: more rows than the specialized step serves (``run_wide``).
+    wide: bool = False
+    positions: Any = None
 
 
 def attention_layer(module):
@@ -90,16 +97,31 @@ class SpecializedDecode:
 
     def __init__(self, backbone, config):
         self.backbone, self.buffers = backbone, {}
+        self.kv_prepared = False  # prepare_kv for the bound KV cache
+        self.cache_config = get_current_vllm_config().cache_config
         q = config.q
         # Verify steps decode q tokens per request at M = requests * q tokens; FULL
         # verify graphs round each capture size up to whole requests.
         rounded = {round_up(s, q) for s in config.capture_sizes}
         verify = {m for m in rounded if m <= PREPARED_MAX}
-        self.batches, self.q = tuple(sorted({*BATCHES, *verify})), q
+        # Steps up to the model's specialized-vs-stock crossover (wider: stock).
+        cap = step_cap(config.dsa, config.dcp > 1)
+        cap = min(cap, PREPARED_MAX)
+        batches = {b for b in (*BATCHES, *verify) if b <= cap}
+        self.batches, self.q = tuple(sorted(batches)), q
+        # Wide verify steps (cap < rows <= ATTENTION_MAX): the stock layer loop with
+        # each attention layer kind's projection and core specialized up to its own
+        # crossover (providers.WIDE_ROWS); kinds and rows past it run stock.
+        self.wide_cap = wide_caps(config.dcp > 1)
+        kinds = ("kda", "mla", "dsa") if config.dsa else ("kda", "mla")
+        widest = max(self.wide_cap[kind] for kind in kinds)
+        wide = {m for m in rounded if q > 1 and cap < m <= min(widest, ATTENTION_MAX)}
+        self.wide = tuple(sorted(wide))
+        self.attention_rows = max((*self.batches, *self.wide))
         self.queries = (1, q) if q > 1 else (1,)
         # The longest sequence the deployment serves bounds the MLA split count.
-        self.max_context, self.mla_core = config.max_context, config.mla_core
-        self.dsa_core = config.dsa_core
+        self.max_context, self.fi_kernels = config.max_context, config.fi_kernels
+        self.prims_ts_rows = config.prims_ts_rows
         # Decode context parallel over the TP ranks: MLA KV is sequence-sharded.
         self.dcp, self.dcp_box, self.mla_layers = config.dcp, None, 0
         self.dsa_dcp_box, self.dsa_layers = None, 0
@@ -137,6 +159,11 @@ class SpecializedDecode:
         self.hidden = (empty((64, 7168)), empty((64, 7168)))
         self.prefix = empty((64, 7168))
         self.blocks = empty((64, backbone.num_attn_res_blocks, 7168))
+
+    def wide_batches(self, kind):
+        """The wide step rows whose ``kind`` attention layers run the specialized
+        projection and core."""
+        return tuple(b for b in self.wide if b <= self.wide_cap[kind])
 
     def build_providers(self):
         """Every layer's attention and feed-forward providers, the model's mailboxes
@@ -196,11 +223,18 @@ class SpecializedDecode:
             self.feed_forward[index] = moe
 
     def prepare_kv(self):
-        """Compile each layer's cores for its bound KV cache layout (the profiling
-        cache, then the real one)."""
+        """Compile each layer's cores for its bound KV cache layout. The memory
+        profiling's throwaway cache is left unprepared (its compiles would all be
+        thrown away: every KV-dependent kernel is specialized to its cache's block
+        count), so its steps run the stock forward; the worker records the real
+        cache's block count before binding it, the profiling one only after."""
+        self.kv_prepared = False
+        if self.cache_config.num_gpu_blocks is None:  # the profiling cache
+            return
         for layer in self.layers:
             caches = caches_of(layer.self_attn)
             self.attention[layer.layer_idx].prepare_layout(caches)
+        self.kv_prepared = True
 
     def embed_input_ids(self, ids):
         rows = ids.shape[0] if ids.ndim == 1 and ids.is_contiguous() else 0
@@ -214,7 +248,11 @@ class SpecializedDecode:
 
         Steps that run the stock forward:
         - pipeline-parallel stage inputs (``intermediate_tensors``);
-        - token counts without prepared providers (above 64 or not in ``batches``);
+        - token counts without prepared providers (not in ``batches``, and not a
+          wide verify step: q > 1 and in ``wide``, the rows past the step cap
+          that some attention layer kind's projection and core take, run_wide);
+        - steps before ``prepare_kv`` bound the KV cache (the memory profiling's
+          cache is never prepared);
         - steps outside a CUDA graph capture (profiling, warmup and the warmup run
           before each capture), so every stock kernel runs before its capture;
         - PIECEWISE steps, keyed by token count alone and so captured as stock;
@@ -226,7 +264,10 @@ class SpecializedDecode:
         decode need every rank to take the same path.
         """
         b = positions.shape[0]
-        if intermediate_tensors is not None or b not in self.batches:
+        wide = b in self.wide
+        if intermediate_tensors is not None or not (b in self.batches or wide):
+            return None
+        if not self.kv_prepared:  # KV cache not prepared (memory profiling)
             return None
         if not torch.cuda.is_current_stream_capturing():
             return None
@@ -238,15 +279,17 @@ class SpecializedDecode:
         by_layer = context.attn_metadata
         rows: list[Any] = list(by_layer.values()) if isinstance(by_layer, dict) else []
         q = self.q if any(getattr(md, "num_spec_decodes", 0) for md in rows) else 1
-        if b % q:
+        if b % q or (wide and q == 1):
             return None
         metadata = [decode_metadata(d.self_attn, context, q, b) for d in self.layers]
         if any(md is None for md in metadata):
             return None
-        return Step(q, metadata, context.slot_mapping)
+        return Step(q, metadata, context.slot_mapping, wide, positions)
 
     def run(self, step, input_ids, inputs_embeds):
         """Normalized hidden states (and the aux streams) of a planned step."""
+        if step.wide:
+            return self.run_wide(step, input_ids, inputs_embeds)
         x = inputs_embeds
         if x is None:
             x = self.embed_input_ids(input_ids)
@@ -279,6 +322,54 @@ class SpecializedDecode:
             self.final.run(hidden, prefix, blocks, out, aux.get(index + 1))
         self.prefetch.join()
         return (out, aux_out) if aux_out else out
+
+    def run_wide(self, step, input_ids, inputs_embeds):
+        """A wide step: the stock decoder layer loop (KimiLinearModel.forward without
+        pipeline or sequence parallelism: AttnRes, o_proj + all-reduce, MoE / dense
+        MLP), with the attention layers whose kind serves this many rows running the
+        specialized input projection and core instead of the stock module's."""
+        backbone = self.backbone
+        x = inputs_embeds
+        if x is None:
+            x = backbone.embed_input_ids(input_ids)
+        b, q, slots, positions = x.shape[0], step.q, step.slot_mapping, step.positions
+        aux = [x] if backbone.start_layer in self.aux_layers else []
+        residual = x.new_empty(b, backbone.num_attn_res_blocks, x.shape[1])
+        prefix_sum, hidden = x, None
+        for layer, md in zip(self.layers, step.metadata):
+            hidden, prefix_sum, residual = layer._pre_attn_norm(
+                hidden, residual, prefix_sum
+            )
+            attention = self.attention[layer.layer_idx]
+            if b in attention.wide:
+                caches = caches_of(layer.self_attn)
+                hidden = attention.run_wide(hidden, caches, md, slots, q)
+            else:
+                hidden = layer._run_self_attn(positions, hidden)
+            hidden, prefix_sum, residual = layer._post_attn_norm(
+                hidden, residual, prefix_sum
+            )
+            hidden = layer.mlp(hidden)
+            if layer.layer_idx + 1 in self.aux_layers:
+                aux.append(
+                    backbone._capture_aux_hidden_stream(
+                        layer.layer_idx, prefix_sum, hidden, residual
+                    )
+                )
+        final = backbone.output_attn_res_norm
+        hidden = attn_res(
+            prefix_sum,
+            hidden,
+            residual,
+            final.weight,
+            backbone.output_attn_res_proj.weight.squeeze(0),
+            None,
+            num_blocks=backbone.num_attn_res_blocks,
+            block_write_idx=-1,
+            eps=final.variance_epsilon,
+            output_norm_eps=0.0,
+        )
+        return self.normalize((hidden, aux) if aux else hidden)
 
     def normalize(self, output):
         """A stock step's output with the backbone's final norm applied, as the

@@ -1,75 +1,98 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Prepared DSA core (Kimi K3.1 sparse MLA layers) over the packed fp8_ds_mla and
-indexer caches (FlashMLA sparse reads whole blocks, the indexer 64-entry pages):
+"""Prepared DSA core (Kimi K3.1 sparse MLA layers): the orchestration of one layer's
+stages over the packed MLA cache and the indexer cache (64-entry pages):
 
-  MlaQuery (dsa)   BF16 query rows [B, 64 (padded heads), 576], the fp8_ds_mla KV
-                   insert and the normalized q_c rows
-  wq_b             split-K projection of q_c -> [B, 32 * 128]
-  DsaIndex         FP8 indexer query + head weights, indexer key insert
-  indexer core     the stock decode scoring and top-k (sparse_attn_indexer, key
-                   insert skipped)
-  sparse core      SparseMlaDecode over the local heads (core "cute"), or logical ->
-                   physical top-k and FlashMLA sparse decode (core "flashmla"); on a
-                   per-tensor FP8 cache (FLASHINFER_MLA_SPARSE) the query and KV row
-                   are FP8 and FlashInfer's trtllm-gen sparse decode reads the flat
-                   rows of the packed blocks (core "flashinfer")
+  query stage      MlaQuery (dsa) -> wq_b -> DsaIndex (query_stage.py)
+  indexer stage    TP on FlashInfer: the fused decode indexer (indexer.py: scores,
+                   exact top-k and the physical rows in two PDL-chained kernels);
+                   DCP with the #63 merge: its scorer and local top-N select
+                   feed the merge (indexer_stage.py); else the stock decode
+                   scoring and top-k (indexer_stage.py)
+  sparse core      FlashInfer sparse MLA on a per-tensor FP8 cache (attn_fi.py:
+                   trtllm-gen or prims_ts per batch, called directly into the value
+                   stage's rows), else FlashMLA sparse on fp8_ds_mla (attn_ds.py)
   MlaValue         W_UV and the sigmoid gate of the BF16 latent
 
-Under DCP (= TP) each rank's cache holds 1 / DCP of every context: the query and
-DsaIndex insert only the owned slots, the indexer merges the ranks' local top-k
-into global token ids, every rank's BF16 query heads are gathered for FlashMLA
-sparse decode over the local shard, and the stock LSE combine returns this rank's
-heads to MlaValue.
+Query overlap (overlap.py, per batch of rows): the indexer path needs only q_c, so
+QueryNorm writes it (or IndexFront fuses it with wq_b and DsaIndex, front.py) on the
+main stream while MlaQuery (and, under DCP, the q mailbox poll) runs on a side
+stream that the main stream joins before the sparse core; or (TP, "late") MlaQuery
+runs on the main stream right after the fused indexer's select, beside it.
+
+Under DCP (= TP, dcp_stage.py) each rank's cache holds 1 / DCP of every context: the
+query and DsaIndex insert only the owned slots, the query publishes its heads into
+every rank's q mailbox, the indexer merges the ranks' local top-k into global token
+ids, which are filtered to this rank's slots (on FlashInfer with the #63 merge: into
+this rank's slots directly) for the sparse decode of every rank's gathered heads, and
+DcpValue merges this rank's heads by LSE.
 
 The packed projection row is [q_a 1536 | kv_a 576 | gate H*128 | wk 128 | wv 32]."""
 
 from functools import cache
 
-import cutlass
 import cutlass.cute as cute
 import torch
 from cutlass.cute.runtime import make_fake_stream
 
-from vllm.utils.torch_utils import _encode_layer_name
-
-from ..common.host import (
-    dynamic_view,
-    fake,
-    layout,
-    prepare_shared_carveout,
-    stream,
-    to_cute,
-)
-from ..common.policy import batch_table
-from ..gemm.projection import PreparedProjection
-from ..mla.dcp import compile_value
+from ..common.host import fake, layout, stream, to_cute
+from ..mla.dcp import PROJECTED
 from ..mla.prepared import pad_requests
-from ..mla.query import MlaQuery
 from ..mla.value import MlaValue
-from .index import DIM, HEADS, DsaIndex
-from .sparse import TOPK, SparseMlaDecode
+from .attn_ds import flashmla_core, flashmla_dcp_core
+from .attn_fi import FlashInferCore, dsa_on_flashinfer, fi_kernels, kernel_for
+from .dcp_stage import compile_dcp_value, local_slots, publish_args, run_value
+from .indexer import PAGE as INDEX_PAGE
+from .indexer import FusedIndexer
+from .indexer import reserve as reserve_fused_indexer
+from .indexer import static_unsupported as fused_indexer_static_unsupported
+from .indexer import supports as fused_indexer_unsupported
+from .indexer_stage import IndexerStage
+from .overlap import (
+    FRONT,
+    LATE,
+    MODES,
+    NORM,
+    QUERY_OVERLAP_UNFUSED,
+    overlap_for,
+    side_stream,
+)
+from .query_stage import (
+    QUERY_HEADS,
+    QueryStage,
+    compile_front,
+    compile_index,
+    compile_norm,
+    compile_query,
+    compile_wait,
+    gate_columns,
+)
 
-QUERY_HEADS = 64  # FlashMLA sparse FP8 decode reads 64 or 128 query heads
-# Sparse core per decode batch (GB300, TP8, 2048 of a 32k context; us per layer,
-# cute vs FlashMLA: B1 11.8/21.4, B4 12.1/21.9, B8 16.6/21.1, B16 27.4/24.4,
-# B32 27.9/34.9, B64 52.0/52.8).
-SPARSE_CORE = "1-8:cute,9-16:flashmla,17-32:cute,33-64:flashmla"
-CORES = ("cute", "flashmla", "flashinfer")
+__all__ = [
+    "QUERY_HEADS",
+    "PreparedDsa",
+    "compile_core",
+    "dsa_on_flashinfer",
+    "gate_columns",
+]
 
 
-def core_for(batch, core="auto"):
-    if core == "auto":
-        core = batch_table(SPARSE_CORE).get(batch, "flashmla")
-    if core not in CORES:
-        raise ValueError(
-            f"Kimi K3.1 DSA core {core!r}: expected auto, cute or flashmla"
-        )
-    return core
-
-
-def gate_columns(heads):
-    return 2112, 2112 + heads * 128
+# FlashInfer sparse MLA kernels that read their inputs (prims_ts: query and rows;
+# trtllm-gen: the counts) before their PDL wait: the kernel before them is held.
+HELD_KERNELS = ("prims_ts", "trtllm")
+# On FlashInfer with a per-tensor FP8 query the fused decode indexer always runs
+# (where fused_indexer_unsupported allows): at TP instead of the stock op and the
+# conversion; under DCP feeding the #63 merge its scores, plus (up to one row per
+# SM, FusedIndexer.packs) its local top-N select as B' rows. The exact merge
+# re-reads a saturated rank's logits (more than N of a row's global top-k), so it
+# always gets the DeepGEMM-layout logits, unmodified until it returns; the B' rows
+# meet its producer contract (bit-exact #63's pack of the exact local top-N, ties
+# to the lowest key: test_fused_indexer_dcp).
+# serial query overlap: the fused index front from MlaQuery's q_c rows
+# (IndexFrontMma, normalized) instead of the split-K wq_b and DsaIndex, up to this
+# many rows (0: never). Under fork it measured no gain (QueryNorm stays a launch);
+# under DCP8 wait it lost 1-8 us (it would wait on MlaQuery's q mailbox poll).
+FUSED_INDEX = 64
 
 
 @cache
@@ -85,115 +108,85 @@ def compile_core(
     sms=148,
     fp8=False,
     lse_base_e=True,
+    nvfp4=False,
+    overlap="serial",
+    partials="bf16",
+    cap=64,
+    release=True,
 ):
     """CuTe kernels (query, index, value) of one batch of rows (``q`` per request).
     ``specs``: the layouts of the weights, the MLA cache and the indexer cache.
-    Under DCP (``dcp``: its size, ``q_heads``: the gathered query's padded heads) the
-    query also publishes into the q mailbox and the value is DcpValue. ``fp8``: a
-    per-tensor FP8 query [B, H, 576] and cache, and the value reads FlashInfer's
-    [B, H, 512] latent (under DCP: an FP8 q mailbox, and an LSE in base e if
-    ``lse_base_e``, else base 2)."""
+    Under DCP (``dcp``: its size, ``q_heads``: the gathered query's padded heads,
+    ``cap``: the DcpBox rows) the query also publishes into the q mailbox and the
+    value is DcpValue. ``fp8``: a per-tensor FP8 query [B, H, 576] and cache, and
+    the value reads FlashInfer's [B, H, 512] latent (under DCP: an FP8 q mailbox,
+    and an LSE in base e if
+    ``lse_base_e``, else base 2). ``nvfp4``: that FP8 query over an nvfp4_ds_mla
+    cache (FlashInfer prims_ts). ``overlap``: the query overlap mode (overlap.py).
+    ``partials``: the DcpBox's partial rows. ``release``: the query launches the
+    next kernel early (PDL)."""
     qnorm, kvnorm, qb, uk, uv, kv, index_kv = (
         fake(shape, stride, dtype, 4 if dtype == torch.float32 else 16)
         for shape, stride, dtype in specs
     )
-    scalar = fake((1,), (1,), torch.float32, 4)
     query_heads = heads if fp8 else QUERY_HEADS
-    if fp8:
-        query = fake((batch, heads, 576), (heads * 576, 576, 1), torch.uint8)
-    else:
-        query = fake((batch, QUERY_HEADS, 576), (QUERY_HEADS * 576, 576, 1))
-    qc = fake((batch, 1536), (1536, 1))
-    projected = fake((batch, pitch), (pitch, 1))
-    slots = fake((batch,), (1,), torch.int64, 8)
-    f32 = cutlass.Float32
-    s = make_fake_stream()
-    mla_query = MlaQuery(
-        heads,
-        batch,
-        q_b_cp_async=heads == 12 and batch == 1,
-        dsa=True,
-        fp8=fp8,
-        dcp=dcp,
-        q_heads=q_heads,
-    )
-    q_args = (projected, qnorm, kvnorm, qb, uk, kv, slots, scalar, scalar, f32(1e-6))
-    publish: tuple = ()
-    if dcp:  # this parity's q mailbox (bytes), its multicast address, rank
-        mailbox = fake((64, q_heads, 576 if fp8 else 1152), None, torch.uint8)
-        publish = (mailbox, cutlass.Int64(0), cutlass.Int32(0))
-    _, key = gate_columns(heads)
-    index = DsaIndex(key, key + DIM)
-    iq = fake((batch, HEADS * DIM), (HEADS * DIM, 1))
-    norm = fake((DIM,), (1,), torch.float32, 4)
-    q_out = fake((batch, HEADS, DIM), None, torch.uint8)
-    w_out = fake((batch, HEADS), None, torch.bfloat16, 4)
-    i_args = (projected, iq, norm, norm, index_kv, slots, q_out, w_out, f32(1e-6))
-    latent = fake((batch, heads, 512), (query_heads * 512, 512, 1))
-    gate = fake((batch, heads * 128), (pitch, 1))
-    lengths = fake((batch // q,), (1,), torch.int32, 4)
-    output = fake((batch, heads * 128), (heads * 128, 1))
     with torch.accelerator.device_index(device):
-        query_kernel = cute.compile(mla_query, *q_args, query, qc, *publish, s)
-        if batch > 1:
-            query_kernel = prepare_shared_carveout(query_kernel, device, 100)
-        index_kernel = cute.compile(index, *i_args, s)
+        fakes = qnorm, kvnorm, qb, uk, kv
+        query_kernel = compile_query(
+            batch,
+            heads,
+            pitch,
+            fakes,
+            device,
+            dcp,
+            q_heads,
+            fp8,
+            nvfp4=nvfp4,
+            overlap=overlap,
+            cap=cap,
+            release=release,
+        )
+        index_kernel = compile_index(batch, heads, pitch, index_kv)
         if dcp:
-            value_kernel = compile_value(
-                heads,
-                dcp,
-                batch,
-                64,
-                specs[4],
-                pitch,
-                device,
-                sms,
-                q,
-                q_heads,
-                dsa_bf16=not fp8,
-                lse_base_e=lse_base_e,
-            )
+            args = heads, dcp, batch, specs[4], pitch, device, sms, q, q_heads
+            value_kernel = compile_dcp_value(*args, fp8, lse_base_e, partials, cap)
         else:
+            latent = fake((batch, heads, 512), (query_heads * 512, 512, 1))
+            gate = fake((batch, heads * 128), (pitch, 1))
+            lengths = fake((batch // q,), (1,), torch.int32, 4)
+            output = fake((batch, heads * 128), (heads * 128, 1))
             value = MlaValue(heads, batch, q)
-            value_kernel = cute.compile(value, latent, uv, gate, lengths, output, s)
+            v_args = (latent, uv, gate, lengths, output, make_fake_stream())
+            value_kernel = cute.compile(value, *v_args)
     return query_kernel, index_kernel, value_kernel
 
 
-@cache
-def compile_sparse(batch, heads, kv_spec, device, q=1):
-    """SparseMlaDecode of one batch of rows into the [B, 64, 512]-strided latent."""
-    query = fake((batch, QUERY_HEADS, 576), (QUERY_HEADS * 576, 576, 1))
-    topk = fake((batch, TOPK), (TOPK, 1), torch.int32, 4)
-    rows = cute.sym_int(), cute.sym_int()
-    table = fake(rows, (cute.sym_int(), 1), torch.int32, 4)  # any block table pitch
-    latent = fake((batch, heads, 512), (QUERY_HEADS * 512, 512, 1))
-    kv = fake(*kv_spec)
-    args = (query, topk, table, kv, latent, cutlass.Float32(1.0), make_fake_stream())
-    with torch.accelerator.device_index(device):
-        return cute.compile(SparseMlaDecode(heads, batch, q), *args)
+def kv_cache_blocks():
+    """The 64-token blocks the KV cache holds, if known before it is allocated (a
+    num_gpu_blocks override, or a cache already sized): a request's context fits in
+    it, so it bounds the fused indexer's logits with the longest context. None if
+    unknown (the KV cache is sized after the specialized decode is built)."""
+    from vllm.config import get_current_vllm_config_or_none
 
-
-def index_policies(batches):
-    """Split-K tactics of the replicated wq_b projection (N 4096, K 1536) per padded
-    batch (GB300 us, previous / these: B1-8 4.9/2.9, B32 3.7/3.4, B64 4.9/3.9)."""
-    tactics = {8: (128, 8, 3, 4), 16: (64, 16, 2, 6), 32: (64, 32, 1, 8)}
-    tactics[64] = (64, 64, 1, 4)
-    return {b: tactics[next(n for n in tactics if b <= n)] for b in batches}
-
-
-def dsa_on_flashinfer(attention) -> bool:
-    """Whether a KimiK3DSAAttention runs FLASHINFER_MLA_SPARSE (per-tensor FP8)."""
-    from vllm.v1.attention.backends.mla.flashinfer_mla_sparse import (
-        FlashInferMLASparseImpl,
-    )
-
-    return isinstance(attention.mla_attn.mla_attn.impl, FlashInferMLASparseImpl)
+    config = get_current_vllm_config_or_none()
+    if config is None:
+        return None
+    cache = config.cache_config
+    blocks = cache.num_gpu_blocks or cache.num_gpu_blocks_override
+    if not blocks or not cache.block_size:
+        return None
+    return -(-blocks * cache.block_size // INDEX_PAGE)
 
 
 class PreparedDsa:
     """One K3.1 DSA layer. ``attention``: the KimiK3DSAAttention; ``pitches``: the
     packed projection pitch per batch; ``queries``: the query lengths q (1 + the
-    draft length under DSpark verify) prepared for every batch divisible by q."""
+    draft length under DSpark verify) prepared for every batch divisible by q;
+    ``kernels``: the FlashInfer sparse MLA kernels to pick from per batch (default:
+    attn_fi.fi_kernels); ``prims_ts_rows``: the prims_ts plans' row capacities
+    (default: every batch on its own plan);
+    ``overlap``: a query overlap mode or "rows:mode" table (overlap.QUERY_OVERLAP).
+    """
 
     def __init__(
         self,
@@ -202,52 +195,75 @@ class PreparedDsa:
         scratch,
         *,
         queries=(1,),
-        core="auto",
         dcp=None,
         parity=0,
+        kernels=None,
+        overlap=None,
+        prims_ts_rows=None,
     ):
+        from vllm.model_executor.layers.linear import UnquantizedLinearMethod
         from vllm.v1.attention.backends.mla.flashmla_sparse import FlashMLASparseImpl
 
         wrapper = attention.mla_attn
         self.layer = layer = wrapper.mla_attn
         self.impl, self.indexer = layer.impl, attention.dsa_indexer
+        # The KV format: fp8_ds_mla (FlashMLA sparse), else FlashInfer
+        # sparse's per-tensor FP8 query over a per-tensor FP8 cache (trtllm-gen or
+        # prims_ts) or an nvfp4_ds_mla one (prims_ts).
         self.fp8 = dsa_on_flashinfer(attention)
+        self.nvfp4 = layer.kv_cache_dtype == "nvfp4_ds_mla"
         if not (self.fp8 or isinstance(self.impl, FlashMLASparseImpl)):
             raise ValueError(
                 "Kimi K3.1 specialized decode needs the FLASHMLA_SPARSE or "
                 f"FLASHINFER_MLA_SPARSE backend, got {type(self.impl).__name__}"
             )
+        # The index projection runs as a BF16 split-K GEMM (stock: BF16 wq_index).
+        if not isinstance(self.indexer.wq_index.quant_method, UnquantizedLinearMethod):
+            raise ValueError(
+                "Kimi K3.1 specialized decode needs an unquantized (BF16) wq_index"
+            )
         self.box, self.parity = dcp, parity
+        # The DcpBox mailboxes hold cap rows: a wider batch would store past them.
+        assert dcp is None or max(pitches) <= dcp.cap, (max(pitches), dcp.cap)
         self.dcp = dcp.size if dcp is not None else 1
         if dcp is None and not self.fp8:
             assert self.impl.fp8_decode_padded_heads == QUERY_HEADS
         self.heads = layer.W_UK_T.shape[0]
-        norms = wrapper.q_a_layernorm.weight, wrapper.kv_a_layernorm.weight
-        self.weights: tuple = (*norms, wrapper.q_b_proj.weight, layer.W_UK_T)
-        self.weights += (layer.W_UV,)
         self.device, self.pitches = layer.W_UK_T.device, pitches
-        self.eps = cutlass.Float32(wrapper.q_a_layernorm.variance_epsilon)
-        knorm = self.indexer.k_index_norm
-        self.key_eps = cutlass.Float32(knorm.eps)
-        self.key_norm = to_cute(knorm.weight, 4), to_cute(knorm.bias, 4)
-        self.views = tuple(
-            to_cute(w, 4 if w.dtype == torch.float32 else 16) for w in self.weights
-        )
-        self.unit = torch.ones(1, dtype=torch.float32, device=self.device)
-        self.query, self.qc, self.iq, self.q_fp8, self.head_w, self.latent = scratch
+        *shared, fi_buffers = scratch
+        self.query_stage = QueryStage(attention, pitches, shared, self.fp8, self.nvfp4)
+        # Under DCP on FlashInfer: the #63 merge's owned-row outputs (indexer_stage).
+        merge_rows = max(pitches) if self.dcp > 1 and self.fp8 else 0
+        self.indexer_stage = IndexerStage(self.indexer, merge_rows)
         self.shapes = [(b, q) for b in pitches for q in queries if b % q == 0]
-        self.cores = {(b, q): core_for(b, core) for b, q in self.shapes}
-        # Inverse per-tensor scales of the FP8 query and KV row (FlashMLA: unused).
-        self.scales_inv = self.unit, self.unit
+        self.fi = None
+        self.overlaps = {
+            (b, q): overlap_for(b, overlap, self.dcp > 1) for b, q in self.shapes
+        }
         if self.fp8:
-            self.cores = dict.fromkeys(self.shapes, "flashinfer")
-            self.scales_inv = tuple(
-                (1 / scale.float()).reshape(1).to(self.device)
-                for scale in (layer._q_scale, layer._k_scale)
+            if kernels is None:
+                kernels = fi_kernels(layer.kv_cache_dtype)
+            dcp_size = self.dcp
+            rows = {b: kernel_for(b, dcp_size > 1, kernels) for b in pitches}
+            self.cores = {(b, q): rows[b] for b, q in self.shapes}
+            heads = dcp.q_heads if dcp is not None else self.heads
+            sharding = dcp_size, self.indexer.dcp_rank
+            # The merge's rows are narrower than the top-k: plan both widths.
+            merged = self.indexer_stage.local_topk
+            widths = (self.indexer_stage.dcp_rows.shape[1],) if merged else ()
+            self.fi = FlashInferCore(
+                self.impl,
+                layer,
+                heads,
+                fi_buffers,
+                rows,
+                *sharding,
+                widths=widths,
+                capacities=prims_ts_rows,
             )
-            shape = (max(pitches), self.heads, 576)
-            self.query = torch.zeros(shape, dtype=torch.uint8, device=self.device)
-        if self.dcp > 1:
+        elif self.dcp == 1:
+            self.cores = dict.fromkeys(self.shapes, "flashmla")
+        else:
             self.cores = dict.fromkeys(self.shapes, "dcp")
             rows, device = max(pitches), self.device
             padded = dcp.q_heads
@@ -258,227 +274,272 @@ class PreparedDsa:
             self.cache_lens = torch.full(
                 (rows,), self.indexer.max_model_len, dtype=torch.int32, device=device
             )
-        self.kernels, self.sparse = {}, {}
-        policies = index_policies(sorted(pitches))
-        wq = self.indexer.wq_index.weight
-        self.index_projection = PreparedProjection(wq, policies).prepare()
-        self.k_cache_name = _encode_layer_name(self.indexer.k_cache.prefix)
-        self.max_model_len = self.indexer.max_model_len
-        self.max_total = self.indexer.max_total_seq_len
-        self.topk = self.indexer.topk_tokens
+        self.kernels, self.overlap_kernels = {}, {}
+        local_topk = self.indexer_stage.local_topk
+        static = (
+            fused_indexer_static_unsupported(self.indexer, *s) for s in self.shapes
+        )
+        if self.fp8 and (self.dcp == 1 or local_topk) and not any(static):
+            # The fused indexer's buffers (prepare_cache), shared by every layer,
+            # sized for the longest context the KV cache can hold: reserved now, as
+            # the specialized decode is built before vLLM profiles its memory for
+            # the KV cache (only where prepare_cache can run it: its cache layout
+            # aside, the same checks).
+            args = self.indexer, self.device, max(pitches), local_topk
+            reserve_fused_indexer(*args, blocks=kv_cache_blocks())
+        # DCP "proj" partials: every gathered head's W_UV (collective).
+        self.uv_gathered = dcp.value_weights(layer.W_UV) if dcp else None
+        # TP on FlashInfer: the fused decode indexer (prepare_cache; None: stock).
+        self.fused: FusedIndexer | None = None
+
+    @property
+    def query(self):
+        """This layer's query rows (FlashInfer: FP8 [B, H, 576] bytes)."""
+        return self.query_stage.query
 
     def prepare_cache(self, kv):
         caches = kv.view(torch.uint8), self.indexer.k_cache.kv_cache
-        specs = tuple(layout(w) for w in (*self.weights, *caches))
+        weights = self.query_stage.weights
+        specs = tuple(layout(w) for w in (*weights, *caches))
         sms = torch.cuda.get_device_properties(self.device).multi_processor_count
+        unsupported = [fused_indexer_unsupported(self.indexer, *s) for s in self.shapes]
+        fused = self.box is None and self.fp8
+        fused = fused and not any(unsupported)
+        if not fused:  # the late query follows the fused indexer's select
+            # Without it (fp8_ds_mla, unsupported shapes) the TP default is the
+            # stack's table from before the late modes (QUERY_OVERLAP_UNFUSED).
+            for (batch, q), mode in self.overlaps.items():
+                if mode in LATE:
+                    mode = overlap_for(batch, QUERY_OVERLAP_UNFUSED)
+                self.overlaps[batch, q] = mode
         for batch, q in self.shapes:
             args: tuple = (batch, self.heads, self.pitches[batch], specs)
             args += (self.device.index, q)
+            partials = "bf16"
             if self.box is not None:
                 args += (self.dcp, self.box.q_heads, sms)
-            lse_base_e = not self.fp8 or self.impl.lse_base_on_e
+                partials = self.box.mailbox(batch).format
+            lse_base_e = self.cores[batch, q] != "trtllm"  # trtllm-gen: base 2
+            overlap = self.overlaps[batch, q]
+            cap = self.box.cap if self.box is not None else 64
             self.kernels[batch, q] = compile_core(
-                *args, fp8=self.fp8, lse_base_e=lse_base_e
+                *args,
+                fp8=self.fp8,
+                lse_base_e=lse_base_e,
+                nvfp4=self.nvfp4,
+                overlap=overlap,
+                partials=partials,
+                cap=cap,
+                release=(batch, q) not in self.held(LATE),
             )
-            if self.cores[batch, q] == "cute":
-                sparse = batch, self.heads, specs[5], self.device.index, q
-                self.sparse[batch, q] = compile_sparse(*sparse)
+            if overlap != "serial" or batch <= FUSED_INDEX:
+                self.overlap_kernels[batch, q] = self.compile_overlap(
+                    batch, q, specs[6]
+                )
+        rows = max(self.pitches)
+        if fused:
+            # Every mode but the late ones has the select right before the decode
+            # (wait too: QueryWait runs only under DCP).
+            hold = self.held(tuple(m for m in MODES if m not in LATE))
+            # The select maps keys to rows of the MLA cache's pages (kv.shape[1]
+            # tokens: 64, or the hybrid model's attention page, e.g. 2048).
+            args = self.indexer, self.shapes, self.device, rows
+            self.fused = FusedIndexer(*args, hold=hold, page=kv.shape[1])
+        stage = self.indexer_stage
+        if stage.local_topk and not any(unsupported):
+            stage.fused = FusedIndexer(
+                self.indexer,
+                self.shapes,
+                self.device,
+                rows,
+                local_topk=stage.local_topk,
+                packed=True,
+            )
         return self
+
+    def held(self, modes):
+        """The shapes on a FlashInfer kernel (HELD_KERNELS) whose overlap mode is
+        one of ``modes``: the kernel right before their sparse decode (TP: the
+        fused indexer's select, or the late query) must not launch it early.
+        prims_ts' split-KV decode launches with PDL but reads its query and rows
+        before its PDL wait, so it would read the previous layer's; trtllm-gen
+        reads its per-row counts early too (a CUDA graph with only the counts
+        poisoned before each layer hangs at 60 rows)."""
+        return {
+            shape
+            for shape, core in self.cores.items()
+            if core in HELD_KERNELS and self.overlaps[shape] in modes
+        }
 
     def indexer_core(self, projected, batch):
         """Top-k of the current rows into the shared buffer (stock decode scoring)."""
-        indexer = self.indexer
-        return torch.ops.vllm.sparse_attn_indexer(
-            projected,
-            self.k_cache_name,
-            indexer.k_cache.kv_cache,
-            self.q_fp8[:batch].view(torch.float8_e4m3fn),
-            None,
-            None,
-            self.head_w[:batch],
-            DIM,
-            indexer.scale_fmt,
-            self.topk,
-            DIM,
-            self.max_model_len,
-            self.max_total,
-            indexer.topk_indices_buffer,
-            True,  # the key is inserted by DsaIndex
-            False,
-            False,
-            _encode_layer_name(""),
-            False,
-            indexer.dcp_rank,
-            indexer.dcp_world_size,
-            indexer.cp_kv_cache_interleave_size,
-            topk_backend=indexer.topk_backend,
+        stage = self.query_stage
+        assert projected.shape[0] == batch
+        return self.indexer_stage.run(projected, stage.q_fp8, stage.head_w)
+
+    def fused_core(self, cache, metadata, batch, q, join=None):
+        """TP on FlashInfer: the fused decode indexer's physical rows, then the
+        sparse decode -> the [B, H, 512] latent. ``join``: what makes the sparse
+        decode wait for the query (run_query)."""
+        from vllm.forward_context import get_forward_context
+        from vllm.v1.attention.backends.mla.sparse_utils import flat_kv_row_view
+
+        assert self.fused is not None and metadata.block_size == self.fused.page, (
+            metadata.block_size,
+            self.fused.page,
         )
+        decode = get_forward_context().attn_metadata[self.indexer.k_cache.prefix]
+        _, block_rows = flat_kv_row_view(cache, metadata.block_size)
+        stage = self.query_stage
+        args = stage.q_fp8, stage.head_w, decode.decode, metadata.block_table
+        rows, valid = self.fused.run(*args, block_rows, batch, q)
+        assert self.fi is not None
+        if join is not None:
+            join()
+        query = self.query[:batch]
+        return self.fi.decode(query, cache, rows, valid, metadata.block_size)[0]
 
     def sparse_core(self, cache, topk, metadata, batch, q):
-        """Sparse decode of the padded BF16 query rows -> [B, 64, 512]-strided."""
-        from vllm.v1.attention.backends.mla.flashmla_sparse import _fp8_kv_pages
-        from vllm.v1.attention.ops.flashmla import flash_mla_with_kvcache
+        """Sparse decode of the query rows -> the latent ([B, 64, 512]-strided on
+        fp8_ds_mla, [B, H, 512] on FlashInfer)."""
+        query = self.query[:batch]
+        if self.fi is not None:
+            return self.fi.run(query, cache, topk[:batch], metadata)[0]
+        return flashmla_core(self.impl, query, cache, topk[:batch], metadata)
 
-        impl = self.impl
-        if self.cores[batch, q] == "flashinfer":
-            # As the stock decode: top-k -> flat rows of the packed blocks.
-            from vllm.v1.attention.backends.mla.sparse_utils import flat_kv_row_view
+    def compile_overlap(self, batch, q, index_spec):
+        """The overlap kernels of a batch: (front, wait, norm). ``front``: the fused
+        index front (IndexFront / IndexFrontMma from the packed rows under front /
+        late_front, IndexFrontMma from q_c under serial up to FUSED_INDEX
+        rows) or None; ``wait``: QueryWait under DCP (else None); ``norm``:
+        QueryNorm under fork / late (else None). Each kernel is compiled once per
+        key and shared by every DSA layer (query_stage memoizes them)."""
+        mode, pitch, device = self.overlaps[batch, q], self.pitches[batch], self.device
+        first = wait = None
+        with torch.accelerator.device_index(device.index):
+            if self.box is not None:
+                args = batch, self.heads, self.dcp, self.box.q_heads, self.fp8
+                wait = compile_wait(*args, self.box.cap)
+            norm = None
+            if mode in NORM:
+                norm = compile_norm(batch, self.heads, pitch)
+            fused = mode == "serial" and batch <= FUSED_INDEX
+            if mode in FRONT or fused:
+                weight = self.query_stage.index_projection.weight
+                specs = layout(weight), index_spec
+                normalized = mode not in FRONT
+                args = batch, self.heads, pitch, *specs, device.index, normalized
+                first = compile_front(*args)
+        return first, wait, norm
 
-            impl.record_logical_topk_ready()
-            _, block_rows = flat_kv_row_view(cache, metadata.block_size)
-            physical, valid = impl._convert_logical_to_physical_topk(
-                topk[:batch],
-                metadata,
-                block_stride_rows=block_rows,
-                return_valid_counts=True,
-            )
-            latent, _ = impl._forward_mqa_kernel(
-                self.query[:batch].view(torch.float8_e4m3fn),
-                cache,
-                physical,
-                valid,
-                layer=self.layer,
-                block_size=metadata.block_size,
-                is_decode=True,
-            )
-            return latent
-        if self.cores[batch, q] == "cute":
-            reqs = batch // q
-            table, _, _ = pad_requests(reqs, metadata.block_table, metadata.seq_lens)
-            query, rows = to_cute(self.query[:batch]), to_cute(topk[:batch], 4)
-            kv = to_cute(cache.view(torch.uint8))
-            latent = to_cute(self.latent[:batch, : self.heads])
-            scale = cutlass.Float32(impl.softmax_scale)
-            table = dynamic_view(table[:reqs], 4)
-            self.sparse[batch, q](
-                query, rows, table, kv, latent, scale, stream(self.device)
-            )
-            return self.latent[:batch]
-        # As the stock decode: the packed blocks as 64-row pages of flat rows.
-        pages, stride_rows = _fp8_kv_pages(cache, metadata.block_size)
-        impl.record_logical_topk_ready()
-        physical = impl._convert_logical_to_physical_topk(
-            topk[:batch],
-            metadata,
-            block_stride_rows=stride_rows,
-            return_valid_counts=False,
-        )
-        kernel_metadata = metadata.fp8_extra_metadata
-        latent, _ = flash_mla_with_kvcache(
-            q=self.query[:batch].unsqueeze(0),
-            k_cache=pages.view(torch.uint8).unsqueeze(-2),
-            block_table=kernel_metadata.dummy_block_table,
-            head_dim_v=512,
-            cache_seqlens=kernel_metadata.cache_lens,
-            tile_scheduler_metadata=kernel_metadata.scheduler_metadata,
-            is_fp8_kvcache=True,
-            indices=physical.unsqueeze(0),
-            softmax_scale=impl.softmax_scale,
-        )
-        return latent[0]
+    def run_query(self, projected, cache, slots, q, publish=()):
+        """MlaQuery and the q_c rows per the overlap mode. Returns what makes the
+        sparse core wait for the query (None: it is already in stream order)."""
+        stage, batch = self.query_stage, projected.shape[0]
+        query, mode = self.kernels[batch, q][0], self.overlaps[batch, q]
+        if mode == "serial":
+            stage.run_query(query, projected, cache, slots, publish)
+            return None
+        first, wait, norm = self.overlap_kernels[batch, q]
+        if mode in LATE:  # MlaQuery inside the fused indexer's chain (fused_core)
+            if mode in NORM:
+                stage.run_norm(norm, projected)
+            return lambda: stage.run_query(query, projected, cache, slots)
+        mailbox = publish[:1]
+        if mode == "wait":
+            stage.run_query(query, projected, cache, slots, publish)
+            if wait is None:
+                return None
+            return lambda: wait(*mailbox, stream(self.device))
+        main = torch.cuda.current_stream(self.device)
+        side = side_stream(self.device.index)
+        side.wait_stream(main)
+        if mode == "fork":
+            stage.run_norm(norm, projected)
+        with torch.cuda.stream(side):
+            stage.run_query(query, projected, cache, slots, publish)
+            if wait is not None:
+                wait(*mailbox, stream(self.device))
+        return lambda: main.wait_stream(side)
 
-    def dcp_core(self, cache, topk, metadata, batch):
+    def run_index(self, kernel, projected, index_slots, q):
+        """The indexer inputs: wq_b and DsaIndex (``kernel``), or the fused index
+        front (from the packed rows, or under serial from q_c)."""
+        shape = projected.shape[0], q
+        mode, stage = self.overlaps[shape], self.query_stage
+        front = self.overlap_kernels.get(shape, (None,))[0]
+        if mode in FRONT:
+            return stage.run_front(front, projected, index_slots)
+        if front is not None:  # serial: from MlaQuery's q_c rows
+            return stage.run_front(front, projected, index_slots, normalized=True)
+        return stage.run_index(kernel, projected, index_slots)
+
+    def dcp_core(self, cache, topk, metadata, batch, projected=None, join=None, q=1):
         """Sparse decode of every rank's query heads (the gathered q mailbox) over the
-        local shard into the DcpValue rows and LSE. The global top-k ids are filtered
-        to this rank's slots and compacted to a prefix whose length bounds the work
-        (about 1 / DCP of the top-k). FlashMLA (natural-log LSE; a fresh scheduler
-        metadata per call follows those lengths) or, on a per-tensor FP8 cache,
-        FlashInfer's sparse decode over the flat rows, as the stock decode."""
+        local shard into the DcpValue rows, LSE and per-row valid counts: on a
+        per-tensor FP8 cache FlashInfer over this rank's flat rows, on fp8_ds_mla
+        FlashMLA as the stock decode. ``topk``: the global ids, or None with
+        ``projected``: on FlashInfer the indexer stage's DCP merge (#63) gives this
+        rank's rows directly, else the stock op's global ids are filtered to them.
+        ``join``: what makes the sparse decode wait for the query (run_query)."""
         from vllm.v1.attention.backends.mla.flashmla_sparse import _fp8_kv_pages
-        from vllm.v1.attention.backends.mla.sparse_utils import (
-            flat_kv_row_view,
-            triton_filter_and_convert_dcp_index,
-        )
-        from vllm.v1.attention.ops.flashmla import (
-            flash_mla_with_kvcache,
-            get_mla_metadata,
-        )
 
         indexer, md = self.indexer, metadata
-        stride_rows: int | None
-        if self.fp8:
-            _, stride_rows = flat_kv_row_view(cache, md.block_size)
-        else:
-            pages, stride_rows = _fp8_kv_pages(cache, md.block_size)
-        slots, valid = triton_filter_and_convert_dcp_index(
-            md.req_id_per_token[:batch],
-            md.block_table,
+        query = self.box.q[self.parity, :batch]
+        if self.fi is not None:
+            stride_rows = self.fi.rows(cache, md.block_size)[1]
+            merged = None
+            if topk is None and self.indexer_stage.local_topk:
+                stage = self.query_stage
+                args = stage.q_fp8, stage.head_w, md, stride_rows, batch
+                merged = self.indexer_stage.merge_rows(*args, q)
+            if merged is None:
+                if topk is None:
+                    topk = self.indexer_core(projected, batch)
+                interleave = indexer.cp_kv_cache_interleave_size
+                args = topk, md, batch, stride_rows, interleave
+                merged = self.fi.convert(*args)
+            if join is not None:
+                join()
+            latent, lse = self.fi.decode(query, cache, *merged, md.block_size)
+            return latent, lse, merged[1]
+        if topk is None:
+            topk = self.indexer_core(projected, batch)
+        pages, stride_rows = _fp8_kv_pages(cache, md.block_size)
+        slots, valid = local_slots(
+            md,
             topk[:batch],
-            dcp_size=self.dcp,
-            dcp_rank=indexer.dcp_rank,
-            cp_kv_cache_interleave_size=indexer.cp_kv_cache_interleave_size,
-            BLOCK_SIZE=md.block_size,
-            BLOCK_STRIDE_ROWS=stride_rows,
-            NUM_TOPK_TOKENS=topk.shape[1],
-            return_valid_counts=True,
+            self.dcp,
+            indexer.dcp_rank,
+            indexer.cp_kv_cache_interleave_size,
+            stride_rows,
         )
-        if self.fp8:
-            self.impl.record_logical_topk_ready()
-            rows, lse = self.impl._forward_mqa_kernel(
-                self.box.q[self.parity, :batch].view(torch.float8_e4m3fn),
-                cache,
-                slots,
-                valid,
-                layer=self.layer,
-                block_size=md.block_size,
-                is_decode=True,
-            )
-            assert lse is not None
-            return rows, lse.masked_fill((valid == 0).view(-1, 1), float("-inf"))
-        rows, lse = flash_mla_with_kvcache(
-            q=self.box.q[self.parity, :batch].unsqueeze(1),
-            k_cache=pages.view(torch.uint8).unsqueeze(-2),
-            block_table=self.dummy_table[:batch],
-            head_dim_v=512,
-            cache_seqlens=self.cache_lens[:batch],
-            tile_scheduler_metadata=get_mla_metadata()[0],
-            is_fp8_kvcache=True,
-            indices=slots.unsqueeze(1),
-            topk_length=valid,
-            softmax_scale=self.impl.softmax_scale,
-            out=self.rows[:batch],
+        if join is not None:
+            join()
+        out, table, lens = (
+            t[:batch] for t in (self.rows, self.dummy_table, self.cache_lens)
         )
-        # A rank owning none of a row's entries: DcpValue drops it (LSE -inf).
-        return rows, lse.masked_fill((valid == 0).view(-1, 1, 1), float("-inf"))
+        return flashmla_dcp_core(
+            self.impl, query, pages, slots, valid, out, table, lens
+        )
 
     def run_dcp(self, projected, out, cache, slots, index_slots, metadata, q):
         """``run`` under DCP: the query publishes into the q mailbox and DcpValue
         merges every rank's partial rows of this rank's heads (global lengths)."""
-        batch, s = projected.shape[0], stream(self.device)
+        batch = projected.shape[0]
         reqs, box, p = batch // q, self.box, self.parity
         _, lengths, _ = pad_requests(reqs, metadata.block_table, metadata.seq_lens)
-        mq, index, value = self.kernels[batch, q]
-        qnorm, kvnorm, qb, uk, uv = self.views
-        x, q_slots = to_cute(projected), to_cute(slots[:batch], 8)
-        kv = to_cute(cache.view(torch.uint8))
-        q_scale_inv, k_scale_inv = (to_cute(t, 4) for t in self.scales_inv)
-        mailbox = to_cute(box.q[p].view(torch.uint8))
-        scales = q_scale_inv, k_scale_inv, self.eps
-        q_args = (x, qnorm, kvnorm, qb, uk, kv, q_slots, *scales)
-        publish = (mailbox, box.mc(p), cutlass.Int32(box.rank))
-        mq(*q_args, to_cute(self.query[:batch]), to_cute(self.qc[:batch]), *publish, s)
-        self.run_index(x, index_slots, batch, index)
-        topk = self.indexer_core(projected, batch)
-        latent, lse = self.dcp_core(cache, topk, metadata, batch)
-        lens = to_cute(lengths[:reqs], 4)
-        boxes = to_cute(box.partial[p]), to_cute(box.lse[p], 4)
-        peers = to_cute(box.peers, 8), to_cute(box.lse_peers, 8)
-        gate = to_cute(projected[:, 2112:])
-        # DcpValue's [B, 1, DCP * H] views of FlashMLA's padded-head rows and LSE.
-        heads, padded = self.heads * self.dcp, box.q_heads
-        latent = latent.as_strided((batch, 1, heads, 512), (padded * 512, 0, 512, 1))
-        lse = lse.as_strided((batch, 1, heads), (padded, 0, 1))
-        v_args = (to_cute(latent), to_cute(lse, 4), lens, *boxes, *peers, mailbox, uv)
-        value(*v_args, gate, lens, to_cute(out), cutlass.Int32(p), publish[2], s)
-        return out
-
-    def run_index(self, x, index_slots, batch, index):
-        """FP8 indexer query and head weights; the key into the indexer cache."""
-        iq = self.index_projection.run(self.qc[:batch], self.iq[:batch])
-        rows = to_cute(self.q_fp8[:batch]), to_cute(self.head_w[:batch], 4)
-        key = to_cute(self.indexer.k_cache.kv_cache), to_cute(index_slots[:batch], 8)
-        s = stream(self.device)
-        index(x, to_cute(iq), *self.key_norm, *key, *rows, self.key_eps, s)
+        _, index, value = self.kernels[batch, q]
+        stage = self.query_stage
+        publish = publish_args(box, p)
+        join = self.run_query(projected, cache, slots, q, publish)
+        self.run_index(index, projected, index_slots, q)
+        core = self.dcp_core(cache, None, metadata, batch, projected, join, q)
+        uv = stage.views[4]
+        if box.mailbox(batch).format == PROJECTED:
+            uv = self.uv_gathered[1]
+        args = value, box, p, publish, self.heads, core, lengths[:reqs], uv
+        return run_value(*args, projected, out)
 
     def run(self, projected, out, *, cache, slots, index_slots, metadata, q=1):
         """``projected``: the packed projection rows; ``out`` [B, H * 128] gets the
@@ -489,20 +550,19 @@ class PreparedDsa:
             return self.run_dcp(projected, out, *args)
         batch, s = projected.shape[0], stream(self.device)
         reqs = batch // q
-        lengths = metadata.seq_lens
-        _, lengths, _ = pad_requests(reqs, metadata.block_table, lengths)
-        mq, index, value = self.kernels[batch, q]
-        qnorm, kvnorm, qb, uk, uv = self.views
-        kv = to_cute(cache.view(torch.uint8))
-        q_scale_inv, k_scale_inv = (to_cute(t, 4) for t in self.scales_inv)
-        x, q_slots = to_cute(projected), to_cute(slots[:batch], 8)
-        scales = q_scale_inv, k_scale_inv, self.eps
-        q_args = (x, qnorm, kvnorm, qb, uk, kv, q_slots, *scales)
-        mq(*q_args, to_cute(self.query[:batch]), to_cute(self.qc[:batch]), s)
-        self.run_index(x, index_slots, batch, index)
-        topk = self.indexer_core(projected, batch)
-        latent = self.sparse_core(cache, topk, metadata, batch, q)
+        _, lengths, _ = pad_requests(reqs, metadata.block_table, metadata.seq_lens)
+        _, index, value = self.kernels[batch, q]
+        stage = self.query_stage
+        join = self.run_query(projected, cache, slots, q)
+        self.run_index(index, projected, index_slots, q)
+        if self.fused is not None:
+            latent = self.fused_core(cache, metadata, batch, q, join)
+        else:
+            topk = self.indexer_core(projected, batch)
+            if join is not None:
+                join()
+            latent = self.sparse_core(cache, topk, metadata, batch, q)
         gate = to_cute(projected[:, slice(*gate_columns(self.heads))])
-        lens = to_cute(lengths[:reqs], 4)
+        lens, uv = to_cute(lengths[:reqs], 4), stage.views[4]
         value(to_cute(latent[:, : self.heads]), uv, gate, lens, to_cute(out), s)
         return out

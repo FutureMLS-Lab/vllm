@@ -23,7 +23,6 @@ from ..common.primitives import (
     load_words,
     mma_into,
     push_float,
-    sigmoid,
     smem_words,
     store_f32x4,
     unpack_bf16,
@@ -41,38 +40,51 @@ load_staged = partial(
 )
 
 
-@asm((Float32, Int32), pure=True)
-def reciprocal_guess(denominator):
-    """``sigmoid_reciprocal``'s refined fast path (IEEE mode) and whether it holds."""
-    code = "{ .reg .f32 r,error,neg_error; .reg .b32 bits; .reg .pred regular; "
-    code += "mov.b32 bits,$2; add.u32 bits,bits,0x01800000; "
-    code += "and.b32 bits,bits,0x7f800000; setp.gt.u32 regular,bits,0x01ffffff; "
-    code += "rcp.approx.ftz.f32 r,$2; fma.rn.f32 error,$2,r,0fbf800000; "
-    code += "neg.f32 neg_error,error; fma.rn.f32 $0,r,neg_error,r; "
-    return code + "selp.u32 $1,1,0,regular; }", "=f,=r,f", (denominator,)
+# The stock composed decode's Triton math (causal_conv1d_update, fused_recurrent_kda,
+# rms_norm_gated): tl.exp is ex2.approx of x * log2(e), tl.sqrt is sqrt.approx.ftz and
+# an FP32 ``/`` is div.full.f32. For a positive divisor b that is a * rcp.approx(b)
+# bit for bit, with a and b first scaled by 1/4 when b > 2^126
+# (test_div_full_is_reciprocal_product); so it is computed as that, without
+# div.full's slow-path branch, and the reciprocal of a shared divisor once. The
+# flush-to-zero forms of ex2 and rcp (no subnormal fixups) give the same bits here:
+# every exp below is either added to 1 or at least e^-5 (or A = exp(A_log), which
+# only scales a sigmoid's argument), and every reciprocal is of a value in [1e-3,
+# 2^126].
+@asm(Float32, pure=True)
+def triton_exp(value):
+    code = "{ .reg .f32 t; mul.f32 t,$1,0f3FB8AA3B; ex2.approx.ftz.f32 $0,t; }"
+    return code, "=f,f", (value,)
 
 
 @asm(Float32, pure=True)
-def reciprocal_rn(value):
-    return "div.rn.f32 $0,0f3f800000,$1;", "=f,f", (value,)
+def div_full(numerator, denominator):
+    """The quotient by a positive denominator as div.full.f32 computes it."""
+    code = "{ .reg .f32 a,b,r; .reg .pred big; mov.f32 a,$1; mov.f32 b,$2; "
+    code += "setp.gt.f32 big,b,0f7E800000; @big mul.f32 a,a,0f3E800000; "
+    code += "@big mul.f32 b,b,0f3E800000; rcp.approx.ftz.f32 r,b; mul.f32 $0,a,r; }"
+    return code, "=f,f,f", (numerator, denominator)
+
+
+@asm(Float32, pure=True)
+def reciprocal(value):
+    """1 / x as div.full.f32 computes it for 2^-126 <= x <= 2^126."""
+    return "rcp.approx.ftz.f32 $0,$1;", "=f,f", (value,)
+
+
+@asm(Float32, pure=True)
+def mul_rn(a, b):
+    return "mul.f32 $0,$1,$2;", "=f,f,f", (a, b)
+
+
+@asm(Float32, pure=True)
+def sqrt_approx(value):
+    return "sqrt.approx.ftz.f32 $0,$1;", "=f,f", (value,)
 
 
 @cute.jit
-def sigmoids(values):
-    """``sigmoid(v, False)`` of every value, bit for bit, with all fast paths ahead
-    of the division fallbacks' branches (verify tokens get ILP)."""
-    count: cutlass.Constexpr = len(values)
-    den = [Float32(1) + cute.math.exp(-Float32(v), fastmath=True) for v in values]
-    result, regular = zeros(count, Float32), zeros(count, Int32)
-    irregular = Int32(0)
-    for i in cutlass.range_constexpr(count):
-        result[i], regular[i] = reciprocal_guess(den[i])
-        irregular |= regular[i] ^ 1
-    if irregular != 0:  # rare: one branch for the whole batch
-        for i in cutlass.range_constexpr(count):
-            if regular[i] == 0:
-                result[i] = reciprocal_rn(den[i])
-    return result
+def triton_sigmoid(value):
+    """tl.sigmoid: 1 / (1 + exp(-x))."""
+    return div_full(Float32(1), Float32(1) + triton_exp(-value))
 
 
 def advance(base, n):
@@ -118,7 +130,14 @@ class KdaSplit:
     ``record`` (verify only, RecoverSSM): the state slot is a checkpoint the verify
     leaves unchanged, and two more last tensors take the records the commit after
     sampling folds the accepted tokens in with: the correction [R, H, q, V] (FP32)
-    and the key and raw gate [R, H, q, 2K] (BF16), row R = request."""
+    and the key and raw gate [R, H, q, 2K] (BF16), row R = request.
+
+    Every step has the precision of the composed decode production runs (next to its
+    speculative config, at q = 1 too), Triton ``causal_conv1d_update`` ->
+    ``fused_recurrent_kda`` -> ``rms_norm_gated``: the convolution's Q/K/V and the
+    recurrence's output round to BF16, and every step uses the Triton formula
+    (x / (1 + exp(-x)), q / sqrt(|q|^2 + eps) * scale, 1 / sqrt(var + eps)) and
+    instructions."""
 
     def __init__(
         self,
@@ -142,8 +161,8 @@ class KdaSplit:
         self.gate_staged, self.tokens = early == 3, tokens
         assert gate_mode != 2 or not (early or cluster)
         assert tokens == 1 or not (self.staged or gate_mode == 2 or cluster == 16)
-        # TP8 (12 heads) uses fast math; B1 releases dependents at entry.
-        self.fast_math, self.trigger_at_entry = heads == 12, batch == 1
+        # B1 releases dependents at entry.
+        self.trigger_at_entry = batch == 1
         self.cluster = cluster or (8 if batch == 1 else 4)
         self.lanes_per_row = lanes or (8 if batch <= (4 if heads == 6 else 2) else 16)
         self.rows, self.groups = 128 // self.cluster, 128 // self.lanes_per_row
@@ -294,17 +313,13 @@ class KdaSplit:
                             term = Float32(term)
                             cf = Float32(coeff[s, i]) if self.early else coeff[s, i]
                             acc = accum[3 * t + s]
-                            accum[3 * t + s] = fma(term, cf, acc, ftz=self.fast_math)
-                act = lambda i, value: sigmoid(value, self.fast_math)
-                if cutlass.const_expr(T > 1 and not self.fast_math):
-                    raw = [accum[i] for i in range(3 * T)] + betas + gates
-                    act = partial(lambda batch, i, value: batch[i], sigmoids(raw))
+                            accum[3 * t + s] = fma(term, cf, acc)
                 for t in cutlass.range_constexpr(T):
-                    q = accum[3 * t] * act(3 * t, accum[3 * t])
-                    k = accum[3 * t + 1] * act(3 * t + 1, accum[3 * t + 1])
-                    v = accum[3 * t + 2] * act(3 * t + 2, accum[3 * t + 2])
-                    betas[t] = act(3 * T + t, Float32(betas[t]))
-                    gates[t] = act(4 * T + t, Float32(gates[t]))
+                    q = self.silu(accum[3 * t])
+                    k = self.silu(accum[3 * t + 1])
+                    v = self.silu(accum[3 * t + 2])
+                    betas[t] = self.sigmoid(Float32(betas[t]))
+                    gates[t] = self.sigmoid(Float32(gates[t]))
                     shared_q[advance(thread, 128 * t)] = q
                     shared_k[advance(thread, 128 * t)] = k
                     if cutlass.const_expr(self.record):  # noqa: SIM102
@@ -327,17 +342,23 @@ class KdaSplit:
                 cute.arch.barrier(barrier_id=1, number_of_threads=128)
 
                 def factors(t):
+                    """The inverse norms of q and k: 1 / |q|, 1 / |k| (< 2^64)."""
                     r = lambda i: reductions[8 * t + i]
-                    qn = (r(0) + r(2)) + (r(1) + r(3))
-                    kn = (r(4) + r(6)) + (r(5) + r(7))
-                    fq = cute.math.rsqrt(qn + 1.0e-6, fastmath=True) * scale
-                    return fq, cute.math.rsqrt(kn + 1.0e-6, fastmath=True)
+                    qn = (r(0) + r(2)) + (r(1) + r(3)) + 1.0e-6
+                    kn = (r(4) + r(6)) + (r(5) + r(7)) + 1.0e-6
+                    return reciprocal(sqrt_approx(qn)), reciprocal(sqrt_approx(kn))
+
+                def normalize(value, factor, query):  # q / |q| * scale
+                    value = mul_rn(value, factor)
+                    return mul_rn(value, scale) if query else value
 
                 if cutlass.const_expr(T > 1):  # normalize each token's q, k once
                     for t in cutlass.range_constexpr(T):
                         fq, fk = factors(t)
-                        shared_q[128 * t + thread] = qks[2 * t] * fq
-                        shared_k[128 * t + thread] = qks[2 * t + 1] * fk
+                        q_n = normalize(qks[2 * t], fq, True)
+                        k_n = normalize(qks[2 * t + 1], fk, False)
+                        shared_q[128 * t + thread] = q_n
+                        shared_k[128 * t + thread] = k_n
                     cute.arch.barrier(barrier_id=1, number_of_threads=128)
 
                 def operands(t):
@@ -353,8 +374,8 @@ class KdaSplit:
                             advance(shared_k.iterator, 128 * t) + column, shared=True
                         )
                         for e in cutlass.range_constexpr(4):
-                            qr[j, e] = q4[e] * fq if T == 1 else q4[e]
-                            kr[j, e] = k4[e] * fk if T == 1 else k4[e]
+                            qr[j, e] = normalize(q4[e], fq, True) if T == 1 else q4[e]
+                            kr[j, e] = normalize(k4[e], fk, False) if T == 1 else k4[e]
                     if cutlass.const_expr(t == 0):
                         wait(gate_barrier)
                     decays = []
@@ -397,14 +418,16 @@ class KdaSplit:
                         for p in cutlass.range_constexpr(start, stop):
                             row = p * self.groups + group
                             send = (row < self.rows) & (group_lane == 0)
+                            o = dots[p]
+                            o = Float32(BFloat16(o))  # stored BF16
                             if cutlass.const_expr(T > 1):  # predicated: no branches
                                 position = self.output_position(value_base + row)
                                 dst = advance(shared_o.iterator, 128 * t) + position
-                                push_float(dst, dots[p], bar, owner, when=send)
+                                push_float(dst, o, bar, owner, when=send)
                             elif send:
                                 position = self.output_position(value_base + row)
                                 dst = shared_o.iterator + position
-                                store_async_dsmem(dst, float_bits(dots[p]), bar, owner)
+                                store_async_dsmem(dst, float_bits(o), bar, owner)
                         if cutlass.const_expr(not self.record):
                             rows = partial(state_row, s=page(writes[t]))
                             when = None if T == 1 else writes[t] > 0
@@ -432,7 +455,8 @@ class KdaSplit:
                             s0, s1, s2, s3 = (o * o for o in o4)
                             sums[g] = warp_sum((s0 + s2) + (s1 + s3), 8)
                         sumsq = (sums[0] + sums[2]) + (sums[1] + sums[3])
-                        rstd = cute.math.rsqrt(sumsq * (1.0 / 128) + eps, fastmath=True)
+                        variance = sumsq * (1.0 / 128) + eps
+                        rstd = reciprocal(sqrt_approx(variance))
                         result = raw_o * rstd * nw * gates[t]
                         output[advance(token, t), qk_channel] = BFloat16(result)
                         if cutlass.const_expr(t == 0):
@@ -500,9 +524,7 @@ class KdaSplit:
                     corrections[value_base + safe_row] = v_new
             for j in cutlass.range_constexpr(self.chunks):
                 for e in cutlass.range_constexpr(4):
-                    history[p, j, e] = fma(
-                        kr[j, e], v_new, history[p, j, e], ftz=self.fast_math
-                    )
+                    history[p, j, e] = fma(kr[j, e], v_new, history[p, j, e])
             dots[p] = self.row_dot(history, qr, p)
         for shift in reversed(range(self.lanes_per_row.bit_length() - 1)):
             for p in cutlass.range_constexpr(start, stop):
@@ -645,11 +667,7 @@ class KdaSplit:
                     )
                 raw_g.append(Float32(BFloat16(value)))
 
-        decay = []
-        for r in cutlass.range_constexpr(per):
-            gate = cute.math.exp(a, fastmath=True) * (raw_g[r] + dt[r])
-            gate = sigmoid(gate, self.fast_math)
-            decay.append(cute.math.exp(lower_bound * gate, fastmath=True))
+        decay = [self.decay(a, raw_g[r], dt[r], lower_bound) for r in range(per)]
         packets: cutlass.Constexpr = rows // 4
         packet, destination = lane % packets, lane // packets
         values = cute.make_rmem_tensor(4, Float32)
@@ -704,9 +722,7 @@ class KdaSplit:
                     parts = [acc[c, tile, e + column] for c in range(4)]
                     value = Float32(0) + (((value + parts[1]) + parts[2]) + parts[3])
                 raw_g = Float32(BFloat16(value))
-                gate = cute.math.exp(a, fastmath=True) * (raw_g + dt[i])
-                gate = sigmoid(gate, self.fast_math)
-                decay = float_bits(cute.math.exp(lower_bound * gate, fastmath=True))
+                decay = float_bits(self.decay(a, raw_g, dt[i], lower_bound))
                 token = 2 * quarter + column
                 offset = token * 128 + value_base + features[i]
                 pointer = shared_decay.iterator + offset
@@ -716,6 +732,22 @@ class KdaSplit:
                     if cutlass.const_expr(key_gate is not None):
                         feature = 128 + value_base + features[i]
                         key_gate[token, feature] = BFloat16(raw_g)
+
+    @cute.jit
+    def silu(self, value):
+        """The convolution's SiLU: x / (1 + exp(-x)), stored BF16."""
+        silu = div_full(value, Float32(1) + triton_exp(-value))
+        return Float32(BFloat16(silu))
+
+    @cute.jit
+    def sigmoid(self, value):
+        return triton_sigmoid(value)
+
+    @cute.jit
+    def decay(self, a_log, raw_g, dt, lower_bound):
+        """exp(lower_bound * sigmoid(exp(A_log) * (raw_g + dt_bias)))."""
+        gate = lower_bound * triton_sigmoid(triton_exp(a_log) * (raw_g + dt))
+        return triton_exp(gate)
 
     @staticmethod
     def split_pairs(wr, tile, chunk, low, high):
@@ -748,7 +780,7 @@ class KdaSplit:
         partial = cute.make_rmem_tensor(self.chunks, Float32)
         for j in cutlass.range_constexpr(self.chunks):
             row = (history[p, j, e] for e in range(4))
-            partial[j] = dot(row, (vector[j, e] for e in range(4)), ftz=self.fast_math)
+            partial[j] = dot(row, (vector[j, e] for e in range(4)))
         for shift in cutlass.range_constexpr(self.chunks.bit_length() - 2, -1, -1):
             for j in cutlass.range_constexpr(1 << shift):
                 partial[j] += partial[j + (1 << shift)]

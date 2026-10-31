@@ -77,7 +77,7 @@ def compile_experts(tp, experts, batch, grid, device, publish=False, *knobs):
     out = flat(batch * 16 * (1 if publish else 3584), c.BFloat16)
     maps = flat(768 if moe.paired else 256, align=64)
     tensors = (x, ids, maps, *scales, flat(moe.workspace_bytes), out)
-    scalars = (c.Int32(batch), *map(c.Float32, (100, 0.25, 0.04)), *box)
+    scalars = (c.Int32(batch), *map(c.Float32, (4, 25, 0.25, 0.04)), *box)
     with torch.accelerator.device_index(device):
         return cute.compile(moe, *tensors, *scalars, make_fake_stream())
 
@@ -121,7 +121,7 @@ class PersistentExperts:
         # one-wave tail; grouped B9-64 on 152.
         grids = "3-4:148,5-6:128,7:132,9-64:152" if self.tp == 8 else ""
         self.grids = batch_table(grids)
-        scalars = (beta * linear_beta, 1 / beta, 1 / linear_beta)
+        scalars = (beta, linear_beta, 1 / beta, 1 / linear_beta)
         self.scalars = tuple(map(c.Float32, scalars))
         # The experts kernel uses maps 0-1 (L2 promotion on w13); the TP8 B1 cluster
         # experts use maps 2-4 (w13, w2 two-chunk and one-chunk boxes, promoted); TP8

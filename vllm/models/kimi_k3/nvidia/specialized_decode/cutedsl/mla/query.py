@@ -6,7 +6,8 @@ Static weights load before the PDL wait; current-token data is consumed after it
 DSA (``dsa=True``, Kimi K3.1): the normalized q_c rows are also stored for the indexer
 query projection. On FlashMLA sparse the query rows are BF16 and the KV row is written
 in the fp8_ds_mla layout (per 128-column power-of-two scales, BF16 k_pe); with ``fp8``
-(FlashInfer sparse) both are per-tensor FP8 as for dense MLA."""
+(FlashInfer sparse) both are per-tensor FP8 as for dense MLA, or (``nvfp4``, prims_ts)
+the query is per-tensor FP8 and the KV row is written in the nvfp4_ds_mla layout."""
 
 import cutlass
 import cutlass.cute as cute
@@ -20,6 +21,8 @@ from ..common.primitives import (
     copy_evict,
     copy_g2s,
     copy_s2cluster,
+    div_rn,
+    ds_tile_scale,
     float_bits,
     fma,
     fma2,
@@ -32,6 +35,8 @@ from ..common.primitives import (
     mma_into,
     mul2,
     multicast_words,
+    nvfp4_scale,
+    pack_e2m1,
     pack_fp8,
     prefetch_l2,
     published,
@@ -55,6 +60,9 @@ TILED_FROM = {12: 4, 6: 6}
 Q_SENT = 0xFFFFFFFF  # q mailbox sentinel: four FP8 0xFF bytes, never written
 # fp8_ds_mla row: 512 FP8 latent bytes, 4 FP32 tile scales, 64 BF16 k_pe.
 DS_SCALES, DS_ROPE = 512, 528
+# nvfp4_ds_mla row (352 B): 512 E2M1 latent values, 64 unscaled E4M3 k_pe, then the
+# E4M3 scales of the 32 16-value blocks (block s at byte 8 * (s % 4) + s // 4).
+NVFP4_ROPE, NVFP4_SCALES = 256, 320
 
 
 @cute.jit
@@ -85,7 +93,18 @@ class MlaQuery:
     bytes it wrote into head block ``rank`` of every rank's Lamport q mailbox
     (mla.dcp.DcpBox), then polls its share of the gathered mailbox until no word is
     the sentinel, so the next kernel reads the gathered query. DSA publishes BF16
-    rows into a mailbox of ``q_heads`` (FlashMLA's padding) rows per token."""
+    rows into a mailbox of ``q_heads`` (FlashMLA's padding) rows per token. Above 64
+    rows (several tiles per head, more CTAs than one wave) each tile polls only its
+    own tokens, so a resident tile never waits for one that is not yet scheduled.
+
+    DSA query overlap (dsa.overlap): ``store_qc=False`` leaves the q_c rows to
+    QueryNorm and ``poll=False`` leaves the mailbox poll to QueryWait.
+
+    Stock numerics: K3 MLA normalizes q_a as the Triton fused_q_kv_rmsnorm, K3.1 DSA
+    (``dsa``) as vllm_c's rms_norm and writes as concat_and_cache_(ds_)mla. A per-tensor
+    FP8 KV row is divided by k_scale (``args[8]``) as concat_and_cache_mla does under
+    DSA, and multiplied by its inverse (``args[8]``) as K3 MLA's fused insert does.
+    """
 
     def __init__(
         self,
@@ -96,13 +115,32 @@ class MlaQuery:
         dcp: int = 0,
         dsa: bool = False,
         fp8: bool = False,
+        nvfp4: bool = False,
         q_heads: int = 0,
+        store_qc: bool = True,
+        poll: bool = True,
+        late: bool = False,
+        release: bool = True,
     ):
+        assert not nvfp4 or (dsa and fp8), "nvfp4_ds_mla takes the FP8 DSA query"
+        # The q_a RMSNorm in the Triton form (K3 MLA), else vllm_c's (K3.1 DSA).
+        self.triton_norms = not dsa
         tiled = TILED_FROM[heads]
         self.heads, self.batch, self.wide = heads, batch, batch >= tiled
         self.dcp, self.dsa = dcp, dsa
+        self.qc_rows, self.poll = dsa and store_qc, dcp and poll
+        # DSA "late" query overlap (TP): launched after the indexer's last kernel,
+        # whose inputs it does not read, it runs beside it and waits for it (the
+        # PDL dependency) only at its end, so the sparse core still waits for both.
+        assert not late or (dsa and not dcp), "late: the TP DSA query only"
+        self.late = late
+        # release: launch the next kernel early (PDL); off when it reads this
+        # kernel's outputs before its own PDL wait (FlashInfer prims_ts' split-KV
+        # decode after a late query).
+        self.release = release
         # fp8_ds_mla cache with a BF16 query (FlashMLA sparse), else per-tensor FP8.
         self.ds = dsa and not fp8
+        self.nvfp4 = nvfp4  # nvfp4_ds_mla KV rows (FlashInfer prims_ts)
         # q mailbox geometry: rows per token, element bytes, args index of the box.
         self.q_heads = q_heads or dcp * heads
         self.q_bytes, self.box_arg = 2 if self.ds else 1, 12 if dsa else 11
@@ -113,6 +151,7 @@ class MlaQuery:
         if self.wide:
             self.tokens = 16 if batch <= 16 else 32 if batch <= 32 or heads < 8 else 64
         self.grid = (self.cluster, heads, (batch + self.tokens - 1) // self.tokens)
+        self.tile_poll = self.wide and batch > 64
         carveout = 100 if batch > 1 else None
         self.options = dict(cluster=self.cluster, preferred_smem_carveout=carveout)
         self.q_b_cp_async = q_b_cp_async
@@ -160,17 +199,24 @@ class MlaQuery:
                 multicast_words(address, word, kind="b32")
 
     @cute.jit
-    def gathered(self, args, tid):
+    def gathered(self, args, tid, tok0=0):
         """DCP: poll this CTA's share of the gathered mailbox (16 B chunks of the
-        B x DCP*H x 576 bytes) until every rank's bytes have landed."""
+        B x DCP*H x 576 bytes) until every rank's bytes have landed (``tile_poll``:
+        the share of this tile's tokens from ``tok0``)."""
         mailbox = args[self.box_arg]
         part, head, tile = cute.arch.block_idx()
-        threads: cutlass.Constexpr = self.grid[0] * self.grid[1] * self.grid[2] * 256
         row: cutlass.Constexpr = 36 * self.q_bytes  # 16 B chunks per head row
         token: cutlass.Constexpr = self.dcp * self.heads * row  # published per token
-        chunks: cutlass.Constexpr = self.batch * token
-        first = ((tile * self.heads + head) * self.cluster + part) * 256 + tid
-        last = chunks - 1  # threads past the end re-poll it
+        tiles: cutlass.Constexpr = 1 if self.tile_poll else self.grid[2]
+        threads: cutlass.Constexpr = self.grid[0] * self.grid[1] * tiles * 256
+        polled: cutlass.Constexpr = self.tokens if self.tile_poll else self.batch
+        chunks: cutlass.Constexpr = polled * token
+        if cutlass.const_expr(self.tile_poll):
+            first = tok0 * token + (head * self.cluster + part) * 256 + tid
+            last = (tok0 + min(self.tokens, self.batch - tok0)) * token - 1
+        else:
+            first = ((tile * self.heads + head) * self.cluster + part) * 256 + tid
+            last = chunks - 1  # threads past the end re-poll it
         for i0 in cutlass.range_constexpr(0, -(-chunks // threads), 8):
             n: cutlass.Constexpr = min(8, -(-chunks // threads) - i0)
             picks = [min(first + (i0 + i) * threads, last) for i in range(n)]
@@ -231,8 +277,7 @@ class MlaQuery:
                 src = w_qb.iterator + (head * 192 + part * R) * 1536 + c * 8
                 copy_evict(dst, src)
             cute.arch.cp_async_commit_group()
-        cute.arch.griddepcontrol_wait()
-        cute.arch.griddepcontrol_launch_dependents()
+        self.pdl_start()
         qsi = q_scale_inv[0]
         xv = cute.make_rmem_tensor((B, 8), Float32)
         for b in cutlass.range_constexpr(B):
@@ -253,11 +298,11 @@ class MlaQuery:
                 total = Float32(0)
                 for w in cutlass.range_constexpr(8):
                     total += ss[w, b]
-                rr = query_norm_rsqrt(total, eps)
+                rr = query_norm_rsqrt(total, eps, triton=self.triton_norms)
                 for i in cutlass.range_constexpr(8):
                     xq[b, tid * 8 + i] = BFloat16(xv[b, i] * rr * weights[i])
         cute.arch.sync_threads()
-        if cutlass.const_expr(self.dsa):
+        if cutlass.const_expr(self.qc_rows):
             self.store_qc(args, xq.iterator, 1536, tok0, B, (part, head), tid)
         if cutlass.const_expr(self.q_b_cp_async):
             cute.arch.cp_async_wait_group(0)
@@ -321,10 +366,33 @@ class MlaQuery:
         valid = (head == 0) & (part < B) & self.live(tok0 + part)
         if cutlass.const_expr(self.ds):
             self.insert_ds(args, ss, tok0, part, valid, tid)
+        elif cutlass.const_expr(self.nvfp4):
+            self.insert_nvfp4(args, ss, tok0, part, valid, tid)
         else:
             self.insert(args, ss, tok0, part, valid, tid)
-        if cutlass.const_expr(self.dcp):
+        if cutlass.const_expr(self.poll):
             self.gathered(args, tid)
+        if cutlass.const_expr(self.late):
+            cute.arch.griddepcontrol_wait()
+
+    @cute.jit
+    def pdl_start(self):
+        """The PDL wait for the kernel before (late: none, see __init__) and the
+        early launch of the next one."""
+        if cutlass.const_expr(not self.late):
+            cute.arch.griddepcontrol_wait()
+        if cutlass.const_expr(self.release):
+            cute.arch.griddepcontrol_launch_dependents()
+
+    @cute.jit
+    def kv_fp8(self, value, scale):
+        """The pre-FP8 value of a per-tensor FP8 KV element: under DSA divided by
+        k_scale (concat_and_cache_mla), else times its inverse (K3 MLA's insert)."""
+        if cutlass.const_expr(self.dsa):  # noqa: SIM108 (compile time)
+            value = div_rn(value, scale)
+        else:
+            value = value * scale
+        return value
 
     @cute.jit
     def insert(self, args, ss, tok0, j, valid, tid):
@@ -341,7 +409,7 @@ class MlaQuery:
         if valid:
             slot = slots[tok0 + j]
         if slot >= 0:
-            ksi = k_scale_inv[0]
+            ks = k_scale_inv[0]  # k_scale under DSA, else its inverse
             xx = cute.make_rmem_tensor(8, Float32)
             total = Float32(0)
             if tid < 64:
@@ -361,18 +429,19 @@ class MlaQuery:
                 weights = load_bf16x8(w_kva.iterator + tid * 8)
                 for i in cutlass.range_constexpr(8):
                     normed = Float32(BFloat16(xx[i] * rr * weights[i]))
-                    cache[page, offset, tid * 8 + i] = fp8_bits(normed * ksi)
+                    cache[page, offset, tid * 8 + i] = fp8_bits(self.kv_fp8(normed, ks))
             elif tid < 72:
                 c = tid - 64
                 values = load_bf16x8(at(qkv, tok0 + j, 2048 + c * 8), mutable=True)
                 for i in cutlass.range_constexpr(8):
-                    cache[page, offset, 512 + c * 8 + i] = fp8_bits(values[i] * ksi)
+                    value = self.kv_fp8(values[i], ks)
+                    cache[page, offset, 512 + c * 8 + i] = fp8_bits(value)
 
     @cute.jit
     def insert_ds(self, args, ss, tok0, j, valid, tid):
         """``insert`` in the fp8_ds_mla layout: each 128-column tile of the RMSNormed
-        BF16 latent is scaled by pow2_ceil(max(amax / 448, 1e-4)) (16 lanes per
-        tile), and k_pe is stored unquantized."""
+        BF16 latent is scaled by the stock writer's exp2(ceil(log2(max(amax / 448,
+        1e-4)))) (16 lanes per tile), and k_pe is stored unquantized."""
         qkv, w_kva, (cache, slots), eps = args[0], args[2], args[5:7], args[9]
         lane, warp = tid % 32, tid // 32
         slot = cutlass.Int64(-1)
@@ -401,7 +470,7 @@ class MlaQuery:
                     xx[i] = Float32(BFloat16(xx[i] * rr * weights[i]))
                     amax = cute.arch.fmax(amax, abs(xx[i]))
                 amax = half_warp_max(amax)
-                scale = pow2_ceil(cute.arch.fmax(amax / Float32(448), Float32(1e-4)))
+                scale = ds_tile_scale(amax)
                 inverse = Float32(1) / scale
                 words = [
                     pack_fp8(tuple(xx[4 * w + i] * inverse for i in range(4)))
@@ -417,6 +486,56 @@ class MlaQuery:
                     at(qkv, tok0 + j, 2048 + c * 8), count=4, mutable=True
                 )
                 store_words(at(cache, page, offset, DS_ROPE + c * 16), words)
+
+    @cute.jit
+    def insert_nvfp4(self, args, ss, tok0, j, valid, tid):
+        """``insert`` in the nvfp4_ds_mla layout (byte-exact with vLLM's writer): each
+        16-value block of the RMSNormed BF16 latent (two lanes) gets the E4M3 scale
+        sf = max(amax / 6, 2^-9) and is stored as E2M1 of x * (1 / sf); k_pe is
+        stored as unscaled E4M3."""
+        qkv, w_kva, (cache, slots), eps = args[0], args[2], args[5:7], args[9]
+        lane, warp = tid % 32, tid // 32
+        slot = cutlass.Int64(-1)
+        if valid:
+            slot = slots[tok0 + j]
+        if slot >= 0:
+            xx = cute.make_rmem_tensor(8, Float32)
+            total = Float32(0)
+            if tid < 64:
+                values = load_bf16x8(at(qkv, tok0 + j, 1536 + tid * 8), mutable=True)
+                for i in cutlass.range_constexpr(8):
+                    xx[i] = values[i]
+                    total = fma(values[i], values[i], total)
+            total = warp_sum(total)
+            cute.arch.sync_threads()
+            if (lane == 0) & (warp < 2):
+                ss[warp, 0] = total
+            cute.arch.sync_threads()
+            page, offset = slot // cache.shape[1], slot % cache.shape[1]
+            if tid < 64:
+                mean = fma(ss[0, 0] + ss[1, 0], Float32(1 / 512), eps)
+                rr = cute.math.rsqrt(mean, fastmath=True)
+                weights = load_bf16x8(w_kva.iterator + tid * 8)
+                amax = Float32(0)
+                for i in cutlass.range_constexpr(8):
+                    xx[i] = Float32(BFloat16(xx[i] * rr * weights[i]))
+                    amax = cute.arch.fmax(amax, abs(xx[i]))
+                amax = cute.arch.fmax(amax, cute.arch.shuffle_sync_bfly(amax, 1))
+                code, inverse = nvfp4_scale(amax)
+                word = pack_e2m1(tuple(xx[i] * inverse for i in range(8)))
+                store_words(at(cache, page, offset, tid * 4), (word,))
+                if lane % 2 == 0:
+                    s = tid // 2
+                    byte = NVFP4_SCALES + 8 * (s % 4) + s // 4
+                    cache[page, offset, byte] = cutlass.Uint8(code)
+            elif tid < 72:
+                c = tid - 64
+                values = load_bf16x8(at(qkv, tok0 + j, 2048 + c * 8), mutable=True)
+                words = tuple(
+                    pack_fp8(tuple(values[4 * w + i] for i in range(4)))
+                    for w in range(2)
+                )
+                store_words(at(cache, page, offset, NVFP4_ROPE + c * 8), words)
 
     @cute.jit
     def store_qc(self, args, rows, pitch, tok0, tokens, block, tid):
@@ -480,8 +599,7 @@ class MlaQuery:
         if tid < 192:
             copy_evict(qa.iterator + tid * 8, w_qa.iterator + tid * 8)
         cute.arch.cp_async_commit_group()
-        cute.arch.griddepcontrol_wait()
-        cute.arch.griddepcontrol_launch_dependents()
+        self.pdl_start()
         for c in range(tid, T * 192, 256):
             t, j = c // 192, c % 192
             if self.live(tok0 + t):
@@ -490,10 +608,13 @@ class MlaQuery:
         qsi = q_scale_inv[0]
         # The KV insert overlaps the staging of x (CTA j of the tile owns request j).
         j = head * self.cluster + part
+        valid = (j < T) & self.live(tok0 + j)
         if cutlass.const_expr(self.ds):
-            self.insert_ds(args, ss, tok0, j, (j < T) & self.live(tok0 + j), tid)
+            self.insert_ds(args, ss, tok0, j, valid, tid)
+        elif cutlass.const_expr(self.nvfp4):
+            self.insert_nvfp4(args, ss, tok0, j, valid, tid)
         else:
-            self.insert(args, ss, tok0, j, (j < T) & self.live(tok0 + j), tid)
+            self.insert(args, ss, tok0, j, valid, tid)
         cute.arch.cp_async_wait_group(0)
         cute.arch.sync_threads()
         # Packed FP32 pairs: the same IEEE ops in the same order as the scalar form.
@@ -516,7 +637,8 @@ class MlaQuery:
                     x = values[h][e], values[h][e + 1]
                     chains[e % 4 // 2] = fma2(x, x, chains[e % 4 // 2])
                 (c0, c1), (c2, c3) = chains
-                rr.append(query_norm_rsqrt(warp_sum((c0 + c1) + (c2 + c3)), eps))
+                total = warp_sum((c0 + c1) + (c2 + c3))
+                rr.append(query_norm_rsqrt(total, eps, triton=self.triton_norms))
             for h in cutlass.range_constexpr(2):
                 for i in cutlass.range_constexpr(6):
                     words = []
@@ -527,7 +649,7 @@ class MlaQuery:
                     store_shared_words(xrows[h] + 256 * i + 8 * lane, tuple(words))
         qbr = [[load_words(address, count=4) for address in chunk] for chunk in qb_at]
         cute.arch.sync_threads()
-        if cutlass.const_expr(self.dsa):
+        if cutlass.const_expr(self.qc_rows):
             self.store_qc(args, xq.iterator, KP, tok0, T, (part, head), tid)
         acc = zeros((MT * 3, 4), Float32)
         for cc in cutlass.range_constexpr(6):
@@ -601,5 +723,7 @@ class MlaQuery:
         if cutlass.const_expr(self.dcp):
             self.publish(args, tok0, tid)
         cute.arch.cluster_wait()
-        if cutlass.const_expr(self.dcp):
-            self.gathered(args, tid)
+        if cutlass.const_expr(self.poll):
+            self.gathered(args, tid, tok0)
+        if cutlass.const_expr(self.late):
+            cute.arch.griddepcontrol_wait()
