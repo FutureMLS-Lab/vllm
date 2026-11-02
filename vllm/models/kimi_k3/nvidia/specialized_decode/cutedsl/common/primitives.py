@@ -275,11 +275,6 @@ def mul_rn(a: Float32, b: Float32):
     return "mul.rn.f32 $0,$1,$2;", "=f,f,f", (Float32(a), Float32(b))
 
 
-@asm(Float32, pure=True)
-def add_rn(a: Float32, b: Float32):
-    return "add.rn.f32 $0,$1,$2;", "=f,f,f", (Float32(a), Float32(b))
-
-
 @cute.jit
 def situ_gate(gate, beta):
     """The gate factor of the ``_C`` situ_and_mul kernel: (0.5 beta) * tanh(g *
@@ -301,9 +296,9 @@ def situ_up(up, linear_beta):
 
 @cute.jit
 def situ_and_mul(gate, up, beta, linear_beta):
-    """vLLM's ``SituAndMul`` as the deployment runs it, before the BF16 store: the op
-    enabled (custom_ops "all", e.g. compilation mode NONE under the breakable CUDA
-    graph), i.e. the ``_C`` situ_and_mul kernel, gate factor times up factor."""
+    """The ``SituAndMul`` op as the deployment runs it, before the BF16 store: the
+    op enabled (custom_ops "all", e.g. compilation mode NONE under the breakable
+    CUDA graph), i.e. the ``_C`` situ_and_mul kernel, gate factor times up factor."""
     return mul_rn(situ_gate(gate, beta), situ_up(up, linear_beta))
 
 

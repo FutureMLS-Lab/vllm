@@ -96,12 +96,27 @@ def dsa_on_flashinfer(attention) -> bool:
 def fi_kernels(kv_cache_dtype) -> tuple[str, ...]:
     """The sparse MLA kernels the specialized decode picks from per batch (FI_KERNEL):
     trtllm-gen and prims_ts on a per-tensor FP8 cache, prims_ts alone on an
-    nvfp4_ds_mla one (no trtllm-gen kernel reads it)."""
-    return ("prims_ts",) if kv_cache_dtype == "nvfp4_ds_mla" else KERNELS
+    nvfp4_ds_mla one (no trtllm-gen kernel reads it); under DCP on a per-tensor
+    FP8 cache also the specialized sparse decode ("sparse", attn_sparse) at the
+    batches attn_sparse.SPARSE_DCP gives it."""
+    if kv_cache_dtype == "nvfp4_ds_mla":
+        return ("prims_ts",)
+    return (*KERNELS, "sparse")
 
 
-def kernel_for(rows, dcp, kernels):
-    """The sparse MLA kernel of one batch: the measured choice among ``kernels``."""
+def kernel_for(rows, dcp, kernels, heads=None):
+    """The sparse MLA kernel of one batch: the measured choice among ``kernels``
+    (``heads``: the query heads; trtllm-gen takes at most 64 or exactly 128, so
+    unpadded 64 < H < 128 run prims_ts). Without DCP, 128 heads are TP1's 96
+    head-padded (fi_heads): the stock decode's kernel, trtllm-gen on a per-tensor
+    FP8 cache (its split-KV schedule; GB300 128K q5, 5 / 20 / 80 / 160 / 320 rows:
+    17.7 / 26.0 / 51.0 / 73.1 / 113.6 us, prims_ts 21.2 / 27.4 / 50.7 / 72.4 /
+    112.6), prims_ts on nvfp4_ds_mla."""
+    kernels = tuple(k for k in kernels if k in KERNELS)  # FlashInfer's only
+    if heads is not None and 64 < heads < 128:
+        kernels = tuple(k for k in kernels if k != "trtllm") or kernels
+    if heads == 128 and not dcp:
+        return "trtllm" if "trtllm" in kernels else kernels[0]
     if len(kernels) == 1:
         return kernels[0]
     choice = batch_table(FI_KERNEL["dcp" if dcp else "tp"]).get(rows, "prims_ts")

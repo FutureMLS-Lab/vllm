@@ -16,7 +16,7 @@ from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
 from ..cutedsl.dsa.attn_ds import TOPK
 from ..cutedsl.dsa.index import DIM, HEADS
 from ..cutedsl.dsa.prepared import QUERY_HEADS, PreparedDsa, dsa_on_flashinfer
-from ..cutedsl.gemm.projection import PreparedProjection
+from ..cutedsl.gemm.decode import DecodeProjection
 from ..cutedsl.kda.prepared import PreparedKda
 from ..cutedsl.mla.balanced import BalancedMla
 from ..cutedsl.mla.dcp import DcpBox, resolve_partials
@@ -36,17 +36,22 @@ ATTENTION_MAX = 320
 # o_proj, us per layer), per (layer kind, DCP):
 #   K3 MLA   TP8   R12 (60 rows) -5..-110; R16 (80) +12 at 8K, +7 at 32K
 #            DCP8  R12 -18..-123; R16 +4 at 8K
-#   K3.1 DSA TP8   R16 (80) wins at every context (stock / spec us, 8K 135.1 / 116.8
-#                  1.16x, 32K 180.1 / 131.5, 128K 276.7 / 216.8, AgentX 231.1 / 165.8:
-#                  1.28-1.39x); R32 (160) loses at 8K (175.8 / 182.8, 0.96x; 32K+
-#                  1.21-1.38x), R48 / R64 too (0.90x / 0.85x at 8K); PR #108 at
-#                  9829aeebbd, layer microbenchmark, L2 flushed
+#   K3.1 DSA TP8   with the per-row-count input projection (``DecodeProjection``:
+#                  cuBLAS past 64 rows) every row count to the cores' maximum (stock /
+#                  spec us; 8K, 32K, 128K, AgentX): R16 (80) 136.6 / 107.5, 194.8 /
+#                  128.6, 262.6 / 194.2, 231.3 / 157.3; R32 (160) 176.7 / 160.0,
+#                  290.4 / 200.9, 452.9 / 338.2, 370.0 / 248.7; R48 (240) 194.1 /
+#                  187.3, -, 555.6 / 443.7, 488.8 / 344.9; R64 (320) 233.0 / 238.2
+#                  (8K: +2%), 365.9 / 314.6, 658.1 / 539.5, 564.8 / 402.1 (1-GPU TP8
+#                  rank, fp8 KV, L2 flushed). The #108 split-K projection (64-column
+#                  tiles at every width) lost from R32 at 8K and capped TP8 at R16.
 #            DCP8  R64 (320, the cores' maximum) still -60..-71
-# The cap sits at the crossover, never past what the cores prepare (ATTENTION_MAX).
+# The cap sits at the crossover (TP8 R64: the 8K loss is 2%, the AgentX gain 29%),
+# never past what the cores prepare (ATTENTION_MAX).
 SPECIALIZED_ROWS = {
     ("mla", False): 64,
     ("mla", True): 64,
-    ("dsa", False): 80,
+    ("dsa", False): ATTENTION_MAX,
     ("dsa", True): ATTENTION_MAX,
 }
 
@@ -57,22 +62,26 @@ SPECIALIZED_ROWS = {
 # projection and core specialized up to its kind's crossover (rows; 0: stock), per
 # (layer kind, DCP). GB300, DSpark q5, fp8 KV (per layer, and per K3.1 step with
 # dummy weights, ms per step):
-#   K3.1 DSA  as SPECIALIZED_ROWS (projection + core + stock o_proj: TP8 to R16,
-#             DCP8 R64 -59..-70 us per layer); step DCP8 24K R16 / R32 / R48
+#   K3.1 DSA  as SPECIALIZED_ROWS (projection + core + stock o_proj: TP8 and DCP8
+#             to R64, DCP8 R64 -59..-70 us per layer); step DCP8 24K R16 / R32 / R48
 #             31.04 -> 29.72 / 40.74 -> 39.35 / 50.17 -> 47.67, R64 57.64 -> 55.79;
 #             TP8 24K R16 30.33 -> 29.55, 4K R16 / R32 29.71 -> 29.85 / 39.09 -> 38.71
 #   K3 MLA    the cores lose from R16 at short contexts (SPECIALIZED_ROWS)
-#   KDA       KdaSplit verify past 16 requests (no tuned schedule) is no clear win
-#             over the stock KDA: step with it vs without, TP8 4K R16 -0.95 / R32
-#             +1.84, DCP8 24K R16 +0.08 / R32 +0.57 / R48 +1.77 -> stock
-KDA_WIDE_ROWS = 0
+#   KDA       per verify kind (``recoverssm``: the deployment's KDA layers keep
+#             RecoverSSM records). RecoverSSM verify: KdaSplit, then KdaWide from
+#             384 (request, head) items (kda.prepared.WIDE_ITEMS), beats the stock
+#             RecoverSSM verify at every batch (TP8 12 heads, FP32 state and conv,
+#             q5, us per layer stock / spec: R16 39.1 / 16.1, R64 80.1 / 47.9,
+#             R128 139.3 / 81.8; its commit 45.3 -> 35.4 at R64).
+#             Plain verify (q state slots): KdaSplit past 16 requests is no clear
+#             win over the stock KDA (step with it vs without, TP8 4K R16 -0.95 /
+#             R32 +1.84, DCP8 24K R16 +0.08 / R32 +0.57 / R48 +1.77) -> stock.
+KDA_WIDE_ROWS = {True: ATTENTION_MAX, False: 0}
 WIDE_ROWS = {
     ("dsa", False): SPECIALIZED_ROWS["dsa", False],
     ("dsa", True): SPECIALIZED_ROWS["dsa", True],
     ("mla", False): 0,
     ("mla", True): 0,
-    ("kda", False): KDA_WIDE_ROWS,
-    ("kda", True): KDA_WIDE_ROWS,
 }
 
 
@@ -84,10 +93,12 @@ def step_cap(dsa: bool, dcp: bool) -> int:
     return min(PREPARED_MAX, *(SPECIALIZED_ROWS[kind, dcp] for kind in kinds))
 
 
-def wide_caps(dcp: bool) -> dict[str, int]:
+def wide_caps(dcp: bool, recoverssm: bool = False) -> dict[str, int]:
     """Per attention layer kind, the most rows of a wide step its specialized input
-    projection and core take (0: the stock attention module), at most ATTENTION_MAX."""
-    caps = {kind: WIDE_ROWS[kind, dcp] for kind in ("kda", "mla", "dsa")}
+    projection and core take (0: the stock attention module), at most ATTENTION_MAX.
+    ``recoverssm``: the KDA layers verify with RecoverSSM records."""
+    caps = {kind: WIDE_ROWS[kind, dcp] for kind in ("mla", "dsa")}
+    caps["kda"] = KDA_WIDE_ROWS[recoverssm]
     assert all(0 <= rows <= ATTENTION_MAX for rows in caps.values()), caps
     return caps
 
@@ -108,7 +119,8 @@ def projection_policies(tp, rows, batches):
 
 
 class SkinnyProjection:
-    """B1/B2 skinny GEMM; static K loads two weight tiles before the PDL wait."""
+    """B1/B2 skinny GEMM; static K loads two weight tiles before the PDL wait (the
+    projections now run ``DecodeProjection``; kept for the layer benchmarks)."""
 
     def __init__(self, weight, fallback):
         self.weight, self.fallback, k = weight, fallback, weight.shape[1]
@@ -173,8 +185,7 @@ class Attention:
         self.wide = tuple(runtime.wide_batches(kind))
         batches = (*runtime.batches, *self.wide)
         policies = projection_policies(tp, pitch, batches)
-        split_k = PreparedProjection(weight, policies).prepare()
-        self.projection = SkinnyProjection(weight, split_k)
+        self.projection = DecodeProjection(weight, batches, policies)
         self.core: Any  # PreparedKda, PreparedMla or PreparedDsa
         if kind == "dsa":
             pitches = {b: pitch for b in batches}
@@ -281,6 +292,7 @@ class Attention:
                     slots=slots,
                     accepted=accepted,
                     q=q,
+                    deferred=getattr(metadata, "recoverssm_deferred", None),
                 )
             else:
                 slots = metadata.non_spec_state_indices_tensor

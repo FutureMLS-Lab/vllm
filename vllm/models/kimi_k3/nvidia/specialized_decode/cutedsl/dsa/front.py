@@ -46,7 +46,14 @@ from ..common.primitives import (
     zeros,
 )
 from ..mla.query import pow2_ceil
-from .index import DIM, HEADS, insert_key
+from .index import (
+    DIM,
+    FP4_WEIGHT,
+    HEADS,
+    insert_key,
+    is_fp4_cache,
+    quantize_fp4_query,
+)
 
 CLUSTER = 4
 KQ = 1536 // CLUSTER  # K columns per CTA
@@ -211,23 +218,33 @@ class IndexFront:
                 Float32(BFloat16(((sums[0][i] + sums[1][i]) + sums[2][i]) + sums[3][i]))
                 for i in range(4)
             ]
-            amax = Float32(1e-10)
-            for i in cutlass.range_constexpr(4):
-                amax = cute.arch.fmax(amax, abs(values[i]))
-            for shift in cutlass.range_constexpr(4, -1, -1):
-                amax = cute.arch.fmax(
-                    amax, cute.arch.shuffle_sync_bfly(amax, 1 << shift)
-                )
-            scale = pow2_ceil(amax / Float32(448))  # amax >= 1e-10
-            inverse = Float32(1) / scale
-            word = pack_fp8(tuple(values[i] * inverse for i in range(4)))
-            store_words(at(q_out, b, head, 4 * lane), (word,))
-            if lane == 0:
-                wv = Float32(projected[b, self.weight + head])
-                fold = (wv * scale) * Float32((HEADS * DIM) ** -0.5)
-                w_out[b, head] = BFloat16(fold)
+            if cutlass.const_expr(is_fp4_cache(cache)):  # MXFP4 (index.py)
+                quantize_fp4_query(values, 4, at(q_out, b, 0, 0), head, lane, lane)
+                if lane == 0:
+                    wv = Float32(projected[b, self.weight + head])
+                    w_out[b, head] = BFloat16(wv * Float32(FP4_WEIGHT))
+            else:
+                self.fp8_head(values, projected, q_out, w_out, b, head, lane)
         token = head * CLUSTER + part
         if (warp == 0) & (token < B):
             key = projected, self.key, norm_w, norm_b, cache, slots, token, key_eps
             insert_key(*key, self.mx, lane)
         cute.arch.cluster_wait()  # no CTA exits while a peer may read or write it
+
+    @cute.jit
+    def fp8_head(self, values, projected, q_out, w_out, b, head, lane):
+        """FP8 of one head's 4 columns per lane (a power-of-two head scale) and its
+        folded head weight."""
+        amax = Float32(1e-10)
+        for i in cutlass.range_constexpr(4):
+            amax = cute.arch.fmax(amax, abs(values[i]))
+        for shift in cutlass.range_constexpr(4, -1, -1):
+            amax = cute.arch.fmax(amax, cute.arch.shuffle_sync_bfly(amax, 1 << shift))
+        scale = pow2_ceil(amax / Float32(448))  # amax >= 1e-10
+        inverse = Float32(1) / scale
+        word = pack_fp8(tuple(values[i] * inverse for i in range(4)))
+        store_words(at(q_out, b, head, 4 * lane), (word,))
+        if lane == 0:
+            wv = Float32(projected[b, self.weight + head])
+            fold = (wv * scale) * Float32((HEADS * DIM) ** -0.5)
+            w_out[b, head] = BFloat16(fold)

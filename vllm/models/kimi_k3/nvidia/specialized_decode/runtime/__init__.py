@@ -5,6 +5,12 @@ by ``additional_config={"decode_backend": "latency_specialized"}``."""
 
 from dataclasses import dataclass
 
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
+
+SPECIALIZED = "latency_specialized"
+
 
 @dataclass(frozen=True)
 class DecodeConfig:
@@ -35,6 +41,12 @@ def specialized_decode_config(vllm_config) -> DecodeConfig | None:
     if reason is not None:
         raise ValueError(f"Kimi K3 specialized decode does not support {reason}")
     spec = vllm_config.speculative_config
+    if spec is not None:
+        # The draft model loads after this target: build it as the specialized
+        # drafter (its own module, ``drafter.model``).
+        from ..drafter.model import register
+
+        register()
     return DecodeConfig(
         max_context=vllm_config.model_config.max_model_len,
         dcp=vllm_config.parallel_config.decode_context_parallel_size,
@@ -88,6 +100,8 @@ def kda_dtypes(vllm_config):
 def unsupported(vllm_config) -> str | None:
     import torch
 
+    kda_allowed = ((torch.bfloat16, torch.float32), (torch.float32, torch.float32))
+
     from vllm import envs
     from vllm.config import CompilationMode, CUDAGraphMode
     from vllm.platforms import current_platform
@@ -112,15 +126,42 @@ def unsupported(vllm_config) -> str | None:
     # Kimi K3.1: sparse (DSA) MLA layers over the packed MLA and indexer caches,
     # fp8_ds_mla on FlashMLA sparse or per-tensor FP8 on FlashInfer sparse.
     dsa = getattr(text, "dsa_config", None) is not None
+    tp1 = parallel.tensor_parallel_size == 1
+    ep = parallel.enable_expert_parallel
     checks = (
         (not current_platform.is_device_capability_family(100), "this GPU (SM100/103)"),
         (
             moe != ("situ", 4.0, 25.0, 896, 16, 1, 1, "sigmoid"),
             "MoE configs but the one-group sigmoid top-16 SiTU MoE of Kimi K3",
         ),
-        (parallel.tensor_parallel_size not in (8, 16), "TP other than 8/16"),
+        (
+            parallel.tensor_parallel_size not in ((1, 4, 8, 16) if ep else (1, 8, 16)),
+            "TP other than 1/8/16 (1/4/8/16 with expert parallelism)",
+        ),
         (parallel.pipeline_parallel_size != 1, "pipeline parallelism"),
-        (parallel.enable_expert_parallel, "expert parallelism"),
+        # Expert parallel: DEP (TP1 attention per DP rank: runtime.dep) or the hybrid
+        # (TP-G attention groups, routed experts EP over every rank: runtime.hybrid),
+        # both over MegaMoE; TP8 / TP16 without EP run their TP-sharded MoE providers.
+        (
+            ep and not tp1 and not dsa,
+            "expert parallelism with TP > 1 without DSA layers (Kimi K3 MLA)",
+        ),
+        (
+            ep
+            and not tp1
+            and vllm_config.kernel_config.moe_backend != "deep_gemm_mega_moe",
+            "expert parallelism with TP > 1 on MoE backends other than MegaMoE",
+        ),
+        # The hybrid step all-reduces o_proj's full-row partial; the fused GEMM +
+        # reduce-scatter o_proj returns a row shard instead.
+        (
+            ep and not tp1 and envs.VLLM_ENABLE_GEMM_RS,
+            "expert parallelism with TP > 1 under the GEMM + reduce-scatter o_proj",
+        ),
+        (
+            parallel.tensor_parallel_size == 1 and not dsa,
+            "TP1 (DEP) without DSA layers (Kimi K3 MLA)",
+        ),
         (parallel.use_ubatching, "DBO"),
         (
             parallel.decode_context_parallel_size
@@ -147,11 +188,13 @@ def unsupported(vllm_config) -> str | None:
             spec is not None and spec.enable_adaptive_verification,
             "adaptive verification",
         ),
-        # KdaSplit keeps a BF16 conv state and an FP32 recurrent state in place.
+        # The KDA cores (KdaSplit, KdaWide) keep an FP32 recurrent state and a BF16
+        # or FP32 conv state in place (the taps are BF16 projection values: exact
+        # in both).
         (
-            kda_dtypes(vllm_config) != (torch.bfloat16, torch.float32),
-            "KDA cache dtypes other than a BF16 conv state and an FP32 recurrent "
-            "state (mamba cache dtype)",
+            kda_dtypes(vllm_config) not in kda_allowed,
+            "KDA cache dtypes other than a BF16 or FP32 conv state and an FP32 "
+            "recurrent state (mamba cache dtype)",
         ),
         # The verify kernels take at most 8 tokens per request (KdaSplit's barriers).
         (
@@ -166,6 +209,11 @@ def unsupported(vllm_config) -> str | None:
         (
             not dsa and vllm_config.cache_config.cache_dtype not in MLA_CACHE_DTYPES,
             "MLA layers on KV cache dtypes other than per-tensor fp8",
+        ),
+        # TP1: the split query writes FlashInfer's per-tensor FP8 query (96 heads).
+        (
+            tp1 and vllm_config.cache_config.cache_dtype not in FI_CACHE_DTYPES,
+            "TP1 (DEP) on KV cache dtypes other than per-tensor fp8 or nvfp4_ds_mla",
         ),
         (
             dsa

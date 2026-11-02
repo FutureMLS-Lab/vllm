@@ -26,6 +26,7 @@ import torch.distributed._symmetric_memory as symm_mem
 from cutlass import BFloat16, Float32, Int32, Int64, Uint32
 from cutlass.cute.runtime import make_fake_stream
 
+from ....specialized_decode.symm import multicast_rendezvous, peer_rendezvous
 from ..common.host import fake, to_cute
 from ..common.policy import batch_table
 from ..common.primitives import (
@@ -108,7 +109,8 @@ class DcpMailbox:
         width = 128 if fmt == PROJECTED else 512
         self.partial = empty((*shape, width), dtype=torch.bfloat16, device=device)
         self.lse = empty(shape, dtype=torch.float32, device=device)
-        handles = [symm_mem.rendezvous(t, group) for t in (self.partial, self.lse)]
+        # Peer stores only: no multicast object.
+        handles = [peer_rendezvous(t, group) for t in (self.partial, self.lse)]
         i64 = dict(dtype=torch.int64, device=device)
         self.peers = torch.tensor(handles[0].buffer_ptrs, **i64)
         self.lse_peers = torch.tensor(handles[1].buffer_ptrs, **i64)
@@ -147,7 +149,7 @@ class DcpBox:
         self.q = symm_mem.empty(
             (2, cap, self.q_heads, 576), dtype=q_dtype, device=device
         )
-        self.q_mc = int(symm_mem.rendezvous(self.q, group).multicast_ptr or 0)
+        _, self.q_mc = multicast_rendezvous(self.q, group, "Kimi K3 DCP q mailbox")
         if not self.q_mc:
             raise RuntimeError("Kimi K3 specialized MLA DCP needs multicast memory")
         formats = sorted({partials_for(partials, b) for b in range(1, cap + 1)})
@@ -246,14 +248,24 @@ class DcpValue:
         lse_scale=1.0,
         per_row=False,
         partials="bf16",
+        preprojected=False,
+        pushed=False,
     ):
         """``q_chunks``: 16 B chunks per q mailbox head row (36 FP8, 72 BF16);
         ``q_heads``: q mailbox rows per token (default DCP * H); ``lse_scale``: to
-        base 2 (LOG2E for a natural-log LSE)."""
+        base 2 (LOG2E for a natural-log LSE). ``preprojected`` ("proj" only): the
+        W_UV argument holds the value rows [DCP * H, B, 128] BF16 a batched GEMM
+        already projected (the stock W_UV bmm over the gathered heads), so the
+        projecting CTAs only push them. ``pushed`` ("bf16" only): the sparse
+        decode before pushed every rank's rows and LSEs and re-armed the q mailbox
+        (dsa.attn_sparse), so DcpValue only merges."""
         self.heads, self.size, self.batch = heads, size, batch
         assert partials in FORMATS, partials
         self.q, self.per_row, self.partials = q, per_row, partials
         self.projected = partials == PROJECTED
+        self.preprojected = preprojected and self.projected
+        assert not (pushed and self.projected), partials
+        self.pushed = pushed
         # Rows with nothing to merge send only their LSE (neither polled nor
         # re-armed): "proj", and BF16 for a sparse decode's per-row counts. The MLA
         # BF16 layout (rarely empty: padded requests, short contexts) sends zeros
@@ -277,6 +289,9 @@ class DcpValue:
         merge = heads * tiles
         chunks = batch * size * heads * 64
         pushers = min(max(1, sms // merge), -(-chunks // (merge * 512 * 4)))
+        if pushed:
+            assert per_row  # the sparse decode's per-row counts
+            pushers = 1
         self.grid = (heads, tiles, pushers)
 
     @cute.jit
@@ -299,7 +314,7 @@ class DcpValue:
     def kernel(self, args):
         rows, rows_lse, lens, box, lbox, peers, lpeers, mailbox = args[0:8]
         w_uv, gate, totals, output, parity, rank = args[8:14]
-        H, D, B, cap = self.heads, self.size, self.batch, box.shape[1]
+        D = self.size
         smem = cutlass.utils.SmemAllocator()
         latent = alloc(smem, BFloat16, (16, 544), 128)
         scales = alloc(smem, Float32, (16, D))
@@ -314,6 +329,23 @@ class DcpValue:
             for c in range(16)
         ]
         cute.arch.griddepcontrol_wait()
+        if cutlass.const_expr(not self.pushed):
+            self.push_rows(args, head, tile, pusher, tid)
+        cute.arch.griddepcontrol_launch_dependents()
+        if pusher == 0:
+            if cutlass.const_expr(self.grid[1] == self.tiles):
+                self.merge(args, latent, scales, wb, tid, tile)
+            else:
+                for t in range(tile, self.tiles, self.grid[1]):
+                    self.merge(args, latent, scales, wb, tid, t)
+
+    @cute.jit
+    def push_rows(self, args, head, tile, pusher, tid):
+        """Every rank's local rows (+ LSE) to their head owner's mailbox, then the
+        q mailbox re-arm (see the class docstring)."""
+        rows, rows_lse, lens, box, lbox, peers, lpeers, mailbox = args[0:8]
+        parity, rank = args[12], args[13]
+        H, D, B, cap = self.heads, self.size, self.batch, box.shape[1]
         threads = H * self.grid[1] * self.grid[2] * 512
         me = ((pusher * self.grid[1] + tile) * H + head) * 512 + tid
         for i in range(me, B * D * H * 64, threads):
@@ -338,13 +370,6 @@ class DcpValue:
             store_relaxed(lpeers[gh // H] + Int64(slot) * 4, (float_bits(value),))
         # The peer stores leave first; the local re-arm overlaps their flight.
         self.rearm(mailbox, me, threads)
-        cute.arch.griddepcontrol_launch_dependents()
-        if pusher == 0:
-            if cutlass.const_expr(self.grid[1] == self.tiles):
-                self.merge(args, latent, scales, wb, tid, tile)
-            else:
-                for t in range(tile, self.tiles, self.grid[1]):
-                    self.merge(args, latent, scales, wb, tid, t)
 
     @cute.kernel
     def kernel_projected(self, args):
@@ -368,17 +393,21 @@ class DcpValue:
         me = (y * H + head) * 512 + tid
         if y < D:
             gh = y * H + head
-            v = 32 * (warp // 4) + 8 * (warp % 4) + group
-            wb = [
-                load_words(at(w_uv, gh, 32 * c + 8 * quarter, v), count=4)
-                for c in range(16)
-            ]
-            cute.arch.griddepcontrol_wait()
-            # Software pipeline: step t + 1's latents and LSEs load while step t
-            # projects and pushes.
-            ahead = self.load_tile(args, gh, 0, tid)
-            for t0 in range(0, self.batch, R):
-                ahead = self.project(args, latent, values, wb, gh, t0, tid, ahead)
+            if cutlass.const_expr(self.preprojected):
+                cute.arch.griddepcontrol_wait()
+                self.push_values(args, gh, tid)
+            else:
+                v = 32 * (warp // 4) + 8 * (warp % 4) + group
+                wb = [
+                    load_words(at(w_uv, gh, 32 * c + 8 * quarter, v), count=4)
+                    for c in range(16)
+                ]
+                cute.arch.griddepcontrol_wait()
+                # Software pipeline: step t + 1's latents and LSEs load while
+                # step t projects and pushes.
+                ahead = self.load_tile(args, gh, 0, tid)
+                for t0 in range(0, self.batch, R):
+                    ahead = self.project(args, latent, values, wb, gh, t0, tid, ahead)
             self.rearm(mailbox, me, threads)
             cute.arch.griddepcontrol_launch_dependents()
         else:
@@ -387,6 +416,42 @@ class DcpValue:
             cute.arch.griddepcontrol_launch_dependents()
             for t in range(y - D, self.tiles, merges):
                 self.merge_projected(args, scales, tid, t)
+
+    @cute.jit
+    def push_values(self, args, gh, tid):
+        """``preprojected``: push gathered head ``gh``'s value rows (the W_UV
+        argument, [DCP * H, B, 128] BF16) and every row's LSE to the head's owner,
+        a row with nothing to merge only its LSE (as ``project``). Thread tid
+        takes 16 B chunk tid % 16 of rows tid // 16, + 32, ..: four rows' loads in
+        flight per thread."""
+        rows_lse, lens, box, _, peers, lpeers = args[1:7]
+        values, parity, rank = args[8], args[12], args[13]
+        H, D, B = self.heads, self.size, self.batch
+        cap = box.shape[1]
+        chunk, owner = tid % 16, gh // H
+        per: cutlass.Constexpr = 4  # rows per thread per round
+        for r0 in range(tid // 16, B, 32 * per):
+            loads = []
+            for i in cutlass.range_constexpr(per):
+                t = r0 + 32 * i
+                lse = Float32(EMPTY_LSE)
+                words = (Uint32(0),) * 4
+                if t < B:
+                    lse = self.sent_lse(rows_lse, lens, t, gh)
+                    if lse > Float32(EMPTY_LSE):
+                        words = load_words(
+                            at(values, gh, t, 8 * chunk), count=4, mutable=True
+                        )
+                loads.append((t, lse, words))
+            for t, lse, words in loads:
+                if t < B:
+                    slot = ((parity * D + rank) * cap + t) * H + gh % H
+                    if lse > Float32(EMPTY_LSE):
+                        target = peers[owner] + (Int64(slot) * 128 + 8 * chunk) * 2
+                        store_relaxed(target, tuple(no_neg_zero(w) for w in words))
+                    if chunk == 0:
+                        address = lpeers[owner] + Int64(slot) * 4
+                        store_relaxed(address, (float_bits(lse),))
 
     @cute.jit
     def load_tile(self, args, gh, t0, tid):
@@ -677,6 +742,8 @@ def compile_value(
     dsa_bf16=True,
     lse_base_e=True,
     partials="bf16",
+    preprojected=False,
+    pushed=False,
 ):
     """DcpValue of one batch (``q`` rows per request); ``uv``: the (shape, stride,
     dtype) of W_UV, ``pitch``: the projected rows' (the gate follows the 2112 query /
@@ -700,13 +767,26 @@ def compile_value(
         scale = math.log2(math.e) if lse_base_e else 1.0
         chunks = row_bytes // 16
         value = DcpValue(
-            heads, size, batch, sms, q, chunks, dsa_heads, scale, True, partials
+            heads,
+            size,
+            batch,
+            sms,
+            q,
+            chunks,
+            dsa_heads,
+            scale,
+            True,
+            partials,
+            preprojected,
+            pushed,
         )
     totals = fake((batch // q,), None, i32, 4)
     width = 512
     if partials == PROJECTED:  # the gathered W_UV (DcpBox.gather_heads) and values
         gathered = size * heads
         w_uv, width = fake((gathered, 512, 128), (128 * 512, 1, 512)), 128
+        if preprojected:  # the bmm's value rows instead
+            w_uv = fake((gathered, batch, 128), (batch * 128, 128, 1))
     box = fake((size, cap, heads, width), None, torch.bfloat16)
     lbox = fake((size, cap, heads), None, f32, 4)
     peers = fake((size,), None, torch.int64, 8)

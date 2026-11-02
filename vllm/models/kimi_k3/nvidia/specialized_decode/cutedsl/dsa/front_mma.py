@@ -58,7 +58,17 @@ from ..common.primitives import (
     warp_sum,
 )
 from ..mla.query import pow2_ceil
-from .index import DIM, HEADS, insert_key
+from .index import (
+    DIM,
+    FP4_SCALES,
+    FP4_WEIGHT,
+    HEADS,
+    e2m1x2,
+    insert_key,
+    is_fp4_cache,
+    mxfp4_scale,
+    store_b8,
+)
 
 K = 1536
 WEIGHT_BLOCK = 128 * 64 * 2  # one head's 128 rows x 64 K, BF16
@@ -355,6 +365,8 @@ class IndexFrontMma:
             if tid < owned:
                 wv_s[tid] = wv
             wait(bar_acc, 0)
+            # tcgen05.ld is .sync.aligned: reconverge after the per-thread wait.
+            cute.arch.sync_warp()
             fence_tmem()
             self.epilogue(args, tmem, mailbox, amax_s, wv_s, bar_red, row0, valid)
         release_tmem(tmem, self.columns, warp, 4)
@@ -439,7 +451,23 @@ class IndexFrontMma:
             for j in cutlass.range_constexpr(4):
                 c = g * 4 + j
                 column = s * owned + c
-                if column < valid:
+                if cutlass.const_expr(is_fp4_cache(args[6])):
+                    if column < valid:  # MXFP4 (index.py): one warp, one block
+                        amax = bits_float(amax_s[warp, c])
+                        inverse, byte = mxfp4_scale(amax)
+                        value = values[j] * inverse
+                        pair = cute.arch.shuffle_sync_bfly(value, 1)
+                        row = at(q_out, row0 + column, 0, 0)
+                        if tid % 2 == 0:
+                            store_b8(
+                                row + head * (DIM // 2) + tid // 2, e2m1x2(value, pair)
+                            )
+                        if lane == 0:
+                            store_b8(row + FP4_SCALES + head * 4 + warp, byte)
+                        if tid == 0:
+                            weight = wv_s[c] * Float32(FP4_WEIGHT)
+                            w_out[row0 + column, head] = BFloat16(weight)
+                elif column < valid:
                     amax = Float32(1e-10)
                     for w in cutlass.range_constexpr(4):
                         amax = cute.arch.fmax(amax, bits_float(amax_s[w, c]))

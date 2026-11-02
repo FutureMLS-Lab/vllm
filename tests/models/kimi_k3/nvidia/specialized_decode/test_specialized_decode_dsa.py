@@ -21,6 +21,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 UNIT, MLA_ROW, INDEX_ROW = 64, 656, 132  # indexer page tokens; cache row bytes
+FP4_INDEX_ROW = 68  # MXFP4 indexer cache row (indexer_kv_dtype="mxfp4")
 FP8_ROW = 576  # per-tensor FP8 MLA row (FlashInfer sparse)
 NVFP4_ROW = 352  # nvfp4_ds_mla MLA row (FlashInfer sparse prims_ts)
 GAP = 36  # rows of the other layers' pages between two blocks of a packed cache
@@ -41,20 +42,33 @@ def packed_cache(blocks, block, row, gap=GAP):
 
 
 def index_blocks(index):
-    """Each indexer page's bytes: its FP8 keys, then their scales (four packed UE8M0
-    bytes per key on SM100's MX path, else FP32)."""
+    """Each indexer page's bytes: its keys (FP8, or MXFP4: 64 E2M1 bytes), then
+    their scales (four packed UE8M0 bytes per key on SM100's MX path, else FP32)."""
+    row = index.shape[2]
     return torch.as_strided(
-        index, (index.shape[0], index.shape[1] * INDEX_ROW), (index.stride(0), 1)
+        index, (index.shape[0], index.shape[1] * row), (index.stride(0), 1)
     )
 
 
+def key_bytes(index):
+    """Key bytes per token of an indexer cache (128 FP8, 64 MXFP4)."""
+    return index.shape[2] - 4
+
+
+def index_row(indexer):
+    """The indexer's cache row bytes (its format: kimi_k3_indexer_uses_fp4)."""
+    return FP4_INDEX_ROW if indexer.use_fp4_cache else INDEX_ROW
+
+
 def assert_index_nan_free(index):
-    """No NaN codes in an indexer cache: its E4M3 keys (0x7F / 0xFF) and their
-    UE8M0 scale bytes (0xFF). NaN keys give NaN logits, on which DeepSelect
-    returns out-of-range ids and the DCP merge's pack kernel faults (#63)."""
-    pages = index_blocks(index)
-    keys, scales = pages[:, : UNIT * 128], pages[:, UNIT * 128 :]
-    assert not ((keys & 0x7F) == 0x7F).any()
+    """No NaN codes in an indexer cache: its E4M3 keys (0x7F / 0xFF; E2M1 has
+    none) and their UE8M0 scale bytes (0xFF). NaN keys give NaN logits, on which
+    DeepSelect returns out-of-range ids and the DCP merge's pack kernel faults
+    (#63)."""
+    pages, kb = index_blocks(index), key_bytes(index)
+    keys, scales = pages[:, : UNIT * kb], pages[:, UNIT * kb :]
+    if kb == 128:
+        assert not ((keys & 0x7F) == 0x7F).any()
     assert not (scales == 0xFF).any()
 
 
@@ -168,6 +182,55 @@ def test_query_and_cache_insert(batch, block, gap):
     assert (ours[:, :512] != ref[:, :512]).float().mean() < 0.01
 
 
+def call_query(kernel, args, eps, query, q_c, weights, projected):
+    """compile_query's kernel over MlaQuery's arguments (``args`` without eps and
+    the outputs): MlaQuery, or the split query (WideQuery, wide batches)."""
+    import cutlass
+
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.common.host import (
+        stream,
+        to_cute,
+    )
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.dsa.query_stage import (  # noqa: E501
+        WideQuery,
+    )
+
+    if isinstance(kernel, WideQuery):
+        return run_split_query(kernel, args, weights, projected, query, q_c, eps)
+    out = (cutlass.Float32(eps), to_cute(query), to_cute(q_c))
+    kernel(*args, *out, stream(projected.device))
+
+
+def run_split_query(kernel, args, weights, projected, query, q_c, eps=EPS):
+    """The split query (mla.query_wide) of compile_query's WideQuery over MlaQuery's
+    arguments: QueryNorm, the Q_B projection, then MlaAbsorb (or the W_UK bmm and
+    MlaQuant)."""
+    import cutlass
+
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.common.host import (
+        stream,
+        to_cute,
+    )
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.dsa.query_stage import (  # noqa: E501
+        q_b_policies,
+    )
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.gemm.projection import (  # noqa: E501
+        PreparedProjection,
+    )
+
+    batch, s, eps = projected.shape[0], stream(projected.device), cutlass.Float32(eps)
+    q_norm, _, q_b, w_uk = weights[:4]
+    kernel.norm(to_cute(projected), to_cute(q_norm), to_cute(q_c), eps, s)
+    heads = w_uk.shape[0]
+    rows = torch.empty(batch, heads * 192, device=q_c.device, dtype=q_c.dtype)
+    PreparedProjection(q_b, q_b_policies([batch], heads)).prepare().run(q_c, rows)
+    uk = w_uk
+    if kernel.bmm:  # the stock W_UK bmm, then MlaQuant
+        uk = torch.bmm(rows.view(batch, heads, 192)[..., :128].transpose(0, 1), w_uk)
+    args = (*args[:3], to_cute(rows), to_cute(uk), *args[5:])
+    kernel.absorb(*args, eps, to_cute(query), s)
+
+
 @pytest.mark.parametrize("gap", [GAP, FAR])
 @pytest.mark.parametrize("batch", [1, 5, 64, 80, 320])
 def test_fp8_query_and_cache_insert(batch, gap):
@@ -180,6 +243,9 @@ def test_fp8_query_and_cache_insert(batch, gap):
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.common.host import (
         stream,
         to_cute,
+    )
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.dsa.query_stage import (  # noqa: E501
+        WideQuery,
     )
 
     torch.manual_seed(batch)
@@ -207,7 +273,11 @@ def test_fp8_query_and_cache_insert(batch, gap):
     args = (to_cute(projected), *(to_cute(w) for w in weights[:4]), to_cute(mla))
     # The query multiplies by 1 / q_scale; the KV row is divided by k_scale.
     args += (to_cute(slots, 8), to_cute(1 / q_scale, 4), to_cute(k_scale, 4))
-    query_kernel(*args, cutlass.Float32(EPS), to_cute(query), to_cute(q_c), stream(dev))
+    if isinstance(query_kernel, WideQuery):  # the split query (wide batches)
+        run_split_query(query_kernel, args, weights, projected, query, q_c)
+    else:
+        args += (cutlass.Float32(EPS), to_cute(query), to_cute(q_c), stream(dev))
+        query_kernel(*args)
 
     ref_q_c = rms_norm(projected[:, :1536], q_norm)
     torch.testing.assert_close(q_c, ref_q_c, atol=1e-2, rtol=1e-2)
@@ -237,11 +307,8 @@ def test_nvfp4_cache_insert(batch, block, gap):
     The latent rows have an RMS of exactly 1 and the norm no epsilon, so both
     RMSNorms are exact; the norm weights span the block scales' range (the 2^-9
     floor, E4M3 subnormals, saturation), with zero blocks and padded rows."""
-    import cutlass
-
     from vllm import _custom_ops as ops
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.common.host import (
-        stream,
         to_cute,
     )
 
@@ -283,7 +350,7 @@ def test_nvfp4_cache_insert(batch, block, gap):
     unit = torch.ones(1, device=dev)
     args = (to_cute(projected), *(to_cute(w) for w in weights[:4]), to_cute(mla))
     args += (to_cute(slots, 8), to_cute(1 / q_scale, 4), to_cute(unit, 4))
-    query_kernel(*args, cutlass.Float32(0), to_cute(query), to_cute(q_c), stream(dev))
+    call_query(query_kernel, args, 0.0, query, q_c, weights, projected)
 
     x = projected[:, :1536].float()
     ref_q_c = (x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True)) * q_norm).to(bf)
@@ -310,11 +377,8 @@ def test_nvfp4_cache_insert_random(batch, gap):
     """nvfp4_ds_mla KV rows of random latent rows (an inexact RMSNorm): k_pe and
     the scales as the stock writer's, the E2M1 codes but where the norms round
     differently, and the dequantized rows close to the BF16 ones."""
-    import cutlass
-
     from vllm import _custom_ops as ops
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.common.host import (
-        stream,
         to_cute,
     )
 
@@ -337,7 +401,7 @@ def test_nvfp4_cache_insert_random(batch, gap):
     unit = torch.ones(1, device=dev)
     args = (to_cute(projected), *(to_cute(w) for w in weights[:4]), to_cute(mla))
     args += (to_cute(slots, 8), to_cute(unit, 4), to_cute(unit, 4))
-    query_kernel(*args, cutlass.Float32(EPS), to_cute(query), to_cute(q_c), stream(dev))
+    call_query(query_kernel, args, EPS, query, q_c, weights, projected)
 
     stock = packed_cache(blocks, block, NVFP4_ROW, gap)
     kv = rms_norm(projected[:, 1536:2048], kv_norm)
@@ -439,8 +503,11 @@ def test_query_overlap_kernels(batch, fp8):
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.dsa.query_stage import (  # noqa: E501
         compile_norm,
         compile_query,
+        runs_split,
     )
 
+    if runs_split(HEADS, batch, 0, fp8):
+        pytest.skip("the split query serves this batch (test_specialized_decode_dep)")
     torch.manual_seed(batch)
     bf, dev = torch.bfloat16, "cuda"
     projected = torch.randn(batch, PITCH, device=dev, dtype=bf) * 3
@@ -664,7 +731,7 @@ def order16(bits):
 
 FUSED_INDEXER_CASES = {
     # (contexts, q): every row within the top-k (the bypass) or not, ragged
-    # batches, rows past 16K vectors, past the shared vector maxima (512K keys),
+    # batches, rows past 16K vectors, past the shared vector maxima (TOPS: 128K keys),
     # and tie-heavy logits (integer queries and keys).
     "short": ([1500, 300], 5),
     "boundary": ([2046, 2047, 2048, 2049], 1),
@@ -1170,6 +1237,8 @@ def test_flashinfer_dcp_core_merges_to_full_attention(
             indexer=SimpleNamespace(cp_kv_cache_interleave_size=1),
             parity=0,
             box=SimpleNamespace(q=box),
+            # This test covers the FlashInfer decode core (not the sparse one).
+            cores={(rows_n, 1): kernel},
         )
         # Stale rows and LSEs of an earlier layer must not leak into empty rows.
         buffers[2].fill_(float("nan"))
@@ -1705,8 +1774,9 @@ def layer_reference(attn, projected, cache, table, topk, q, kv):
     return out.reshape(query.shape[0], -1) * torch.sigmoid(gate)
 
 
-def layer_config(core, q, world=1):
-    """The vLLM config of a DSA layer test on ``core`` (TP = DCP = ``world``)."""
+def layer_config(core, q, world=1, index_dtype="mxfp4"):
+    """The vLLM config of a DSA layer test on ``core`` (TP = DCP = ``world``);
+    ``index_dtype``: the indexer cache's (the K3.1 deployments request MXFP4)."""
     from tests.v1.attention.utils import create_vllm_config
     from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
@@ -1726,6 +1796,7 @@ def layer_config(core, q, world=1):
         parallel.cp_kv_cache_interleave_size = 1
     config.cache_config.cache_dtype = cache_dtype
     config.attention_config.backend = AttentionBackendEnum[backend]
+    config.attention_config.indexer_kv_dtype = index_dtype
     if kernel is not None:
         config.kernel_config.flashinfer_sparse_mla_kernel = kernel
     if q > 1:  # DSpark verify: the indexer's decode rows take q tokens
@@ -1764,6 +1835,7 @@ def run_layer_step(
     graph=False,
     poison="rows",
     offset=0,
+    index_dtype="mxfp4",
 ):
     """One decode step of a real DSA layer (``q`` rows per request, contexts on
     both sides of the top-k, written by the stock writers) through the stock
@@ -1784,6 +1856,9 @@ def run_layer_step(
     from vllm.models.kimi_k3.nvidia.ops.dsa_indexer import (
         indexer_k_norm_quant_insert,
     )
+    from vllm.models.kimi_k3.nvidia.ops.dsa_indexer_mxfp4 import (
+        mxfp4_k_norm_quant_insert,
+    )
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.dsa.overlap import (
         side_stream,
     )
@@ -1800,7 +1875,7 @@ def run_layer_step(
     from vllm.v1.worker.block_table import get_block_table_width
 
     cache_dtype, _, kernel = LAYER_CORES[core]
-    config = layer_config(core, q, world)
+    config = layer_config(core, q, world, index_dtype)
     rank = get_dcp_group().rank_in_group if world > 1 else 0
     row = {"fp8": FP8_ROW, "nvfp4_ds_mla": NVFP4_ROW}.get(cache_dtype, MLA_ROW)
     flashinfer = cache_dtype != "fp8_ds_mla"
@@ -1834,7 +1909,7 @@ def run_layer_step(
         ]
         local = [(c + q - rank + world - 1) // world for c in contexts]
         mla, mla_table = paged_rows(local, UNIT, row, UNIT, gen)
-        index, index_table = paged_rows(local, UNIT, INDEX_ROW, GAP, gen)
+        index, index_table = paged_rows(local, UNIT, index_row(indexer), GAP, gen)
         old = [range(c) for c in contexts]
         old_mla = owned_slots(mla_table, old, world, rank)
         old_index = owned_slots(index_table, old, world, rank)
@@ -1847,7 +1922,10 @@ def run_layer_step(
         scratch = torch.empty(n, 2048, dtype=torch.int32, device=dev)
         norm = torch.ones(128, dtype=bf, device=dev)
         args = (norm, torch.zeros_like(norm), EPS, old_index, index, scratch, n)
-        indexer_k_norm_quant_insert(keys, *args)
+        insert = indexer_k_norm_quant_insert
+        if indexer.use_fp4_cache:
+            insert = mxfp4_k_norm_quant_insert
+        insert(keys, *args)
         # Finite logits: the zero-filled pages and the inserted keys hold no NaN.
         assert_index_nan_free(index)
         new = [range(c, c + q) for c in contexts]
@@ -2074,17 +2152,29 @@ def exact_topk_widths(index, table, contexts, q, query, weights, ids, world=1):
         config = get_current_vllm_config().parallel_config
         assert config.cp_kv_cache_interleave_size == 1
     topk, spare = ids.shape[1], 512
-    pages = index_blocks(index)
-    query = query.view(torch.float8_e4m3fn).float()
+    pages, kb = index_blocks(index), key_bytes(index)
+    if kb == 64:  # MXFP4 keys and query (dequantized; the scales are in the MMA)
+        from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.dsa.index import (
+            fp4_query_views,
+        )
+
+        packed, q_scales = fp4_query_views(query, query.shape[0])
+        query = mxfp4_values(packed, q_scales.view(torch.uint8).view(-1, 32, 4))
+    else:
+        query = query.view(torch.float8_e4m3fn).float()
     vals, gids, lengths = [], [], []
     t = 0
     for r, c in enumerate(contexts):
         n = (c + q - rank + world - 1) // world
         blocks = pages[table[r, : -(-n // UNIT)].long()]
-        keys = blocks[:, : UNIT * 128].reshape(-1, 128)[:n]
-        keys = keys.view(torch.float8_e4m3fn).float()
-        exps = blocks[:, UNIT * 128 :].reshape(-1, UNIT, 4)[..., 0].reshape(-1)[:n]
-        scale = torch.exp2(exps.float() - 127)
+        keys = blocks[:, : UNIT * kb].reshape(-1, kb)[:n]
+        sbytes = blocks[:, UNIT * kb :].reshape(-1, UNIT, 4).reshape(-1, 4)[:n]
+        if kb == 64:
+            keys = mxfp4_values(keys, sbytes)
+            scale = torch.ones(n, device=keys.device)
+        else:
+            keys = keys.view(torch.float8_e4m3fn).float()
+            scale = torch.exp2(sbytes[:, 0].float() - 127)
         for j in range(q):
             seen = (c + j + 1 - rank + world - 1) // world
             score = torch.relu(query[t] @ keys[:seen].T)
@@ -2125,6 +2215,16 @@ def exact_topk_widths(index, table, contexts, q, query, weights, ids, world=1):
     return widest
 
 
+def mxfp4_values(codes, scales):
+    """E2M1 bytes [..., 64] (low nibble first) times their UE8M0 block scales
+    [..., 4] -> FP32 [..., 128]."""
+    table = torch.tensor(E2M1, device=codes.device)
+    table = torch.cat([table, -table])
+    nibbles = torch.stack([codes & 15, codes >> 4], -1).flatten(-2).long()
+    values = table[nibbles].unflatten(-1, (4, 32))
+    return (values * torch.exp2(scales.float() - 127).unsqueeze(-1)).flatten(-2)
+
+
 def fp8_codes_adjacent(ours, theirs):
     """Whether two E4M3 byte tensors differ by at most one code step (a rounding
     boundary: the same sign, adjacent magnitudes)."""
@@ -2154,15 +2254,28 @@ def check_layer_step(step, q, reference=True):
             f"{step.stock_width:.2f}"
         )
         assert step.width <= 2.0, step.width
-    same = []
+    same, overlaps = [], []
+    fp4 = key_bytes(step.caches[1]) == 64
     for t in range(step.topk.shape[0]):
         a, b = set(step.stock_topk[t].tolist()), set(step.topk[t].tolist())
         # Fused vs DeepGEMM at 160-320 rows: >= 98.7% measured (both sum heads in
         # BF16; the paths' query rounding and BF16 near-ties at the K-th logit
-        # differ; the width check above bounds ours).
+        # differ; the width check above bounds ours). MXFP4: a query value whose
+        # BF16 projection rounds differently moves by an E2M1 step (1/8 to 1/2
+        # of its block's scale), not an E4M3 one, so more keys near the K-th
+        # logit swap (each path is still the exact top-k of its own query).
         bound = 0.99 if step.width is None or step.topk.shape[0] <= 64 else 0.98
-        assert len(a & b) / len(a) > bound, (t, len(a), len(a & b))
+        if fp4:
+            bound -= 0.03
+        overlaps.append(len(a & b) / len(a))
+        assert overlaps[-1] > bound, (t, len(a), len(a & b))
         same.append(a == b)
+    print(
+        f"top-k overlap with stock: min {min(overlaps):.4f} mean "
+        f"{sum(overlaps) / len(overlaps):.4f}"
+    )
+    if fp4:
+        assert sum(overlaps) / len(overlaps) > 0.985
     out, stock = step.out, step.stock
     # Rows with the same top-k attend over the same keys.
     rows = torch.tensor(same, device=out.device)
@@ -2215,12 +2328,16 @@ def check_layer_step(step, q, reference=True):
     page, entry = new_index // UNIT, new_index % UNIT
     blocks = index_blocks(ours_index), index_blocks(stock_index)
     arange = partial(torch.arange, device=ours_index.device)
-    at = UNIT * 128 + 4 * entry.view(-1, 1) + arange(4)
+    kb = key_bytes(ours_index)
+    at = UNIT * kb + 4 * entry.view(-1, 1) + arange(4)
     assert torch.equal(blocks[0][page].gather(1, at), blocks[1][page].gather(1, at))
-    key_at = 128 * entry.view(-1, 1) + arange(128)
+    key_at = kb * entry.view(-1, 1) + arange(kb)
     ours_keys, stock_keys = (b[page].gather(1, key_at) for b in blocks)
-    assert fp8_codes_adjacent(ours_keys, stock_keys)
-    assert (ours_keys != stock_keys).sum() <= 0.05 * ours_keys.numel()
+    if kb == 128:
+        assert fp8_codes_adjacent(ours_keys, stock_keys)
+        assert (ours_keys != stock_keys).sum() <= 0.05 * ours_keys.numel()
+    else:  # MXFP4: the same writer math as the stock insert, bit-exact
+        assert torch.equal(ours_keys, stock_keys)
     for b in blocks:
         b[page.view(-1, 1), at] = 0
         b[page.view(-1, 1), key_at] = 0
@@ -2244,6 +2361,35 @@ def test_prepared_dsa_run_matches_stock(
     if LAYER_CORES[core][2] == "prims_ts" and not has_flashinfer_prims_ts_sparse_mla():
         pytest.skip("FlashInfer has no prims_ts sparse MLA")
     check_layer_step(run_layer_step(core, batch, q, overlap=overlap), q)
+
+
+@pytest.mark.parametrize("batch,q", [(8, 1), (40, 5)])
+@pytest.mark.parametrize("core", ["fi-trtllm", "fi-auto"])
+def test_prepared_dsa_run_fp8_index_matches_stock(
+    workspace_init, dist_init, core, batch, q
+):
+    """test_prepared_dsa_run_matches_stock with the FP8 indexer cache
+    (indexer_kv_dtype='fp8', 132 B/token) instead of MXFP4."""
+    step = run_layer_step(core, batch, q, index_dtype="fp8")
+    assert step.caches[1].shape[2] == INDEX_ROW
+    check_layer_step(step, q)
+
+
+@pytest.mark.parametrize("batch,q", [(8, 8), (40, 8), (80, 8)])
+@pytest.mark.parametrize("core", ["fi-auto"])
+def test_prepared_dsa_q8_runs_stock_indexer(workspace_init, dist_init, core, batch, q):
+    """DSpark k = 7 (q = 8) at TP on the MXFP4 indexer cache: the layer runs the
+    stock decode indexer (DeepGEMM MXFP4 logits + top-k, faster there:
+    prepared.FUSED_TP_MAX_Q) instead of the fused one, and matches stock."""
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.dsa.prepared import (
+        FUSED_TP_MAX_Q,
+    )
+
+    assert q > FUSED_TP_MAX_Q
+    step = run_layer_step(core, batch, q)
+    assert step.caches[1].shape[2] == FP4_INDEX_ROW
+    assert step.width is None  # no fused indexer ran
+    check_layer_step(step, q)
 
 
 # Past the step's 64 rows: the rows a K3.1 DSA layer's specialized projection and
@@ -2383,7 +2529,7 @@ def check_prepare_allocates_nothing(core, world=1):
         for contexts in ([600] * 13, [33000, 9000, 4000] * 5):
             local = [-(-c // world) for c in contexts]
             mla, _ = paged_rows(local, UNIT, row, UNIT, gen)
-            index, _ = paged_rows(local, UNIT, INDEX_ROW, GAP, gen)
+            index, _ = paged_rows(local, UNIT, index_row(dsa_indexer), GAP, gen)
             caches.append((mla, index))
             layer.kv_cache, dsa_indexer.k_cache.kv_cache = mla, index
             gc.collect()  # earlier tests' garbage is not freed by prepare_cache
@@ -2804,12 +2950,13 @@ def check_dcp_value(policy, layout, batch, q, lse_base_e):
     lse_e = lse_base_e and dsa
     kernel_lse = lse * math.log(2) if lse_e else lse
     out = torch.empty(batch, heads * 128, device=dev).bfloat16()
-    uv = to_cute(w_uv)
+    uv, w_uv_proj = to_cute(w_uv), None
     if partials == "proj":  # every rank's heads, as DcpBox.gather_heads gives them
         uv_gathered = box.gather_heads(w_uv)
         assert uv_gathered.stride() == w_uv_all.stride()
         assert torch.equal(uv_gathered, w_uv_all)
-        uv = to_cute(uv_gathered)
+        # run_value projects the rows through the torch W_UV (as PreparedDsa does).
+        uv, w_uv_proj = to_cute(uv_gathered), uv_gathered
 
     if dsa:
         args = heads, world, batch, spec(w_uv), pitch, dev.index, sms, q, padded
@@ -2826,7 +2973,7 @@ def check_dcp_value(policy, layout, batch, q, lse_base_e):
         if dsa:
             core = rows, kernel_lse, valid
             args = kernel, box, parity, publish, heads, core, totals, uv
-            run_value(*args, projected, out)
+            run_value(*args, projected, out, w_uv_proj)
         else:
             mailbox, _, ids = publish
             v_args = (to_cute(box.rows[:batch]), to_cute(box.rows_lse[:batch], 4))
@@ -2998,9 +3145,7 @@ def test_wide_batches_match_64_row_kernels(batch, fp8):
         q_c = torch.zeros(rows, 1536, device=dev, dtype=bf)
         args = (to_cute(x), *(to_cute(w) for w in weights[:4]), to_cute(mla))
         args += (to_cute(s, 8), to_cute(unit, 4), to_cute(unit, 4))
-        query_kernel(
-            *args, cutlass.Float32(EPS), to_cute(query), to_cute(q_c), stream(dev)
-        )
+        call_query(query_kernel, args, EPS, query, q_c, weights, x)
         q_fp8 = torch.zeros(rows, 32, 128, device=dev, dtype=torch.uint8)
         head_w = torch.zeros(rows, 32, device=dev, dtype=bf)
         args = (to_cute(x), to_cute(take(iq)), to_cute(norm_w, 4), to_cute(norm_b, 4))
@@ -3212,18 +3357,24 @@ def test_wide_caps():
     rows (fixed in code: no deployment override)."""
     from vllm.models.kimi_k3.nvidia.specialized_decode.runtime.providers import (
         ATTENTION_MAX,
+        KDA_WIDE_ROWS,
         SPECIALIZED_ROWS,
         WIDE_ROWS,
         wide_caps,
     )
 
-    kinds = ("kda", "mla", "dsa")
+    kinds = ("mla", "dsa")
     assert set(WIDE_ROWS) == {(k, d) for k in kinds for d in (0, 1)}
-    assert all(0 <= rows <= ATTENTION_MAX for rows in WIDE_ROWS.values())
+    rows = (*WIDE_ROWS.values(), *KDA_WIDE_ROWS.values())
+    assert all(0 <= r <= ATTENTION_MAX for r in rows)
+    # KDA: the RecoverSSM verify runs the specialized core at every wide row count.
+    assert KDA_WIDE_ROWS[True] == ATTENTION_MAX
     for dcp in (False, True):
         assert WIDE_ROWS["dsa", dcp] == SPECIALIZED_ROWS["dsa", dcp]
-        caps = wide_caps(dcp)
-        assert caps == {k: WIDE_ROWS[k, dcp] for k in kinds}
+        for recoverssm in (False, True):
+            caps = wide_caps(dcp, recoverssm)
+            expected = {k: WIDE_ROWS[k, dcp] for k in kinds}
+            assert caps == {**expected, "kda": KDA_WIDE_ROWS[recoverssm]}
 
 
 @pytest.mark.parametrize("pitch", [PITCH, 6288 // 8 * 8])
@@ -3447,12 +3598,9 @@ def test_fp8_cache_insert_divides_by_k_scale(batch):
     "fp8" row (each value divided by k_scale), bit for bit, with a k_scale that is
     not a power of two and k_pe values exactly halfway between two E4M3 codes after
     the divide (multiplying by the rounded inverse misses the tie)."""
-    import cutlass
-
     from vllm import _custom_ops as ops
     from vllm import ir
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.common.host import (
-        stream,
         to_cute,
     )
     from vllm.platforms import current_platform
@@ -3491,7 +3639,7 @@ def test_fp8_cache_insert_divides_by_k_scale(batch):
     unit = torch.ones(1, device=dev)
     args = (to_cute(projected), *(to_cute(w) for w in weights[:4]), to_cute(mla))
     args += (to_cute(slots, 8), to_cute(unit, 4), to_cute(k_scale, 4))
-    query_kernel(*args, cutlass.Float32(EPS), to_cute(query), to_cute(q_c), stream(dev))
+    call_query(query_kernel, args, EPS, query, q_c, weights, projected)
 
     stock = packed_cache(blocks, UNIT, FP8_ROW)
     with ir.ops.rms_norm.set_priority(["vllm_c", "native"]):

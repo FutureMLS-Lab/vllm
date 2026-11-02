@@ -87,6 +87,13 @@ def triton_sigmoid(value):
     return div_full(Float32(1), Float32(1) + triton_exp(-value))
 
 
+def record_row(args, request):
+    """A request's RecoverSSM record slot: its row of the step, or under deferred
+    RecoverSSM (operands record_rows [B] and pending after the records) its
+    request-state slot record_rows[row]."""
+    return args[20][request] if len(args) > 20 else request
+
+
 def advance(base, n):
     """``base + n``, or ``base`` itself for a static zero ``n`` (keeps q = 1 code)."""
     return base + n if n else base
@@ -101,9 +108,10 @@ def store_evict_f32x4(pointer, values):
 
 class KdaSplit:
     """128 main threads and C value partitions. Conv state [slot, 3 * heads * 128, 3]
-    and recurrent state [slot, head, value, key] keep their strides; slots <= 0 are
-    padding (never written) and active rows own distinct slots. Weights must be ready
-    at launch; each run waits for prior cache restoration and slot publication.
+    (BF16 or FP32) and recurrent state [slot, head, value, key] keep their strides;
+    slots <= 0 are padding (never written) and active rows own distinct slots. Weights
+    must be ready at launch; each run waits for prior cache restoration and slot
+    publication.
 
     ``schedule`` = (early, lanes per state row, minimum CTAs per SM, CTAs per head);
     zeros keep the batch defaults. Two CTAs per head give each CTA 64 state rows and
@@ -265,7 +273,9 @@ class KdaSplit:
                             values = load_f32x4(state_row(row, column))
                             for e in cutlass.range_constexpr(4):
                                 history[p, j, e] = values[e]
-                taps = zeros((3, 3), BFloat16)
+                # BF16 or FP32 conv state (every tap a BF16 input, exact in both).
+                conv_type: cutlass.Constexpr = conv_state.element_type
+                taps = zeros((3, 3), conv_type)
                 coeff = zeros((3, 4), weights.element_type if self.early else Float32)
                 accum = zeros(3 * T, Float32)
                 for s in cutlass.range_constexpr(3):
@@ -324,7 +334,9 @@ class KdaSplit:
                     shared_k[advance(thread, 128 * t)] = k
                     if cutlass.const_expr(self.record):  # noqa: SIM102
                         if partition == 0:
-                            args[19][request, head, t, thread] = BFloat16(k)
+                            args[19][record_row(args, request), head, t, thread] = (
+                                BFloat16(k)
+                            )
                     vs.append(v)
                     qks += [q, k]
                     if cutlass.const_expr(t == T - 1):  # noqa: SIM102
@@ -403,7 +415,9 @@ class KdaSplit:
                         lanes = (group, group_lane)
                         corrections = None
                         if cutlass.const_expr(self.record):
-                            corrections = args[18][request, head, t, None]
+                            corrections = args[18][
+                                record_row(args, request), head, t, None
+                            ]
                         self.update(
                             history,
                             dots,
@@ -441,7 +455,7 @@ class KdaSplit:
                         *(inputs[3 * t + 2] for t in range(T)),
                     )
                     for i, value in enumerate(window):
-                        conv_page[channel, i] = value
+                        conv_page[channel, i] = conv_type(value)
 
                 for t in cutlass.range_constexpr(T):
                     if partition == t % self.cluster:
@@ -467,7 +481,7 @@ class KdaSplit:
                                     inputs[3 * u + section] for u in range(T)
                                 )
                                 for i, value in enumerate(window):
-                                    conv_page[channel, i] = value
+                                    conv_page[channel, i] = conv_type(value)
 
     @cute.jit
     def store_rows(self, history, state_row, span, lanes, when=None):
@@ -645,7 +659,7 @@ class KdaSplit:
                 targets = (shared_decay, barrier, value_base)
                 key_gate = None
                 if cutlass.const_expr(self.record):  # this request's raw gates
-                    key_gate = args[19][request, head, None, None]
+                    key_gate = args[19][record_row(args, request), head, None, None]
                 return self.multicast(acc, gates, targets, lane, key_gate)
             raw_g = []
             for r in cutlass.range_constexpr(per):

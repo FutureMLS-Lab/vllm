@@ -55,8 +55,16 @@ from ..common.primitives import (
 
 KP = 1536 + 32  # padded Q_B / x row (elements): 3136 B, conflict-free 16 B fragments
 # The smallest batch on the tiled kernel (per head count):
-# its 16-request tiles beat FP32 FMAs from B4 at 12 heads and from B6 at 6 heads.
+# its 16-request tiles beat FP32 FMAs from B4 at 12 heads and from B6 at 6 heads;
+# other head counts (TP1 / DEP: 96) tile from B4.
 TILED_FROM = {12: 4, 6: 6}
+
+
+def tiled_from(heads: int) -> int:
+    """The smallest batch MlaQuery tiles at ``heads`` local heads."""
+    return TILED_FROM.get(heads, 4)
+
+
 Q_SENT = 0xFFFFFFFF  # q mailbox sentinel: four FP8 0xFF bytes, never written
 # fp8_ds_mla row: 512 FP8 latent bytes, 4 FP32 tile scales, 64 BF16 k_pe.
 DS_SCALES, DS_ROPE = 512, 528
@@ -125,7 +133,7 @@ class MlaQuery:
         assert not nvfp4 or (dsa and fp8), "nvfp4_ds_mla takes the FP8 DSA query"
         # The q_a RMSNorm in the Triton form (K3 MLA), else vllm_c's (K3.1 DSA).
         self.triton_norms = not dsa
-        tiled = TILED_FROM[heads]
+        tiled = tiled_from(heads)
         self.heads, self.batch, self.wide = heads, batch, batch >= tiled
         self.dcp, self.dsa = dcp, dsa
         self.qc_rows, self.poll = dsa and store_qc, dcp and poll

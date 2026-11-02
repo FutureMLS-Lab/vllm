@@ -29,6 +29,7 @@ DcpValue merges this rank's heads by LSE.
 
 The packed projection row is [q_a 1536 | kv_a 576 | gate H*128 | wk 128 | wv 32]."""
 
+import math
 from functools import cache
 
 import cutlass.cute as cute
@@ -38,10 +39,18 @@ from cutlass.cute.runtime import make_fake_stream
 from ..common.host import fake, layout, stream, to_cute
 from ..mla.dcp import PROJECTED
 from ..mla.prepared import pad_requests
-from ..mla.value import MlaValue
+from ..mla.query_wide import fi_heads
+from ..mla.value import MlaGate, MlaValue, value_bmm
 from .attn_ds import flashmla_core, flashmla_dcp_core
 from .attn_fi import FlashInferCore, dsa_on_flashinfer, fi_kernels, kernel_for
-from .dcp_stage import compile_dcp_value, local_slots, publish_args, run_value
+from .attn_sparse import compile_sparse, run_sparse, sparse_for
+from .dcp_stage import (
+    compile_dcp_value,
+    local_slots,
+    projected_rows,
+    publish_args,
+    run_value,
+)
 from .indexer import PAGE as INDEX_PAGE
 from .indexer import FusedIndexer
 from .indexer import reserve as reserve_fused_indexer
@@ -66,7 +75,9 @@ from .query_stage import (
     compile_query,
     compile_wait,
     gate_columns,
+    runs_split,
 )
+from .topk_exchange import reserve as reserve_exchange
 
 __all__ = [
     "QUERY_HEADS",
@@ -93,6 +104,16 @@ HELD_KERNELS = ("prims_ts", "trtllm")
 # many rows (0: never). Under fork it measured no gain (QueryNorm stays a launch);
 # under DCP8 wait it lost 1-8 us (it would wait on MlaQuery's q mailbox poll).
 FUSED_INDEX = 64
+# TP on the MXFP4 indexer cache: the fused indexer serves layers whose verify steps
+# take at most this many tokens per request. At q = 8 its scorer holds one TMEM
+# accumulator (MMA and epilogue serialize) and DeepGEMM's MXFP4 logits with the
+# stock top-k win at every batch (GB300, q8, us per layer fused / stock: 32K R1 /
+# R4 / R16 / R64 23.5 / 20.1, 33.9 / 28.1, 77.1 / 60.2, 304 / 240; 128K R1 / R4 /
+# R16 / R64 38.0 / 28.6, 82.9 / 57.5, 271 / 202, 1079 / 941), while at q = 7 the
+# fused one wins everywhere (32K R4 / R16 / R64 22.5 / 27.1, 33.0 / 56.0, 102 /
+# 180; 128K 37.7 / 55.5, 80.0 / 180, 284 / 582). Under DCP the fused scorer and
+# local select stay at q = 8 (R4 / R16 within 5%, 32K R64 23.9 / 34.2).
+FUSED_TP_MAX_Q = 7
 
 
 @cache
@@ -113,6 +134,7 @@ def compile_core(
     partials="bf16",
     cap=64,
     release=True,
+    pushed=False,
 ):
     """CuTe kernels (query, index, value) of one batch of rows (``q`` per request).
     ``specs``: the layouts of the weights, the MLA cache and the indexer cache.
@@ -124,12 +146,13 @@ def compile_core(
     ``lse_base_e``, else base 2). ``nvfp4``: that FP8 query over an nvfp4_ds_mla
     cache (FlashInfer prims_ts). ``overlap``: the query overlap mode (overlap.py).
     ``partials``: the DcpBox's partial rows. ``release``: the query launches the
-    next kernel early (PDL)."""
+    next kernel early (PDL). ``pushed``: DcpValue only merges (the sparse decode
+    pushes the rows, attn_sparse)."""
     qnorm, kvnorm, qb, uk, uv, kv, index_kv = (
         fake(shape, stride, dtype, 4 if dtype == torch.float32 else 16)
         for shape, stride, dtype in specs
     )
-    query_heads = heads if fp8 else QUERY_HEADS
+    query_heads = fi_heads(heads) if fp8 else QUERY_HEADS
     with torch.accelerator.device_index(device):
         fakes = qnorm, kvnorm, qb, uk, kv
         query_kernel = compile_query(
@@ -149,16 +172,31 @@ def compile_core(
         index_kernel = compile_index(batch, heads, pitch, index_kv)
         if dcp:
             args = heads, dcp, batch, specs[4], pitch, device, sms, q, q_heads
-            value_kernel = compile_dcp_value(*args, fp8, lse_base_e, partials, cap)
+            value_kernel = compile_dcp_value(
+                *args, fp8, lse_base_e, partials, cap, pushed
+            )
         else:
             latent = fake((batch, heads, 512), (query_heads * 512, 512, 1))
             gate = fake((batch, heads * 128), (pitch, 1))
             lengths = fake((batch // q,), (1,), torch.int32, 4)
             output = fake((batch, heads * 128), (heads * 128, 1))
-            value = MlaValue(heads, batch, q)
-            v_args = (latent, uv, gate, lengths, output, make_fake_stream())
-            value_kernel = cute.compile(value, *v_args)
+            if fp8 and value_bmm(heads, batch):  # W_UV bmm, then MlaGate
+                values = fake((heads, batch, 128), (batch * 128, 128, 1))
+                gated = MlaGate(heads, batch, q)
+                v_args = (values, gate, lengths, output, make_fake_stream())
+                value_kernel = cute.compile(gated, *v_args)
+            else:
+                value = MlaValue(heads, batch, q)
+                v_args = (latent, uv, gate, lengths, output, make_fake_stream())
+                value_kernel = cute.compile(value, *v_args)
     return query_kernel, index_kernel, value_kernel
+
+
+@cache
+def value_rows(device, rows, heads):
+    """The W_UV bmm's value rows [H * rows * 128] BF16 of the wide TP / TP1 value
+    projection (mla.value.value_bmm), shared by every DSA layer of a device."""
+    return torch.empty(heads * rows * 128, dtype=torch.bfloat16, device=device)
 
 
 def kv_cache_blocks():
@@ -231,22 +269,55 @@ class PreparedDsa:
         self.heads = layer.W_UK_T.shape[0]
         self.device, self.pitches = layer.W_UK_T.device, pitches
         *shared, fi_buffers = scratch
-        self.query_stage = QueryStage(attention, pitches, shared, self.fp8, self.nvfp4)
+        dcp_size = self.dcp if self.dcp > 1 else 0
+        self.query_stage = QueryStage(
+            attention, pitches, shared, self.fp8, self.nvfp4, dcp_size
+        )
         # Under DCP on FlashInfer: the #63 merge's owned-row outputs (indexer_stage).
         merge_rows = max(pitches) if self.dcp > 1 and self.fp8 else 0
         self.indexer_stage = IndexerStage(self.indexer, merge_rows)
+        # ... and the NVLink candidate exchange that replaces its all-gather
+        # (topk_exchange; symmetric over the DCP group: collective, every rank
+        # builds its DSA layers in the same order).
+        self.exchange = None
+        if self.indexer_stage.local_topk:
+            args = dcp.group, self.device, dcp.size, dcp.rank, dcp.cap
+            self.exchange = reserve_exchange(*args, self.indexer_stage.local_topk)
         self.shapes = [(b, q) for b in pitches for q in queries if b % q == 0]
         self.fi = None
-        self.overlaps = {
-            (b, q): overlap_for(b, overlap, self.dcp > 1) for b, q in self.shapes
+        # The split query (mla.query_wide): TP1 (many heads) at every batch, TP8
+        # and DCP8 from SPLIT_FROM rows.
+        self.split = {
+            (b, q): runs_split(self.heads, b, dcp_size, self.fp8)
+            for b, q in self.shapes
         }
+        self.overlaps = {
+            (b, q): overlap_for(
+                b, overlap, self.dcp > 1, self.heads >= 64, self.split[b, q]
+            )
+            for b, q in self.shapes
+        }
+        # The split query has no late mode (it follows no select) and, under DCP,
+        # no serial one (it does not poll the q mailbox: QueryWait does).
+        for shape, split in self.split.items():
+            mode = self.overlaps[shape]
+            if split and (mode in LATE or (mode == "serial" and self.dcp > 1)):
+                self.overlaps[shape] = "front" if mode in FRONT else "fork"
         if self.fp8:
             if kernels is None:
                 kernels = fi_kernels(layer.kv_cache_dtype)
             dcp_size = self.dcp
-            rows = {b: kernel_for(b, dcp_size > 1, kernels) for b in pitches}
+            # TP1's 96 heads run head-padded to 128 (fi_heads; the pad heads are
+            # zero), on every FlashInfer build.
+            heads = dcp.q_heads if dcp is not None else fi_heads(self.heads)
+            rows = {b: kernel_for(b, dcp_size > 1, kernels, heads) for b in pitches}
+            if dcp is not None and not self.nvfp4 and "sparse" in kernels:
+                # The specialized sparse decode (attn_sparse) where it is faster.
+                gathered = dcp.size * self.heads
+                for b in pitches:
+                    if sparse_for(b, gathered, heads):
+                        rows[b] = "sparse"
             self.cores = {(b, q): rows[b] for b, q in self.shapes}
-            heads = dcp.q_heads if dcp is not None else self.heads
             sharding = dcp_size, self.indexer.dcp_rank
             # The merge's rows are narrower than the top-k: plan both widths.
             merged = self.indexer_stage.local_topk
@@ -275,11 +346,19 @@ class PreparedDsa:
                 (rows,), self.indexer.max_model_len, dtype=torch.int32, device=device
             )
         self.kernels, self.overlap_kernels = {}, {}
+        self.sparse_kernels: dict = {}
         local_topk = self.indexer_stage.local_topk
         static = (
             fused_indexer_static_unsupported(self.indexer, *s) for s in self.shapes
         )
-        if self.fp8 and (self.dcp == 1 or local_topk) and not any(static):
+        # TP: the stock decode indexer where it is faster (FUSED_TP_MAX_Q).
+        self.stock_indexer = (
+            self.dcp == 1
+            and getattr(self.indexer, "use_fp4_cache", False)
+            and max(queries) > FUSED_TP_MAX_Q
+        )
+        fused_tp = self.dcp == 1 and not self.stock_indexer
+        if self.fp8 and (fused_tp or local_topk) and not any(static):
             # The fused indexer's buffers (prepare_cache), shared by every layer,
             # sized for the longest context the KV cache can hold: reserved now, as
             # the specialized decode is built before vLLM profiles its memory for
@@ -287,10 +366,18 @@ class PreparedDsa:
             # aside, the same checks).
             args = self.indexer, self.device, max(pitches), local_topk
             reserve_fused_indexer(*args, blocks=kv_cache_blocks())
-        # DCP "proj" partials: every gathered head's W_UV (collective).
+        # DCP "proj" partials: every gathered head's W_UV (collective), and the
+        # rows of its bmm (dcp_stage.projected_rows).
         self.uv_gathered = dcp.value_weights(layer.W_UV) if dcp else None
+        if self.uv_gathered is not None:
+            projected_rows(self.device, dcp.cap, dcp.size * self.heads)
         # TP on FlashInfer: the fused decode indexer (prepare_cache; None: stock).
         self.fused: FusedIndexer | None = None
+        # The wide value projection's rows (value_bmm), allocated before the KV
+        # cache is sized.
+        wide_values = any(value_bmm(self.heads, b) for b in pitches)
+        if self.fp8 and self.dcp == 1 and wide_values:
+            value_rows(self.device, max(pitches), self.heads)
 
     @property
     def query(self):
@@ -303,7 +390,7 @@ class PreparedDsa:
         specs = tuple(layout(w) for w in (*weights, *caches))
         sms = torch.cuda.get_device_properties(self.device).multi_processor_count
         unsupported = [fused_indexer_unsupported(self.indexer, *s) for s in self.shapes]
-        fused = self.box is None and self.fp8
+        fused = self.box is None and self.fp8 and not self.stock_indexer
         fused = fused and not any(unsupported)
         if not fused:  # the late query follows the fused indexer's select
             # Without it (fp8_ds_mla, unsupported shapes) the TP default is the
@@ -321,6 +408,7 @@ class PreparedDsa:
                 partials = self.box.mailbox(batch).format
             lse_base_e = self.cores[batch, q] != "trtllm"  # trtllm-gen: base 2
             overlap = self.overlaps[batch, q]
+            pushed = self.pushes(batch, q)
             cap = self.box.cap if self.box is not None else 64
             self.kernels[batch, q] = compile_core(
                 *args,
@@ -331,10 +419,19 @@ class PreparedDsa:
                 partials=partials,
                 cap=cap,
                 release=(batch, q) not in self.held(LATE),
+                pushed=pushed,
             )
             if overlap != "serial" or batch <= FUSED_INDEX:
                 self.overlap_kernels[batch, q] = self.compile_overlap(
                     batch, q, specs[6]
+                )
+            if self.cores[batch, q] == "sparse" and batch not in self.sparse_kernels:
+                assert self.fi is not None and self.box is not None
+                gathered, box = self.dcp * self.heads, self.box
+                args = batch, gathered, box.q_heads, self.fi.topk, box.cap
+                push = (self.heads, self.dcp) if pushed else None
+                self.sparse_kernels[batch] = compile_sparse(
+                    *args, self.device.index, push=push
                 )
         rows = max(self.pitches)
         if fused:
@@ -354,8 +451,17 @@ class PreparedDsa:
                 rows,
                 local_topk=stage.local_topk,
                 packed=True,
+                page=kv.shape[1],
+                exchange=self.exchange,
             )
         return self
+
+    def pushes(self, batch, q):
+        """Whether the sparse decode of (batch, q) pushes its rows into DcpValue's
+        "bf16" mailbox itself (DcpValue ``pushed``)."""
+        if self.box is None or self.cores[batch, q] != "sparse":
+            return False
+        return self.box.mailbox(batch).format != PROJECTED
 
     def held(self, modes):
         """The shapes on a FlashInfer kernel (HELD_KERNELS) whose overlap mode is
@@ -453,8 +559,11 @@ class PreparedDsa:
             return lambda: wait(*mailbox, stream(self.device))
         main = torch.cuda.current_stream(self.device)
         side = side_stream(self.device.index)
+        split = self.split[batch, q]
+        if split and mode == "fork":  # the split query projects QueryNorm's q_c
+            stage.run_norm(norm, projected)
         side.wait_stream(main)
-        if mode == "fork":
+        if mode == "fork" and not split:
             stage.run_norm(norm, projected)
         with torch.cuda.stream(side):
             stage.run_query(query, projected, cache, slots, publish)
@@ -487,7 +596,8 @@ class PreparedDsa:
         indexer, md = self.indexer, metadata
         query = self.box.q[self.parity, :batch]
         if self.fi is not None:
-            stride_rows = self.fi.rows(cache, md.block_size)[1]
+            kv, stride_rows = self.fi.rows(cache, md.block_size)
+            sparse = self.cores[batch, q] == "sparse"
             merged = None
             if topk is None and self.indexer_stage.local_topk:
                 stage = self.query_stage
@@ -501,6 +611,9 @@ class PreparedDsa:
                 merged = self.fi.convert(*args)
             if join is not None:
                 join()
+            if sparse:
+                latent, lse = self.sparse_decode(kv, *merged, batch, q)
+                return latent, lse, merged[1]
             latent, lse = self.fi.decode(query, cache, *merged, md.block_size)
             return latent, lse, merged[1]
         if topk is None:
@@ -523,6 +636,26 @@ class PreparedDsa:
             self.impl, query, pages, slots, valid, out, table, lens
         )
 
+    def sparse_decode(self, kv, rows, valid, batch, q):
+        """The specialized sparse decode (attn_sparse) of every rank's gathered query
+        heads over this rank's flat ``kv`` rows ``rows`` / ``valid``: into the
+        owners' DcpValue mailbox where it pushes (``pushes``), else into the
+        FlashInfer core's latent [B, Q, 512] and natural-log LSE [B, Q] buffers."""
+        fi, layer, box = self.fi, self.layer, self.box
+        assert fi is not None and box is not None and fi.fmt == "native"
+        assert rows.shape[1] == fi.topk and rows.stride(1) == 1, rows.shape
+        padded = box.q_heads
+        latent = fi.latent[: batch * padded * 512].view(batch, padded, 512)
+        lse = fi.lse[: batch * padded].view(batch, padded)
+        softmax = self.impl.scale * layer._q_scale_float * layer._k_scale_float
+        scale_log2 = softmax * math.log2(math.e)
+        args = box.q[self.parity], kv, rows, valid, latent, lse, scale_log2
+        push = None
+        if self.pushes(batch, q):
+            push = box.mailbox(batch), self.parity, box.rank
+        kernel = self.sparse_kernels[batch]
+        return run_sparse(kernel, *args, layer._k_scale_float, push=push)
+
     def run_dcp(self, projected, out, cache, slots, index_slots, metadata, q):
         """``run`` under DCP: the query publishes into the q mailbox and DcpValue
         merges every rank's partial rows of this rank's heads (global lengths)."""
@@ -535,11 +668,11 @@ class PreparedDsa:
         join = self.run_query(projected, cache, slots, q, publish)
         self.run_index(index, projected, index_slots, q)
         core = self.dcp_core(cache, None, metadata, batch, projected, join, q)
-        uv = stage.views[4]
+        uv, w_uv = stage.views[4], None
         if box.mailbox(batch).format == PROJECTED:
-            uv = self.uv_gathered[1]
+            uv, w_uv = self.uv_gathered[1], self.uv_gathered[0]
         args = value, box, p, publish, self.heads, core, lengths[:reqs], uv
-        return run_value(*args, projected, out)
+        return run_value(*args, projected, out, w_uv)
 
     def run(self, projected, out, *, cache, slots, index_slots, metadata, q=1):
         """``projected``: the packed projection rows; ``out`` [B, H * 128] gets the
@@ -564,5 +697,14 @@ class PreparedDsa:
             latent = self.sparse_core(cache, topk, metadata, batch, q)
         gate = to_cute(projected[:, slice(*gate_columns(self.heads))])
         lens, uv = to_cute(lengths[:reqs], 4), stage.views[4]
+        if self.fp8 and value_bmm(self.heads, batch):
+            # W_UV as the stock decode's bmm over the heads, then MlaGate.
+            heads = self.heads
+            values = value_rows(self.device, max(self.pitches), heads)
+            values = values[: heads * batch * 128].view(heads, batch, 128)
+            rows = latent[:batch, :heads].transpose(0, 1)
+            torch.bmm(rows, stage.weights[4], out=values)
+            value(to_cute(values), gate, lens, to_cute(out), s)
+            return out
         value(to_cute(latent[:, : self.heads]), uv, gate, lens, to_cute(out), s)
         return out

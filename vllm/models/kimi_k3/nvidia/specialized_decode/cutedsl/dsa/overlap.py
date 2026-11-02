@@ -5,7 +5,7 @@ and top-k, under DCP the top-k merge and the local slots) needs only the normali
 q_c rows of the query, so the rest of the query stage leaves the critical path:
 
   QueryNorm   q_a RMSNorm -> the q_c rows, on the main stream ahead of wq_b
-              (bit-identical to MlaQuery's: its scalar form below TILED_FROM rows,
+              (bit-identical to MlaQuery's: its scalar form below tiled_from rows,
               its tiled kernel's packed FP32 pairs from there)
   MlaQuery    Q_B, W_UK absorption, the query rows, the MLA KV insert and, under
               DCP, the q mailbox publish, on a side stream (``store_qc=False``,
@@ -40,7 +40,7 @@ from ..common.primitives import (
     unpack_bf16,
     warp_sum,
 )
-from ..mla.query import Q_SENT, TILED_FROM
+from ..mla.query import Q_SENT, tiled_from
 
 # serial: MlaQuery (q_c, publish and poll) -> wq_b -> ... -> core (one stream).
 # fork: QueryNorm -> wq_b -> ... -> join -> core, MlaQuery (+ QueryWait) forked.
@@ -67,9 +67,22 @@ from ..mla.query import Q_SENT, TILED_FROM
 #   wins at 128K / AgentX (R64 -10.2 / -0.4, R48 -7.5 / -5.0, R32 -3.4 / -2.6 us)
 #   and loses at 8K / 32K (R26 +6.3 / +4.4, R48 +4.3 / +1.6 us); front everywhere
 #   (the long-context AgentX workload). wait with IndexFrontMma lost 1-8 us.
+# - TP1 (DEP, 96 heads: the split query, mla.query_wide): fork (QueryNorm, then the
+#   Q_B projection and MlaAbsorb on the side stream beside the indexer path).
+# - DCP8 with the split query (mla.query_wide, from SPLIT_FROM rows): its four
+#   kernels (QueryNorm, Q_B, MlaAbsorb publishing, QueryWait) forked beside the
+#   index front and the persistent scorer wait for SMs the indexer holds, so at the
+#   widest batches they run ahead of the indexer on the main stream ("wait":
+#   QueryWait before the core). GB300 DCP8 whole layer, us (32K / AgentX): R8 fork
+#   117.2 / 120.8, wait 123.4 / 127.5; R16 fork 134.0, front 137.7, wait 142.1
+#   (MlaQuery front 147.0); R32 fork 169.9 / 184.7, wait 183.6 / 190.6; R48 wait
+#   207.5 / 219.4, fork 233.6 / 249.8; R64 wait 250.0, fork 295.5, front 320.1
+#   (MlaQuery front 271.8).
 QUERY_OVERLAP = {
     "tp": "1-20:late_front,21-320:fork",
     "dcp": "1-320:front",
+    "dcp_split": "1-239:fork,240-320:wait",
+    "tp1": "1-320:fork",
 }
 # TP without the fused indexer (the late modes follow its select): the TP table the
 # stack ran before them.
@@ -80,13 +93,23 @@ NORM = ("fork", "late")  # QueryNorm writes the q_c rows
 FRONT = ("front", "late_front")  # IndexFront
 
 
-def overlap_for(batch, policy=None, dcp=False):
+# The modes of the split query (TP1): QueryNorm ahead of it, or forked beside it.
+WIDE_MODES = ("serial", "fork")
+
+
+def overlap_for(batch, policy=None, dcp=False, wide=False, split=False):
     """The query overlap mode of ``batch`` rows: ``policy`` is a mode or a
-    "rows:mode,..." table (default QUERY_OVERLAP of the topology, ``dcp``)."""
-    policy = policy or QUERY_OVERLAP["dcp" if dcp else "tp"]
+    "rows:mode,..." table (default QUERY_OVERLAP of the topology, ``dcp``;
+    ``wide``: the split query of TP1, WIDE_MODES only; ``split``: the split query
+    of fewer heads, under DCP its own table)."""
+    topology = "tp1" if wide else "dcp" if dcp else "tp"
+    if split and dcp and not wide:
+        topology = "dcp_split"
+    policy = policy or QUERY_OVERLAP[topology]
     mode = policy if policy in MODES else batch_table(policy).get(batch, "fork")
-    if mode not in MODES:
-        raise ValueError(f"Kimi K3.1 DSA query overlap {mode!r}: expected {MODES}")
+    modes = WIDE_MODES if wide else MODES
+    if mode not in modes:
+        raise ValueError(f"Kimi K3.1 DSA query overlap {mode!r}: expected {modes}")
     return mode
 
 
@@ -102,7 +125,7 @@ class QueryNorm:
 
     def __init__(self, heads: int, batch: int):
         self.batch = batch
-        self.wide = batch >= TILED_FROM[heads]
+        self.wide = batch >= tiled_from(heads)
         self.grid = -(-batch // 8) if self.wide else batch
 
     @cute.jit

@@ -2,7 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Indexer stage of a K3.1 DSA layer: the stock decode scoring and top-k
 (sparse_attn_indexer, its key insert skipped: DsaIndex inserted the key) of the FP8
-indexer query and head weights into the model's shared top-k buffer. Under DCP the
+or MXFP4 (index.py) indexer query and head weights into the model's shared top-k
+buffer. Under DCP the
 op merges the ranks' local top-k into global token ids.
 
 Under DCP on the FlashInfer core, when the layer's indexer has the one-round DCP
@@ -17,7 +18,7 @@ import torch
 
 from vllm.utils.torch_utils import _encode_layer_name
 
-from .index import DIM
+from .index import DIM, fp4_query_views, is_fp4_cache
 
 
 class IndexerStage:
@@ -44,17 +45,31 @@ class IndexerStage:
         self.dcp_ids: torch.Tensor | None = None
         # The fused DCP indexer (PreparedDsa.prepare_cache; None: DeepGEMM).
         self.fused = None
+        # MXFP4 keys and query (indexer_kv_dtype="mxfp4", kimi_k3_indexer_uses_fp4).
+        self.fp4 = indexer.use_fp4_cache
+
+    def query(self, q_fp8, rows):
+        """The stock op's (query, its scales or None) of the first ``rows`` rows:
+        FP8 [rows, 32, 128] (scales folded into the head weights), or MXFP4 E2M1
+        [rows, 32, 64] and UE8M0 x4 [rows, 32] (contiguous copies of the views in
+        the query rows, index.py)."""
+        if not self.fp4:
+            return q_fp8[:rows].view(torch.float8_e4m3fn), None
+        packed, scales = fp4_query_views(q_fp8, rows)
+        return packed.contiguous(), scales.contiguous()
         # -----------------------------------------------------------------------
 
     def run(self, projected, q_fp8, head_w):
         """Top-k of the current rows into the shared buffer (stock decode scoring)."""
         indexer, batch = self.indexer, projected.shape[0]
+        assert is_fp4_cache(indexer.k_cache.kv_cache) == self.fp4
+        query, q_scale = self.query(q_fp8, batch)
         return torch.ops.vllm.sparse_attn_indexer(
             projected,
             self.k_cache_name,
             indexer.k_cache.kv_cache,
-            q_fp8[:batch].view(torch.float8_e4m3fn),
-            None,
+            query,
+            q_scale,
             None,
             head_w[:batch],
             DIM,
@@ -68,7 +83,7 @@ class IndexerStage:
             False,
             False,
             _encode_layer_name(""),
-            False,
+            self.fp4,
             indexer.dcp_rank,
             indexer.dcp_world_size,
             indexer.cp_kv_cache_interleave_size,
@@ -135,6 +150,21 @@ class IndexerStage:
             ids_out=ids,
         )
         fused = self.fused
+        if (
+            fused is not None
+            and decode.seq_lens.numel() == rows
+            and (batch, q) in fused.exchange_kernels
+        ):
+            # NVLink candidate exchange + exact merge (topk_exchange): every
+            # row of the batch (rows past the requests have no keys, so they
+            # come out empty, as the fill below).
+            # The merge maps ids to rows of fused.page-token MLA blocks.
+            assert metadata.block_size == fused.page, (metadata.block_size, fused.page)
+            ids = None if self.dcp_ids is None else self.dcp_ids[:batch, : self.topk]
+            args = metadata.req_id_per_token, metadata.block_table, stride_rows
+            merge = (*args, slots, valid, max_local_len)
+            fused.run_exchange(q_fp8, head_w, decode, batch, q, merge, ids)
+            return slots, valid
         if fused is not None and decode.seq_lens.numel() == rows:
             # The logits stay valid until the merge returns (stream order): a
             # saturated rank re-reads its row in the exact merge's second round.
@@ -150,16 +180,19 @@ class IndexerStage:
                 slots[rows:].fill_(-1)
                 valid[rows:].zero_()
             return slots, valid
-        # As the stock op's decode branch (uniform rows, FP8 cache and query).
+        # As the stock op's decode branch (uniform rows; FP8 or MXFP4 cache and
+        # query).
         reqs = decode.decode_lens.shape[0]
         next_n = rows // reqs
-        query = q_fp8[:rows].view(torch.float8_e4m3fn)
+        query, q_scale = self.query(q_fp8, rows)
         query = query.view(reqs, next_n, *query.shape[1:])
-        q_scale, weights = mqa_logits_mx_inputs(query, None, head_w[:rows])
+        if q_scale is not None:
+            q_scale = q_scale.view(reqs, next_n, -1)
+        q_scale, weights = mqa_logits_mx_inputs(query, q_scale, head_w[:rows])
         seq_lens = decode.seq_lens[:reqs]
         logits = fp8_fp4_paged_mqa_logits(
             (query, q_scale),
-            kv_cache_as_quant_view(indexer.k_cache.kv_cache, DIM, False),
+            kv_cache_as_quant_view(indexer.k_cache.kv_cache, DIM, self.fp4),
             weights,
             seq_lens,
             decode.block_table,

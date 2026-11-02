@@ -23,6 +23,7 @@ from vllm.utils.deep_gemm import mqa_logits_use_mx_scales
 from ..common.host import fake, prepare_shared_carveout, stream, to_cute
 from ..gemm.projection import PreparedProjection, weight_map
 from ..mla.query import MlaQuery
+from ..mla.query_wide import MlaAbsorb, MlaQuant, absorb_bmm, fi_heads, split_query
 from .front import IndexFront
 from .front_mma import IndexFrontMma
 from .index import DIM, HEADS, DsaIndex
@@ -42,6 +43,52 @@ def index_policies(batches):
     tactics = {8: (128, 8, 3, 4), 16: (64, 16, 2, 6), 32: (64, 32, 1, 8)}
     tactics[64] = (64, 64, 1, 4)
     return {b: tactics[next((n for n in tactics if b <= n), 64)] for b in batches}
+
+
+def q_b_policies(batches, heads=96):
+    """Split-K tactics of the split query's Q_B projection (``q_b_wide_policies``
+    from WIDE_HEADS heads; below, the TP8 shard: N = 12 * 192 = 2304, 64-row weight
+    tiles split K four ways up to 32 rows, then two ways). GB300, 12 heads, L2
+    flushed, us (SOL 0.94): 5 rows 5.3 (64,8,4,4; 6.8 with 128-row tiles), 40 rows
+    7.3 (64,64,2,4; 9.1 split four ways), 80 rows 7.6 (64,64,2,4; 9.5 with one
+    128-row batch tile), 320 rows 11.2 (64,160,2,3; 13.6 with 128-row tiles, 16.8
+    with 128-row batch tiles)."""
+    if heads >= 64:
+        return q_b_wide_policies(batches)
+    tactics = {8: (64, 8, 4, 4), 16: (64, 16, 4, 4), 32: (64, 32, 4, 4)}
+    tactics.update({64: (64, 64, 2, 4), 128: (64, 64, 2, 4)})
+    tactics[160] = (64, 160, 2, 3)
+    return {b: tactics[next((n for n in tactics if b <= n), 160)] for b in batches}
+
+
+def q_b_wide_policies(batches):
+    """Split-K tactics of the split query's Q_B projection (N = H * 192, K 1536;
+    query_wide): 128-row weight tiles (144 at 96 heads: one wave), no split, one
+    batch tile up to 160 rows (each batch tile re-streams the weight). GB300,
+    96 heads, L2 flushed, us: 5 rows 13.6 (8-row tiles; 14.0-36.6 for the
+    others), 20 rows 14.2 (32), 80 rows 15.2 (128; 24.6 with 64-row tiles), 320
+    rows 32.8 (160; 52.5 with 64, 37.8 with 128, 43.2 with 256)."""
+    tactics = {8: (128, 8, 1, 4), 16: (128, 16, 1, 6), 32: (128, 32, 1, 5)}
+    tactics.update({64: (128, 64, 1, 4), 128: (128, 128, 1, 3)})
+    tactics[160] = (128, 160, 1, 3)
+    return {b: tactics[next((n for n in tactics if b <= n), 160)] for b in batches}
+
+
+def runs_split(heads, batch, dcp, fp8):
+    """Whether the MLA query of ``batch`` rows runs split (mla.query_wide): at many
+    heads always (FlashInfer only), at few heads (TP8 / DCP8) on FlashInfer's
+    per-tensor FP8 query from SPLIT_FROM rows."""
+    return split_query(heads, batch, dcp) and (fp8 or heads >= 64)
+
+
+class WideQuery:
+    """compile_query's result at query_wide heads: the q_a RMSNorm (QueryNorm, None
+    when the overlap mode's main-stream QueryNorm writes the q_c rows), then the
+    layer's Q_B projection (QueryStage.q_projection) and MlaAbsorb, or (``bmm``,
+    query_wide.absorb_bmm) the W_UK bmm and MlaQuant."""
+
+    def __init__(self, norm, absorb, bmm=False):
+        self.norm, self.absorb, self.bmm = norm, absorb, bmm
 
 
 def compile_query(
@@ -68,6 +115,17 @@ def compile_query(
     ``release``: launch the next kernel early (PDL)."""
     qnorm, kvnorm, qb, uk, kv = fakes
     scalar = fake((1,), (1,), torch.float32, 4)
+    if runs_split(heads, batch, dcp, fp8):
+        # Under DCP QueryWait polls the q mailbox (MlaAbsorb only publishes).
+        assert not dcp or overlap != "serial", "the split query does not poll"
+        # FlashMLA sparse's BF16 query rows hold QUERY_HEADS (64) heads.
+        assert fp8, "the split query writes the FlashInfer (per-tensor FP8) query"
+        norm = (
+            None if overlap in ("fork", "late") else compile_norm(batch, heads, pitch)
+        )
+        box = (dcp, q_heads, cap) if dcp else None
+        absorb = compile_absorb(batch, heads, pitch, fakes, fp8, nvfp4, release, box)
+        return WideQuery(norm, absorb, absorb_bmm(heads, batch))
     if fp8:
         query = fake((batch, heads, 576), (heads * 576, 576, 1), torch.uint8)
     else:
@@ -100,6 +158,55 @@ def compile_query(
     if batch > 1:
         kernel = prepare_shared_carveout(kernel, device, 100)
     return kernel
+
+
+def compile_absorb(batch, heads, pitch, fakes, fp8, nvfp4, release, box=None):
+    """MlaAbsorb of one batch of rows (query_wide); ``box``: (DCP size, the q
+    mailbox's padded heads, its rows) to publish into under DCP."""
+    qnorm, kvnorm, _, uk, kv = fakes
+    scalar = fake((1,), (1,), torch.float32, 4)
+    if fp8:  # the first ``heads`` of the head-padded FlashInfer query rows
+        padded = fi_heads(heads) * 576
+        query = fake((batch, heads, 576), (padded, 576, 1), torch.uint8)
+    else:
+        query = fake((batch, QUERY_HEADS, 576), (QUERY_HEADS * 576, 576, 1))
+    projected = fake((batch, pitch), (pitch, 1))
+    q_rows = fake((batch, heads * 192), (heads * 192, 1))
+    slots = fake((batch,), (1,), torch.int64, 8)
+    dcp, q_heads, cap = box or (0, 0, 0)
+    kind = MlaAbsorb
+    if fp8 and absorb_bmm(heads, batch):  # the W_UK bmm's latent in W_UK's place
+        kind, uk = MlaQuant, fake((heads, batch, 512), (batch * 512, 512, 1))
+    absorb = kind(
+        heads,
+        batch,
+        dsa=True,
+        fp8=fp8,
+        nvfp4=nvfp4,
+        release=release,
+        dcp=dcp,
+        q_heads=q_heads,
+    )
+    eps = cutlass.Float32(1e-6)
+    args = (projected, qnorm, kvnorm, q_rows, uk, kv, slots, scalar, scalar, eps)
+    publish: tuple = ()
+    if dcp:  # this parity's q mailbox (bytes), its multicast address, rank
+        mailbox = fake((cap, q_heads, 576 if fp8 else 1152), None, torch.uint8)
+        publish = (mailbox, cutlass.Int64(0), cutlass.Int32(0))
+    return cute.compile(absorb, *args, query, *publish, make_fake_stream())
+
+
+@cache
+def absorb_rows(device, rows, heads):
+    """The W_UK bmm's BF16 latent [H * rows * 512] (query_wide.absorb_bmm), shared
+    by every DSA layer of a device."""
+    return torch.empty(heads * rows * 512, dtype=torch.bfloat16, device=device)
+
+
+@cache
+def q_rows_buffer(device, rows, columns):
+    """The split query's Q_B rows, shared by every DSA layer of a device."""
+    return torch.empty((rows, columns), dtype=torch.bfloat16, device=device)
 
 
 @cache
@@ -213,10 +320,10 @@ class QueryStage:
     query (FlashInfer), whose query rows are this layer's own, over a per-tensor FP8
     cache or (``nvfp4``) an nvfp4_ds_mla one, whose rows carry their own scales."""
 
-    def __init__(self, attention, pitches, scratch, fp8, nvfp4=False):
+    def __init__(self, attention, pitches, scratch, fp8, nvfp4=False, dcp=0):
         wrapper = attention.mla_attn
         layer, self.indexer = wrapper.mla_attn, attention.dsa_indexer
-        self.heads = layer.W_UK_T.shape[0]
+        self.heads, self.pitches = layer.W_UK_T.shape[0], pitches
         norms = wrapper.q_a_layernorm.weight, wrapper.kv_a_layernorm.weight
         self.weights: tuple = (*norms, wrapper.q_b_proj.weight, layer.W_UK_T)
         self.weights += (layer.W_UV,)
@@ -238,7 +345,8 @@ class QueryStage:
             k_scale = layer._k_scale.float().reshape(1).to(device)
             # nvfp4_ds_mla: the KV row is unscaled (prims_ts: kv_descale 1)
             self.scales = q_scale_inv, self.unit if nvfp4 else k_scale
-            shape = (max(pitches), self.heads, 576)
+            # FlashInfer's query heads (fi_heads): the pad heads stay zero.
+            shape = (max(pitches), fi_heads(self.heads), 576)
             self.query = torch.zeros(shape, dtype=torch.uint8, device=device)
         policies = index_policies(sorted(pitches))
         wq = self.indexer.wq_index.weight
@@ -246,6 +354,17 @@ class QueryStage:
         self.wq_view = to_cute(wq)
         # The fused index front's weight TMA map (128-row boxes: one head).
         self.wq_map = weight_map(wq, 128)
+        # The split query's Q_B projection and its rows (split_query: TP1 at every
+        # batch, TP8 at wide ones).
+        self.q_projection = self.q_rows = None
+        split = [b for b in pitches if runs_split(self.heads, b, dcp, fp8)]
+        if split:
+            q_b = self.weights[2]
+            policies = q_b_policies(sorted(split), self.heads)
+            self.q_projection = PreparedProjection(q_b, policies).prepare()
+            self.q_rows = q_rows_buffer(device, max(pitches), q_b.shape[0])
+            if any(absorb_bmm(self.heads, b) for b in split):
+                absorb_rows(device, max(pitches), self.heads)
 
     def run_query(self, kernel, projected, cache, slots, publish=()):
         """MlaQuery: query rows, the KV insert at ``slots`` and q_c (``publish``:
@@ -256,6 +375,22 @@ class QueryStage:
         q_scale_inv, k_scale = (to_cute(t, 4) for t in self.scales)
         x, q_slots = to_cute(projected), to_cute(slots[:batch], 8)
         scales = q_scale_inv, k_scale, self.eps
+        if isinstance(kernel, WideQuery):
+            assert self.q_projection is not None and self.q_rows is not None
+            if kernel.norm is not None:
+                self.run_norm(kernel.norm, projected)
+            rows = self.q_projection.run(self.qc[:batch], self.q_rows[:batch])
+            if kernel.bmm:  # W_UK as the stock decode's bmm over the heads
+                heads = self.heads
+                latent = absorb_rows(self.device, max(self.pitches), heads)
+                latent = latent[: heads * batch * 512].view(heads, batch, 512)
+                nope = rows.view(batch, heads, 192)[..., :128].transpose(0, 1)
+                torch.bmm(nope, self.weights[3], out=latent)
+                uk = to_cute(latent)
+            q_args = (x, qnorm, kvnorm, to_cute(rows), uk, kv, q_slots, *scales)
+            query = to_cute(self.query[:batch, : self.heads])
+            kernel.absorb(*q_args, query, *publish, s)
+            return
         q_args = (x, qnorm, kvnorm, qb, uk, kv, q_slots, *scales)
         query, qc = to_cute(self.query[:batch]), to_cute(self.qc[:batch])
         kernel(*q_args, query, qc, *publish, s)
