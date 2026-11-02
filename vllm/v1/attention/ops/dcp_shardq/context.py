@@ -139,6 +139,59 @@ def capacity_pages(max_tokens: int, max_reqs: int) -> int:
     return -(-max_tokens // PAGE_TOKENS) + max_reqs
 
 
+def scheduler_context_pages(vllm_config: "VllmConfig") -> int | None:
+    """The workspace pages the scheduler keeps each step's prefill rows
+    within (the sum over them of ``ceil(seq_len / 64)``), or None when DCP
+    ShardQ steps cannot run under this configuration.
+
+    With the cap, no step finds the workspace full, so the DCP path only runs
+    a step's leading decode rows and steps of fewer than
+    ``sparse_mla_shard_q_min_tokens`` prefill tokens, and the memory profile
+    reserves those (``dcp_fallback_max_tokens``) instead of a whole
+    ``max_num_batched_tokens`` step. These are the configuration-level
+    conditions of SparseMLAShardQ's DCP ShardQ; when its layer-level ones fail
+    the cap merely keeps a step's prefill context within ``max_model_len``.
+    """
+    parallel_config = vllm_config.parallel_config
+    kv_transfer_config = vllm_config.kv_transfer_config
+    dcp = parallel_config.decode_context_parallel_size
+    if (
+        not vllm_config.attention_config.sparse_mla_shard_q
+        or dcp <= 1
+        or dcp != parallel_config.tensor_parallel_size
+        or parallel_config.cp_kv_cache_interleave_size != 1
+        or parallel_config.use_ubatching
+        or parallel_config.prefill_context_parallel_size != 1
+        or (
+            kv_transfer_config is not None
+            and kv_transfer_config.kv_role == "kv_consumer"
+        )
+    ):
+        return None
+    return capacity_pages(
+        workspace_max_tokens(vllm_config), vllm_config.scheduler_config.max_num_seqs
+    )
+
+
+def dcp_fallback_max_tokens(vllm_config: "VllmConfig", decode_query_len: int) -> int:
+    """Most tokens of a step that keeps the DCP path under DCP ShardQ, given
+    the scheduler's context cap: its leading decode rows plus fewer than
+    ``sparse_mla_shard_q_min_tokens`` prefill tokens, or a padded step of at
+    most the DCP workspace's tokens."""
+    from vllm.v1.attention.ops.dcp import get_dcp_workspace_max_num_tokens
+
+    scheduler_config = vllm_config.scheduler_config
+    few_tokens = (
+        scheduler_config.max_num_seqs * decode_query_len
+        + vllm_config.attention_config.sparse_mla_shard_q_min_tokens
+        - 1
+    )
+    return min(
+        scheduler_config.max_num_batched_tokens,
+        max(few_tokens, get_dcp_workspace_max_num_tokens(vllm_config)),
+    )
+
+
 def _workspace(layout: ContextLayout, pages: int, device) -> _SymmBuffer:
     # Sizes come from the configuration, so every rank rendezvouses together.
     nbytes = pages * (layout.mla_page_bytes + layout.index_page_bytes)
@@ -187,8 +240,11 @@ def warm_up_dcp_fallback(dcp_manager: "MLADCPManager", num_tokens: int) -> None:
     if world == 1 or key in _WARMED_UP_DCP_FALLBACK:
         return
     _WARMED_UP_DCP_FALLBACK.add(key)
+    # The gathered query stays alive while the attention writes its partial
+    # output and the combine runs, as in a real step.
+    gathered_query = None
     if dcp_manager.query_gather is not None:
-        dcp_manager.query_gather(
+        gathered_query = dcp_manager.query_gather(
             torch.zeros(
                 (num_tokens, dcp_manager.num_heads, dcp_manager.query_head_dim),
                 dtype=dcp_manager.query_dtype,
@@ -237,6 +293,7 @@ def warm_up_dcp_fallback(dcp_manager: "MLADCPManager", num_tokens: int) -> None:
                     **batch(rows, num_seqs),
                 )
             num_seqs *= 2
+    del gathered_query
     logger.info_once("Warmed up the MLA DCP collectives of %d-token steps.", num_tokens)
 
 
@@ -564,8 +621,13 @@ class DcpShardQPlanner:
         rank: int,
         device: torch.device,
         label: str = "",
+        max_fallback_tokens: int | None = None,
     ) -> None:
         self.layout = layout
+        # Most tokens of a DCP-path step the memory profile reserved.
+        self.max_fallback_tokens = (
+            max_fallback_tokens if max_fallback_tokens is not None else 1 << 62
+        )
         self.max_pages = max_pages
         self.max_indexer_keys = max_indexer_keys
         self.max_logits_bytes = max_logits_bytes
@@ -623,6 +685,15 @@ class DcpShardQPlanner:
             path = SHARDQ if context is not None else WORKSPACE
         self.stats.record(path, num_prefill_tokens)
         if context is None:
+            # Dense MHA rows take no MQA combine; the others are bounded.
+            if path != DENSE_MHA and num_tokens > self.max_fallback_tokens:
+                logger.warning_once(
+                    "A %d-token step keeps the DCP path (%s), more than the %d "
+                    "tokens the memory profile reserved for it.",
+                    num_tokens,
+                    path,
+                    self.max_fallback_tokens,
+                )
             return None
         split = make_shardq_split(
             qsl[num_decodes:] - qsl[num_decodes], self.world, self.rank, self.device

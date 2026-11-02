@@ -1344,10 +1344,20 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             )
             # The first DCP-path step may come late, once the KV cache and the
             # caching allocator hold the memory that its NCCL collectives
-            # allocate on first use.
+            # allocate on first use. The scheduler keeps steps within the
+            # workspace, so the DCP path runs decode rows and short prefills
+            # only (dcp_fallback_max_tokens), not whole prefill steps.
+            from vllm.v1.attention.backends.mla.indexer import (
+                DeepseekV32IndexerMetadataBuilder,
+            )
+
             assert self.dcp_manager is not None
             shardq_context.warm_up_dcp_fallback(
-                self.dcp_manager, scheduler_config.max_num_batched_tokens
+                self.dcp_manager,
+                shardq_context.dcp_fallback_max_tokens(
+                    vllm_config,
+                    DeepseekV32IndexerMetadataBuilder.get_decode_threshold(vllm_config),
+                ),
             )
 
     def _use_sparse_mha(self, attn_metadata: "MLACommonMetadata") -> bool:

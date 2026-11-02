@@ -1451,12 +1451,16 @@ def _profile_worker(rank, world, init_file, cache_dtype, kernel):
                     dtype=torch.bfloat16,
                 ),
             )
-            # The NCCL query gather and A2A of a whole profile-sized step: every
-            # local head's query, and every head's partial outputs (and LSEs),
-            # of every token.
+            # The NCCL query gather and A2A of the largest step that can still
+            # take the DCP path (the scheduler keeps whole prefill steps within
+            # the ShardQ workspace): every local head's query, and every head's
+            # partial outputs (and LSEs), of every token.
+            fallback_tokens = dcp.dcp_fallback_max_tokens(
+                config, DeepseekV32IndexerMetadataBuilder.get_decode_threshold(config)
+            )
             assert gather_sizes
-            assert max(gather_sizes) >= profile_tokens * local_heads * 512
-            assert a2a_sizes and max(a2a_sizes) >= profile_tokens * LAYER_HEADS * 512
+            assert max(gather_sizes) >= fallback_tokens * local_heads * 512
+            assert a2a_sizes and max(a2a_sizes) >= fallback_tokens * LAYER_HEADS * 512
             torch.accelerator.synchronize()
 
             compiled: list[str] = []

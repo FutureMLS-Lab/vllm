@@ -325,6 +325,7 @@ class SparseMLACommonMetadataBuilder(AttentionMetadataBuilder[T]):
             ContextLayout,
             DcpShardQPlanner,
             capacity_pages,
+            dcp_fallback_max_tokens,
             register_warmup,
         )
 
@@ -343,6 +344,9 @@ class SparseMLACommonMetadataBuilder(AttentionMetadataBuilder[T]):
             get_max_prefill_buffer_size,
         )
 
+        decode_query_len = DeepseekV32IndexerMetadataBuilder.get_decode_threshold(
+            vllm_config
+        )
         # DCP spans the TP group, so DCP ranks also index the workspace peers.
         self.dcp_shardq = DcpShardQPlanner(
             layout,
@@ -354,11 +358,12 @@ class SparseMLACommonMetadataBuilder(AttentionMetadataBuilder[T]):
             envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024,
             self.shardq_min_tokens,
             # Rows the indexer scores as decodes keep the DCP path.
-            DeepseekV32IndexerMetadataBuilder.get_decode_threshold(vllm_config),
+            decode_query_len,
             self.dcp_world_size,
             get_dcp_group().rank_in_group,
             self.device,
             label=f"{self.layer_names[0]}, {len(self.layer_names)} layers",
+            max_fallback_tokens=dcp_fallback_max_tokens(vllm_config, decode_query_len),
         )
         register_warmup(layout, self.dcp_world_size, self.topk_tokens)
         return True

@@ -8737,3 +8737,26 @@ def test_cpu_encoder_input_updates_preserve_shm_handles(use_v2_model_runner):
         {request.request_id: {1: None}} if use_v2_model_runner else {}
     )
     assert request.mm_features[0].data is handle
+
+
+def test_dcp_shardq_prefill_context_cap():
+    """Prefill rows whose context would overflow the DCP ShardQ workspace are
+    not co-scheduled; the first row of a step is always admitted."""
+    scheduler = create_scheduler(max_num_batched_tokens=8192)
+    # Workspace of 40 pages of 64 tokens; each 1600-token prompt needs 25.
+    scheduler.max_prefill_context_pages = 40
+    scheduler.prefill_context_page_tokens = 64
+    scheduler.max_decode_row_tokens = 1
+    for request in create_requests(num_requests=2, num_tokens=1600):
+        scheduler.add_request(request)
+
+    output = scheduler.schedule()
+    assert len(output.scheduled_new_reqs) == 1
+    assert len(scheduler.waiting) == 1
+
+    # Once the first finishes its prefill (now a decode row), the second fits.
+    model_runner_output = make_output(scheduler)
+    scheduler.update_from_output(output, model_runner_output)
+    output = scheduler.schedule()
+    assert len(output.scheduled_new_reqs) == 1
+    assert len(output.scheduled_cached_reqs.req_ids) == 1
