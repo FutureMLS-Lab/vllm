@@ -353,7 +353,8 @@ class KernelConfig:
     """Backend for the DSA sparse indexer decode top-k kernel. Available options:
 
     - "auto": The pre-existing chain (cooperative -> persistent -> per_row);
-      the other backends are opt-in
+      the other backends are opt-in. On SM100 the prefill top-k (without
+      DCP) runs DeepSelect on the BF16 logits, as under "deep_select"
     - "deep_select": Use DeepSelect kernels (SM100a/SM103a only)
     - "cooperative": Use vLLM's cooperative_topk kernel
     - "persistent": Use vLLM's persistent_topk kernel

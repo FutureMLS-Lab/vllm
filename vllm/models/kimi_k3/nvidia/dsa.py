@@ -18,7 +18,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
+from vllm.config import CacheConfig, CUDAGraphMode, VllmConfig, get_current_vllm_config
 from vllm.distributed import get_dcp_group, get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
@@ -274,6 +274,25 @@ class KimiK3DSAIndexer(nn.Module):
         )
         return index_q, index_k
 
+    def _shardq_indexer_rows(self) -> torch.Tensor | None:
+        """The rows a ShardQ step scores on this rank (decode rows, then this
+        rank's prefill tokens), or None outside ShardQ steps and in cudagraph
+        capture or replay: a graph would bake in the capture batch's row count
+        and the address of its rows tensor."""
+        if not self.shardq_layer_name:
+            return None
+        forward_context = get_forward_context()
+        if (
+            forward_context.cudagraph_runtime_mode != CUDAGraphMode.NONE
+            or torch.cuda.is_current_stream_capturing()
+        ):
+            return None
+        attn_metadata = forward_context.attn_metadata
+        if not isinstance(attn_metadata, dict):
+            return None
+        shardq = getattr(attn_metadata.get(self.shardq_layer_name), "shardq", None)
+        return None if shardq is None else shardq.indexer_rows
+
     def _fused_k_insert(self, index_k: torch.Tensor, num_tokens: int) -> None:
         attn_metadata = get_forward_context().attn_metadata
         kv_cache = self.k_cache.kv_cache
@@ -310,12 +329,19 @@ class KimiK3DSAIndexer(nn.Module):
             # q_lora_rank is None: MultiHeadLatentAttention.forward_native
             # passes q_c=None, so the indexer query reads hidden_states.
             index_q_input = hidden_states
+        # A ShardQ step scores this rank's rows only: project and quantize the
+        # query of just those (the op detects the compact query).
+        rows = self._shardq_indexer_rows() if self.use_fused_k_insert else None
+        if rows is not None:
+            index_q_input = index_q_input[rows]
         index_q = self.wq_index(index_q_input)[0].view(
             -1, self.index_num_heads, self.index_head_dim
         )
         index_k, index_weights = self.wkv_index(hidden_states)[0].split(
             [self.index_head_dim, self.index_num_heads], dim=-1
         )
+        if rows is not None:
+            index_weights = index_weights[rows]
         if self.use_fused_k_insert:
             self._fused_k_insert(index_k, hidden_states.shape[0])
             index_k = None

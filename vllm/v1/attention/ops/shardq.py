@@ -169,6 +169,7 @@ def reserve_shardq_buffers(
     q_dtype: torch.dtype,
     out_dtype: torch.dtype,
     device: torch.device,
+    padded_heads: int | None = None,
 ) -> None:
     """Allocate the exchange buffers of a worst-case step in the memory profile.
 
@@ -177,15 +178,19 @@ def reserve_shardq_buffers(
     their largest size and counted as non-torch memory; NCCL buffers are
     per-call transients, reserved inside the profiled peak instead.
 
-    ``qk_dim`` and ``v_dim`` are the MQA query and output widths.
+    ``qk_dim`` and ``v_dim`` are the MQA query and output widths;
+    ``padded_heads`` is that of ``shard_q``.
     """
     world = get_tp_group().world_size
+    q_heads = _q_heads(world * num_local_heads, padded_heads)
     q_rows = max_rank_tokens(max_tokens, max_reqs, world)
-    q_numel = q_rows * world * num_local_heads * qk_dim
+    q_numel = q_rows * q_heads * qk_dim
     out_numel = max_tokens * num_local_heads * v_dim
     if _use_sm(None):
         group = get_tp_group().device_group
-        _symm_buffer(group, "q", q_numel, q_dtype, device)
+        _symm_buffer(
+            group, _q_role(world * num_local_heads, q_heads), q_numel, q_dtype, device
+        )
         _symm_buffer(group, "out", out_numel, out_dtype, device)
     else:
         # Send and receive buffers of both exchanges.
@@ -277,6 +282,17 @@ _buffers: dict[tuple, _SymmBuffer] = {}
 _retired: list[_SymmBuffer] = []
 
 
+def _q_heads(num_heads: int, padded_heads: int | None) -> int:
+    assert padded_heads is None or padded_heads >= num_heads
+    return num_heads if padded_heads is None else padded_heads
+
+
+def _q_role(num_heads: int, q_heads: int) -> str:
+    # Padded query rows have their own buffer, zeroed once: no exchange writes
+    # the padding heads, so they stay zero.
+    return "q" if q_heads == num_heads else f"q_pad{q_heads}"
+
+
 def _symm_buffer(
     group: dist.ProcessGroup, role: str, numel: int, dtype: torch.dtype, device
 ) -> _SymmBuffer:
@@ -290,6 +306,8 @@ def _symm_buffer(
         _retired.append(buf)
     capacity = max(numel, 2 * buf.storage.numel() if buf is not None else 0)
     storage = symm_mem.empty(capacity, dtype=dtype, device=device)
+    if role.startswith("q_pad"):
+        storage.view(torch.uint8).zero_()
     handle = symm_mem.rendezvous(storage, group.group_name)
     peer_ptrs = torch.tensor(
         [
@@ -333,8 +351,10 @@ def shard_q(
     split: ShardQSplit,
     group: dist.ProcessGroup | None = None,
     use_sm: bool | None = None,
+    padded_heads: int | None = None,
 ) -> torch.Tensor:
-    """[T, H_local, D] head shards -> [T_rank, world * H_local, D] token shard.
+    """[T, H_local, D] head shards -> [T_rank, world * H_local, D] token shard,
+    zero-padded to ``padded_heads`` heads when given.
 
     The symmetric-memory result views a buffer that the next call reuses.
     """
@@ -344,38 +364,54 @@ def shard_q(
         use_sm = _use_sm(group)
     group = group or get_tp_group().device_group
     all_heads = split.world * heads
+    q_heads = _q_heads(all_heads, padded_heads)
     if not use_sm:
-        # Exchange bytes: NCCL may lack the dtype (e.g. fp8).
-        send = q.index_select(0, split.rank_order).view(torch.uint8)
-        recv = send.new_empty((split.world * split.num_local, *send.shape[1:]))
-        dist.all_to_all_single(
-            recv,
-            send,
-            output_split_sizes=[split.num_local] * split.world,
-            input_split_sizes=split.counts,
-            group=group,
-        )
-        return (
-            recv.view(q.dtype)
-            .view(split.world, split.num_local, heads, dim)
-            .transpose(0, 1)
-            .reshape(split.num_local, all_heads, dim)
-        )
+        out = _shard_q_nccl(q, split, group)
+        if q_heads != all_heads:
+            out = torch.nn.functional.pad(out, (0, 0, 0, q_heads - all_heads))
+        return out
     buf = _symm_buffer(
-        group, "q", max(split.counts) * all_heads * dim, q.dtype, q.device
+        group,
+        _q_role(all_heads, q_heads),
+        max(split.counts) * q_heads * dim,
+        q.dtype,
+        q.device,
     )
-    key = ("q", q.stride(0), heads, dim, buf.storage.data_ptr())
+    key = ("q", q.stride(0), heads, dim, q_heads, buf.storage.data_ptr())
     rows = split.sm_rows.get(key)
     if rows is None:
         # Row t goes to its owner, at its position there and this rank's heads.
-        dst = (split.row_pos * all_heads + split.rank * heads) * dim
+        dst = (split.row_pos * q_heads + split.rank * heads) * dim
         rows = split.sm_rows[key] = (
             split.rank_order * q.stride(0),
             buf.peer_ptrs[split.row_peer] + dst * q.element_size(),
         )
     _push_rows(q, *rows, heads * dim, buf.handle)
-    return buf.storage[: split.num_local * all_heads * dim].view(
-        split.num_local, all_heads, dim
+    return buf.storage[: split.num_local * q_heads * dim].view(
+        split.num_local, q_heads, dim
+    )
+
+
+def _shard_q_nccl(
+    q: torch.Tensor, split: ShardQSplit, group: dist.ProcessGroup
+) -> torch.Tensor:
+    _, heads, dim = q.shape
+    all_heads = split.world * heads
+    # Exchange bytes: NCCL may lack the dtype (e.g. fp8).
+    send = q.index_select(0, split.rank_order).view(torch.uint8)
+    recv = send.new_empty((split.world * split.num_local, *send.shape[1:]))
+    dist.all_to_all_single(
+        recv,
+        send,
+        output_split_sizes=[split.num_local] * split.world,
+        input_split_sizes=split.counts,
+        group=group,
+    )
+    return (
+        recv.view(q.dtype)
+        .view(split.world, split.num_local, heads, dim)
+        .transpose(0, 1)
+        .reshape(split.num_local, all_heads, dim)
     )
 
 

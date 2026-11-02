@@ -1147,7 +1147,12 @@ class SparseMLACommonImpl(MLACommonBaseImpl[T], SharedTopkIndicesBuffer, Generic
                 block_size=block_size,
                 is_decode=True,
             )
-        q = shard_q(q[num_decode_tokens:], shardq.split)
+        num_heads = shardq.split.world * q.shape[1]
+        q = shard_q(
+            q[num_decode_tokens:],
+            shardq.split,
+            padded_heads=self.shardq_query_heads(num_heads),
+        )
         block_table = attn_metadata.block_table
         if shardq.gathered_context is not None:
             # The prefill rows of a DCP step attend its gathered context.
@@ -1168,6 +1173,8 @@ class SparseMLACommonImpl(MLACommonBaseImpl[T], SharedTopkIndicesBuffer, Generic
             NUM_TOPK_TOKENS=topk.shape[1],
             return_valid_counts=True,
         )
+        # The token slice's output goes straight back to the head shards: the
+        # LSE (and the empty-row masking that comes with it) is never read.
         out, _ = self._forward_mqa_kernel(
             q,
             kv_c_and_k_pe_cache,
@@ -1176,8 +1183,11 @@ class SparseMLACommonImpl(MLACommonBaseImpl[T], SharedTopkIndicesBuffer, Generic
             layer=layer,
             block_size=block_size,
             is_decode=False,
+            return_lse=False,
         )
-        out = unshard_out(out, shardq.split, num_leading_rows=num_decode_tokens)
+        out = unshard_out(
+            out[:, :num_heads], shardq.split, num_leading_rows=num_decode_tokens
+        )
         if decode_out is not None:
             out[:num_decode_tokens] = decode_out
         return out
@@ -1192,8 +1202,15 @@ class SparseMLACommonImpl(MLACommonBaseImpl[T], SharedTopkIndicesBuffer, Generic
         layer: AttentionLayer,
         block_size: int,
         is_decode: bool,
+        return_lse: bool | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """``return_lse`` None means ``need_to_return_lse_for_decode``."""
         raise NotImplementedError
+
+    def shardq_query_heads(self, num_heads: int) -> int:
+        """Heads the MQA kernel runs a ShardQ token slice of ``num_heads``
+        query heads with; ShardQ receives the query zero-padded to them."""
+        return num_heads
 
     @staticmethod
     def masked_mha_workspace_fits(prefill: MLACommonPrefillMetadata) -> bool:

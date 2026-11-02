@@ -990,6 +990,9 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                     current_platform.fp8_dtype() if fp8_query else k_c_normed.dtype,
                     k_c_normed.dtype,
                     k_c_normed.device,
+                    padded_heads=self.impl.shardq_query_heads(  # type: ignore[attr-defined]
+                        get_tp_group().world_size * self.num_heads
+                    ),
                 )
                 if self.impl.dcp_world_size > 1:
                     self._reserve_dcp_shardq_workspace(k_c_normed.device)
@@ -1160,6 +1163,23 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                     torch.bmm(mqa_q_nope, W_UK_T, out=mqa_ql_nope)
                     # Convert from (N, B, L) to (B, N, L)
                     mqa_ql_nope = mqa_ql_nope.transpose(0, 1)
+                elif (
+                    fp8_attention
+                    and self.impl.supports_quant_query_input
+                    and mqa_q_pe.shape[-1] > 0
+                ):
+                    # Concatenate in place: the bmm writes the NoPE columns of
+                    # the token-major (B, N, L + R) query and the RoPE part is
+                    # copied beside it, so the FP8 query op quantizes one
+                    # contiguous tensor instead of concatenating first (that
+                    # concat is ~1 ms per layer of a 32k-token prefill).
+                    R = mqa_q_pe.shape[-1]
+                    mqa_q_cat = mqa_q_nope.new_empty((B, N, L + R))
+                    torch.bmm(
+                        mqa_q_nope, W_UK_T, out=mqa_q_cat[..., :L].transpose(0, 1)
+                    )
+                    mqa_q_cat[..., L:].copy_(mqa_q_pe)
+                    mqa_ql_nope, mqa_q_pe = mqa_q_cat, mqa_q_pe[..., :0]
                 else:
                     # Write the (N, B, L) bmm result straight into a
                     # token-major (B, N, L) buffer so the MQA query is already

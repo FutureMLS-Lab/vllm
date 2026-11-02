@@ -67,7 +67,7 @@ def test_indexer_rows_cover_decodes_then_local_prefill(num_decode_tokens):
     )
 
 
-def _round_trip(rank, world, port, use_sm, q_dtype, num_leading_rows):
+def _round_trip(rank, world, port, use_sm, q_dtype, num_leading_rows, pad):
     os.environ.update(MASTER_ADDR="127.0.0.1", MASTER_PORT=str(port))
     torch.accelerator.set_device_index(rank)
     dist.init_process_group("nccl", rank=rank, world_size=world)
@@ -81,10 +81,20 @@ def _round_trip(rank, world, port, use_sm, q_dtype, num_leading_rows):
     local_heads = full[:, rank * heads : (rank + 1) * heads].contiguous()
     group = dist.group.WORLD
     for _ in range(2):  # The second pass reuses the symmetric buffers.
-        sharded = shard_q(local_heads, split, group, use_sm=use_sm)
+        sharded = shard_q(
+            local_heads,
+            split,
+            group,
+            use_sm=use_sm,
+            padded_heads=world * heads + pad if pad else None,
+        )
+        assert sharded.shape[1] == world * heads + pad
         # Bitwise, as the exchanges only move bytes (and fp8 lacks torch.equal).
         expected = full[split.local_idx]
-        assert torch.equal(sharded.view(torch.uint8), expected.view(torch.uint8))
+        received = sharded.view(torch.uint8)
+        assert torch.equal(received[:, : world * heads], expected.view(torch.uint8))
+        assert not received[:, world * heads :].any()
+        sharded = sharded[:, : world * heads]
         # Attention outputs are a head-padded slice; unshard reads its strides.
         padded = torch.zeros(sharded.shape[0], world * heads + 8, 512, device="cuda")
         padded[:, : world * heads] = sharded[..., :512].float()
@@ -103,10 +113,11 @@ def _round_trip(rank, world, port, use_sm, q_dtype, num_leading_rows):
 @pytest.mark.parametrize("q_dtype", [torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize("use_sm", [False, True])
 @pytest.mark.parametrize("num_leading_rows", [0, 33])
-def test_shard_q_round_trip(use_sm, q_dtype, num_leading_rows):
+@pytest.mark.parametrize("pad", [0, 8])
+def test_shard_q_round_trip(use_sm, q_dtype, num_leading_rows, pad):
     world = 2
     mp.spawn(
         _round_trip,
-        args=(world, get_open_port(), use_sm, q_dtype, num_leading_rows),
+        args=(world, get_open_port(), use_sm, q_dtype, num_leading_rows, pad),
         nprocs=world,
     )

@@ -681,6 +681,14 @@ def sparse_attn_indexer(
             prefill_chunks = shardq.gathered_context.indexer_chunks
             prefill_dcp_world_size = 1
 
+    # The caller may have computed the query (and weights) of the indexer rows
+    # only (ShardQ.indexer_rows): decode rows first, so those keep their index.
+    q_compact = (
+        shardq is not None
+        and q_quant.shape[0] == shardq.indexer_rows_cpu.shape[0]
+        and q_quant.shape[0] < hidden_states.shape[0]
+    )
+
     # The buffer must be pre-filled with -1 (the "no token" sentinel) before the
     # top-k kernels scatter valid indices into it. On the fused deepseek_v32
     # nvidia path, _fused_norm_rope_kernel already cleared the same
@@ -778,11 +786,12 @@ def sparse_attn_indexer(
                 lo, hi = np.searchsorted(
                     shardq.indexer_rows_cpu, (chunk.token_start, chunk.token_end)
                 )
-                q_rows = shardq.indexer_rows[lo:hi]
                 topk_rows = slice(int(lo), int(hi))
-                chunk_rows = q_rows - chunk.token_start
+                chunk_rows = shardq.indexer_rows[lo:hi] - chunk.token_start
                 cu_seqlen_ks = cu_seqlen_ks[chunk_rows]
                 cu_seqlen_ke = cu_seqlen_ke[chunk_rows]
+                # A compact query holds only the indexer rows, in their order.
+                q_rows = topk_rows if q_compact else shardq.indexer_rows[lo:hi]
             q_slice = q_quant[q_rows]
             q_scale_slice = q_scale[q_rows] if q_scale is not None else None
             chunk_weights = weights[q_rows]
@@ -835,9 +844,11 @@ def sparse_attn_indexer(
                         chunk.max_seqlen_k,
                     )
                     # DeepSelect ranks the bf16 logits in place of their exact fp32
-                    # copy; fp32 logits keep the per-row top-k.
+                    # copy (only ties at the cutoff may resolve differently), so
+                    # "auto" takes it too and skips the upcast; fp32 logits keep
+                    # the per-row top-k.
                     use_deep_select = (
-                        topk_backend == "deep_select"
+                        topk_backend in ("auto", "deep_select")
                         and logits.dtype == torch.bfloat16
                         and prefill_dcp_world_size == 1
                         and is_deep_select_supported(logits, topk_tokens)
