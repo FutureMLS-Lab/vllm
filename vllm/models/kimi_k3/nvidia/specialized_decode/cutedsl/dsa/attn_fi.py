@@ -139,7 +139,7 @@ class _Plans:
         if not todo:
             return
         kwargs = dict(
-            max_seq_len_q=1,
+            max_q_len=1,
             q_dtype=torch.float8_e4m3fn,
             max_topk=topk,
             packed_query=True,

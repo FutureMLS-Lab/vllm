@@ -3,7 +3,8 @@
 """FLASHINFER_MLA_SPARSE on FlashInfer's prims_ts sparse MLA kernel (SM100).
 
 Kimi K3.1 DSA shapes: D576, top-k capacity 2048, 96 query heads (DCP8 gathered
-heads, zero-padded to 128 for the 2-CTA schedule), per-tensor fp8 and
+heads; zero-padded to 128 for the 2-CTA schedule on FlashInfer builds that do
+not schedule 96 heads natively), per-tensor fp8 and
 nvfp4_ds_mla caches written by the production cache writer into a packed
 (BLHNC-strided) block layout. Every cache row no live index addresses (page 0,
 the other layers' rows between blocks, unselected rows, rows named by entries
@@ -215,15 +216,15 @@ def test_prims_ts_matches_reference(kv_cache_dtype, heads, case, holes):
         kv_cache_dtype, COUNTS[case], heads, k_scale, q_scale, 1, holes=holes
     )
     layer = SimpleNamespace(_q_scale_float=q_scale, _k_scale_float=k_scale)
-    out, lse = _impl(kv_cache_dtype)._forward_prims_ts(
-        q8, cache, indices, lengths, layer, BLOCK_SIZE
-    )
+    impl = _impl(kv_cache_dtype)
+    out, lse = impl._forward_prims_ts(q8, cache, indices, lengths, layer, BLOCK_SIZE)
     kv = _dequant_rows(cache, kv_cache_dtype, k_scale)
     ref_out, ref_lse = _reference(q8, q_scale, kv, indices, lengths)
     _check(out, lse, ref_out, ref_lse, kv_cache_dtype)
-    # 96 heads ran on the 128-head (2-CTA) plan.
+    # 96 heads ran natively, or zero-padded to the 128-head (2-CTA) plan on
+    # FlashInfer builds without native scheduling of that head count.
     planned = {key[2] for key in fims._prims_ts_plans._plans}
-    assert (128 if heads == 96 else heads) in planned
+    assert impl._prims_ts_query_heads(heads) in planned
 
 
 @pytest.mark.parametrize("kv_cache_dtype", ["fp8", "nvfp4_ds_mla"])
@@ -231,13 +232,13 @@ def test_prims_ts_matches_reference(kv_cache_dtype, heads, case, holes):
 def test_prims_ts_prefill_chunks(kv_cache_dtype, rows):
     """Rows beyond the largest capacity run in chunks (with a ragged tail) and
     are copied back to the call's heads; up to the largest capacity, the call
-    returns views of the kernel's head-padded output and LSE."""
+    returns views of the kernel's (head-padded, if padded) output and LSE."""
     counts = [(i * 37) % 300 for i in range(rows)]
     cache, q8, indices, lengths = _problem(kv_cache_dtype, counts, 96, 1.0, 1.0, 2)
     layer = SimpleNamespace(_q_scale_float=1.0, _k_scale_float=1.0)
     impl = _impl(kv_cache_dtype, buckets=(1, 2, 4, 8, 16, 32, 48))
     out, lse = impl._forward_prims_ts(q8, cache, indices, lengths, layer, BLOCK_SIZE)
-    out_heads = 128 if rows <= 48 else 96
+    out_heads = impl._prims_ts_query_heads(96) if rows <= 48 else 96
     assert out.shape == (rows, 96, KV_LORA_RANK) and lse.shape == (rows, 96)
     assert out.stride() == (out_heads * KV_LORA_RANK, KV_LORA_RANK, 1)
     assert lse.stride() == (out_heads, 1)
@@ -581,7 +582,8 @@ def _trtllm_gen_impl(kv_cache_dtype, device):
 @pytest.mark.parametrize("case", ["dcp_local", "decode_b1"])
 def test_dcp_partials_in_padded_buffers(monkeypatch, kv_cache_dtype, kernel, case):
     """A DCP rank's partials of the 96 gathered heads are views of the kernel's
-    128-head output and LSE (no copy back), bitwise those of the replaced head
+    output and LSE (no copy back; 128 heads on trtllm-gen and on prims_ts
+    builds that pad 96 heads), bitwise those of the replaced head
     pad and empty-row guard; rows without entries are (0, -inf). The same holds
     in CUDA graph replay, with rows emptied in place between replays."""
     k_scale = 0.5 if kv_cache_dtype == "fp8" else 1.0
@@ -608,10 +610,12 @@ def test_dcp_partials_in_padded_buffers(monkeypatch, kv_cache_dtype, kernel, cas
             is_decode=True,
         )
 
+    kernel_heads = 128 if kernel == "trtllm" else impl._prims_ts_query_heads(96)
+
     def check(out, lse):
         assert out.shape == (q8.shape[0], 96, KV_LORA_RANK)
-        assert out.stride() == (128 * KV_LORA_RANK, KV_LORA_RANK, 1)
-        assert lse.shape == (q8.shape[0], 96) and lse.stride() == (128, 1)
+        assert out.stride() == (kernel_heads * KV_LORA_RANK, KV_LORA_RANK, 1)
+        assert lse.shape == (q8.shape[0], 96) and lse.stride() == (kernel_heads, 1)
         empty = counts == 0
         assert (out[empty] == 0).all() and (lse[empty] == -math.inf).all()
         assert torch.isfinite(lse[~empty]).all()

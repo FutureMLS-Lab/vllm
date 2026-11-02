@@ -65,14 +65,14 @@ _TS_HEAD_DIMS = (64, 128, 256)
 _TS_CAPABILITIES = ((10, 0), (10, 3), (10, 7))
 _TS_MAX_HEAD_RATIO = 128
 # First build with the plan/run argument names used below.
-_TS_MIN_FLASHINFER = "0.7.3.dev20261030"
+_TS_MIN_FLASHINFER = "0.7.3.dev20261031"
 
 
 def _require_prims_ts():
     """Import the prims_ts wrapper, or explain which flashinfer is needed.
 
-    Builds before 0.7.3.dev20261030 name the plan/run arguments differently
-    (``q_data_type``, ``seq_lens``, ``bmm1_scale``, ...).
+    Builds before 0.7.3.dev20261031 name the plan/run arguments differently
+    (``max_seq_len_q``, ``q_data_type``, ``seq_lens``, ``bmm1_scale``, ...).
     """
     try:
         from flashinfer.attention.prims_ts import BatchDecodePagedTSWrapper
@@ -211,7 +211,7 @@ class FlashInferTSMetadataBuilder(AttentionMetadataBuilder[FlashInferTSMetadata]
             head_dim=self.head_size,
             page_size=self.page_size,
             max_kv_len=self._max_kv_len(),
-            max_seq_len_q=query_len,
+            max_q_len=query_len,
             packed_query=False,
             q_dtype=self.q_dtype,
             kv_dtype=self.kv_dtype,

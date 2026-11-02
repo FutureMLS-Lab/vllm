@@ -15,7 +15,7 @@ PyNvVideoCodec==2.0.4
 # nightly index also serves the matching flashinfer-cubin and
 # flashinfer-jit-cache wheels (`vllm download-kernels`).
 --extra-index-url https://flashinfer.ai/whl/nightly/
-flashinfer-python==0.7.3.dev20261030
+flashinfer-python==0.7.3.dev20261031
 apache-tvm-ffi==0.1.11
 tilelang==0.1.12
 # >=1.31.0 keeps execution plans alive for the CUDA graphs recorded from them

@@ -177,7 +177,7 @@ def test_dense_plan_matches_flash_attention_non_causal():
         head_dim=HEAD_DIM,
         page_size=PAGE,
         max_kv_len=kv,
-        max_seq_len_q=sq,
+        max_q_len=sq,
         packed_query=False,
         q_dtype=torch.bfloat16,
         kv_dtype=torch.bfloat16,

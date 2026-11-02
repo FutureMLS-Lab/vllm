@@ -490,10 +490,12 @@ _PRIMS_TS_FORMATS = {
     # RoPE, E4M3 block scales).
     "nvfp4_ds_mla": "nvfp4.fp8rope",
 }
-# The 2-CTA schedule (KV rows loaded and converted once per CTA pair) is only
-# chosen for exactly 128 query heads; other counts in (64, 128) run as two M64
-# tiles that load every KV row twice, 1.7x (fp8) to 2.7x (nvfp4) slower at 96
-# heads (DCP8 decode). Such queries are zero-padded to 128 heads.
+# FlashInfer builds without flashinfer-ai/flashinfer#7984 choose the 2-CTA
+# schedule (KV rows loaded and converted once per CTA pair) only for exactly 128
+# query heads; other counts in (64, 128) run as two M64 tiles that load every KV
+# row twice, 1.7x (fp8) to 2.7x (nvfp4) slower at 96 heads (DCP8 decode). There
+# such queries are zero-padded to 128 heads. Builds with it schedule 96 heads on
+# the same 2-CTA tile directly, which saves the padded query/output copies.
 _PRIMS_TS_2CTA_HEADS = 128
 # Rows per prims_ts call. Bounds the head-padded query/output of long prefill
 # steps.
@@ -614,7 +616,7 @@ class _PrimsTSPlans:
 
         kwargs = dict(
             max_topk=max_topk,
-            max_seq_len_q=1,
+            max_q_len=1,
             packed_query=True,
             q_dtype=torch.float8_e4m3fn,
             qk_rope_head_dim=64,
@@ -898,7 +900,11 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
                 self.bmm2_scale *= layer._k_scale_float
 
     def _prims_ts_query_heads(self, num_heads: int) -> int:
-        if 64 < num_heads < _PRIMS_TS_2CTA_HEADS:
+        from vllm.utils.flashinfer import prims_ts_sparse_mla_schedules_native_heads
+
+        if 64 < num_heads < _PRIMS_TS_2CTA_HEADS and (
+            not prims_ts_sparse_mla_schedules_native_heads()
+        ):
             return _PRIMS_TS_2CTA_HEADS
         return num_heads
 
