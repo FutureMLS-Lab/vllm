@@ -91,7 +91,8 @@ class ContextLayout:
         The MLA cache must keep one-byte elements (per-tensor ``fp8``,
         ``nvfp4_ds_mla``) in kernel blocks of whole 64-token pages (a packed
         cache may use e.g. 1024-token blocks), and the indexer fp8 keys
-        with one 4-byte scale per ``quant_block_size`` values.
+        with one 4-byte scale per ``quant_block_size`` values (or MXFP4 keys:
+        64 B of values and 4 B of scales per token).
         """
         k_cache = getattr(indexer, "k_cache", None)
         quant_block = getattr(indexer, "quant_block_size", 0)
@@ -103,8 +104,14 @@ class ContextLayout:
             or not quant_block
         ):
             return None
-        # fp8 keys with one 4-byte scale per quant_block values.
-        index_row = k_cache.head_dim * quant_block // (quant_block + 4)
+        if getattr(indexer, "use_fp4_cache", False):
+            # MXFP4 keys: head_dim / 2 B of E2M1 values and one UE8M0 scale per
+            # 32 values (17 / 32 B per dim), pages of the values then the scales
+            # (as the fp8 layout).
+            index_row = k_cache.head_dim * 16 // 17
+        else:
+            # fp8 keys with one 4-byte scale per quant_block values.
+            index_row = k_cache.head_dim * quant_block // (quant_block + 4)
         return cls(
             spec.state_content_size_bytes, index_row, k_cache.head_dim - index_row
         )

@@ -31,6 +31,10 @@ PAGE = 64
 MLA_BLOCK = 4 * PAGE
 INDEX_HEAD_DIM = 128
 INDEX_HEAD_SIZE = INDEX_HEAD_DIM + 4
+# Value bytes per token of each indexer key format (each adds 4 B of scales):
+# fp8 keys, or MXFP4 keys (E2M1 pairs; four UE8M0 scales per 128 values).
+INDEX_ROW = {"fp8": INDEX_HEAD_DIM, "mxfp4": INDEX_HEAD_DIM // 2}
+INDEX_FORMATS = list(INDEX_ROW)
 TOPK = 2048
 NUM_HEADS = 96
 MLA_ROW = {"fp8": 576, "nvfp4_ds_mla": 352}
@@ -58,12 +62,17 @@ SCENARIOS = {
 }
 
 
-def _layout(cache_dtype: str):
+def _layout(cache_dtype: str, index_format: str = "fp8"):
     from vllm.v1.attention.ops.dcp_shardq.context import (
         ContextLayout,
     )
 
-    return ContextLayout(MLA_ROW[cache_dtype], INDEX_HEAD_DIM, 4)
+    return ContextLayout(MLA_ROW[cache_dtype], INDEX_ROW[index_format], 4)
+
+
+def _index_entry(layout) -> int:
+    """Indexer cache bytes per token (values then scales, in pages)."""
+    return layout.index_row_bytes + layout.index_scale_bytes
 
 
 def _page_start(lens) -> np.ndarray:
@@ -75,8 +84,8 @@ def _sections(layout):
     """(cache, offset in the page, bytes per row) of each per-token section."""
     return (
         ("mla", 0, layout.mla_row_bytes),
-        ("index", 0, INDEX_HEAD_DIM),
-        ("index", PAGE * INDEX_HEAD_DIM, 4),
+        ("index", 0, layout.index_row_bytes),
+        ("index", PAGE * layout.index_row_bytes, layout.index_scale_bytes),
     )
 
 
@@ -107,7 +116,7 @@ class Replicated:
             return torch.zeros(shape, dtype=torch.uint8, device="cuda")
 
         self.mla = cache(layout.mla_row_bytes)
-        self.index = cache(INDEX_HEAD_SIZE)
+        self.index = cache(_index_entry(layout))
 
     def token_bytes(self, req: int, tokens: torch.Tensor, section):
         """``section``'s cache and the flat byte offsets of request ``req``'s
@@ -148,7 +157,7 @@ def _shard(
     # Whole pages apart, as the sparse MLA kernels address the cache in pages
     # of rows.
     mla, mla_table = paged(mla_block, layout.mla_row_bytes, layout.mla_page_bytes)
-    index, index_table = paged(PAGE, INDEX_HEAD_SIZE, 80)
+    index, index_table = paged(PAGE, _index_entry(layout), 80)
     for q, n_local in enumerate(local_lens):
         local = torch.arange(n_local, device="cuda")
         token = local * world + rank
@@ -210,8 +219,8 @@ def _workspace(plan, layout):
     )
     index = torch.as_strided(
         raw,
-        (plan.pages, PAGE, INDEX_HEAD_SIZE),
-        (layout.index_page_bytes, INDEX_HEAD_SIZE, 1),
+        (plan.pages, PAGE, _index_entry(layout)),
+        (layout.index_page_bytes, _index_entry(layout), 1),
         plan.pages * layout.mla_page_bytes,
     )
     return raw, mla, index
@@ -270,11 +279,22 @@ def _check_workspace(
             assert torch.equal(_flat(ws)[mask], expected[name][mask])
 
 
-@pytest.mark.parametrize("cache_dtype", CACHE_DTYPES)
+# (MLA cache dtype, indexer key format): MXFP4 keys (the K3.1 default on SM100)
+# with the per-tensor fp8 MLA cache they are deployed with.
+LAYOUT_CASES = [
+    pytest.param("fp8", "fp8", id="fp8"),
+    pytest.param("nvfp4_ds_mla", "fp8", id="nvfp4_ds_mla"),
+    pytest.param("fp8", "mxfp4", id="fp8-mxfp4_index"),
+]
+
+
+@pytest.mark.parametrize("cache_dtype,index_format", LAYOUT_CASES)
 @pytest.mark.parametrize("world", [2, 8])
 @pytest.mark.parametrize("scenario", list(SCENARIOS))
-def test_push_rebuilds_context_in_token_order(cache_dtype, world, scenario):
-    rep = Replicated(SCENARIOS[scenario], _layout(cache_dtype))
+def test_push_rebuilds_context_in_token_order(
+    cache_dtype, index_format, world, scenario
+):
+    rep = Replicated(SCENARIOS[scenario], _layout(cache_dtype, index_format))
     workspaces, _ = _push_all(rep, world)
     for _, ws_mla, ws_index in workspaces:
         # Prior context in full, the new tokens' indexer rows, nothing else
@@ -306,21 +326,35 @@ def test_plan_bounds_and_capacity():
     assert _build_context(lens, layout, 8, 3, total_pages - 1) is None
 
 
-@pytest.mark.parametrize("cache_dtype", CACHE_DTYPES)
-def test_indexer_chunks_read_the_workspace_like_a_replicated_cache(cache_dtype):
+@pytest.mark.parametrize("cache_dtype,index_format", LAYOUT_CASES)
+def test_indexer_chunks_read_the_workspace_like_a_replicated_cache(
+    cache_dtype, index_format
+):
+    """The prefill indexer's key gather (the same op for fp8 and MXFP4 keys, at
+    the format's widths) reads the workspace exactly as the replicated cache:
+    byte-identical keys and scales, hence identical logits and top-k."""
     from vllm import _custom_ops as ops
 
     lens, world = SCENARIOS["page_tails"], 8
-    rep = Replicated(lens, _layout(cache_dtype))
+    layout = _layout(cache_dtype, index_format)
+    rep = Replicated(lens, layout)
     workspaces, plans = _push_all(rep, world, num_dst=1)
     _, _, ws_index = workspaces[0]
     seq_lens = [c + n for c, n in lens]
     for chunk in plans[0].indexer_chunks:
         # Every key of the chunk's requests, as the TP path gathers them.
         keys = torch.empty(
-            chunk.total_seq_lens, INDEX_HEAD_DIM, dtype=torch.uint8, device="cuda"
+            chunk.total_seq_lens,
+            layout.index_row_bytes,
+            dtype=torch.uint8,
+            device="cuda",
         )
-        scales = torch.empty(chunk.total_seq_lens, 4, dtype=torch.uint8, device="cuda")
+        scales = torch.empty(
+            chunk.total_seq_lens,
+            layout.index_scale_bytes,
+            dtype=torch.uint8,
+            device="cuda",
+        )
         ref_keys, ref_scales = torch.empty_like(keys), torch.empty_like(scales)
         ops.cp_gather_indexer_k_quant_cache(
             ws_index, keys, scales, chunk.block_table, chunk.cu_seq_lens
@@ -1504,3 +1538,35 @@ def test_profile_run_warms_the_dcp_path(cache_dtype, kernel, tmp_path):
         args=(world, str(tmp_path / "dist_init"), cache_dtype, kernel),
         nprocs=world,
     )
+
+
+@pytest.mark.parametrize(
+    "fp4,entry,split",
+    [
+        pytest.param(False, 132, (128, 4), id="fp8_index"),
+        pytest.param(True, 68, (64, 4), id="mxfp4_index"),
+        # index_head_dim 64: 32 B of values and 2 scales.
+        pytest.param(True, 34, (32, 2), id="mxfp4_index_dim64"),
+    ],
+)
+def test_context_layout_of_the_indexer_cache_format(fp4, entry, split):
+    """The gathered indexer rows follow the indexer cache's format: fp8 keys (128 B
+    + one 4 B scale) or MXFP4 keys (head_dim / 2 B of E2M1 values + one UE8M0
+    scale per 32 values, the Kimi K3.1 default on SM100), values then scales."""
+    from types import SimpleNamespace
+
+    from vllm.v1.attention.ops.dcp_shardq.context import ContextLayout
+    from vllm.v1.kv_cache_interface import MLAAttentionSpec
+
+    spec = MLAAttentionSpec(
+        block_size=64, num_kv_heads=1, head_size=576, dtype=torch.uint8
+    )
+    indexer = SimpleNamespace(
+        k_cache=SimpleNamespace(head_dim=entry),
+        quant_block_size=128,
+        use_fp4_cache=fp4,
+    )
+    layout = ContextLayout.from_layer(spec, indexer)
+    assert layout is not None
+    assert (layout.index_row_bytes, layout.index_scale_bytes) == split
+    assert layout.index_page_bytes == 64 * entry
