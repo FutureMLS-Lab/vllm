@@ -1,0 +1,111 @@
+# yaml-language-server: $schema=https://recipes.vllm.ai/recipe.schema.json
+meta:
+  title: "Kimi-K3.1"
+  slug: "kimi-k3.1"
+  provider: "Moonshot AI"
+  description: "2.8T-parameter native multimodal MoE with Kimi Delta Attention, sparse MLA, and a 1M-token context window"
+  date_added: 2026-11-02
+  date_updated: 2026-11-02
+  tasks:
+    - multimodal
+    - text
+  performance_headline: "TP8 on two GB300 trays or one B300 node for the MXFP4 checkpoint"
+  related_recipes:
+    - "moonshotai/Kimi-K3"
+  default_hardware: gb300
+  hardware:
+    gb300: verified
+
+model:
+  model_id: "moonshotai/Kimi-K3.1"
+  min_vllm_version: "nightly"
+  nightly_required: true
+  install:
+    docker:
+      note: "Use a K3.1-enabled nightly image after the integration lands. CUDA 13 (cu130) build only; the host needs an r580+ NVIDIA driver."
+    pip:
+      note: "Use a K3.1-enabled vLLM nightly after the integration lands."
+  architecture: moe
+  parameter_count: "2.8T"
+  active_parameters: "16 experts/token + shared (of 896 routed)"
+  context_length: 1048576
+  base_args:
+    - "--trust-remote-code"
+
+features:
+  tool_calling:
+    description: "Enable automatic tool choice with the Kimi K3 tool-call parser."
+    args:
+      - "--enable-auto-tool-choice"
+      - "--tool-call-parser"
+      - "kimi_k3"
+  reasoning:
+    description: "Parse Kimi K3 reasoning output separately from the final answer."
+    args:
+      - "--reasoning-parser"
+      - "kimi_k3"
+  text_only:
+    description: "Skip the vision encoder for text-only workloads; frees its memory for KV cache."
+    args:
+      - "--language-model-only"
+
+opt_in_features:
+  - text_only
+
+variants:
+  default:
+    precision: mxfp4
+    # 1561 GB of safetensors x 1.2.
+    vram_minimum_gb: 1874
+    supported_hardware: [b300, gb300]
+    description: "MXFP4 routed-expert weights (~1.56 TB on disk); attention, shared experts and the vision tower stay in BF16."
+
+compatible_strategies:
+  - single_node_tp
+  - multi_node_tp
+
+# One B300 node (8 GPUs) or two GB300 trays (2 x 4 GPUs) hold the checkpoint.
+strategy_min_gpus:
+  single_node_tp: 8
+  multi_node_tp: 8
+
+default_strategy: single_node_tp
+
+hardware_overrides:
+  blackwell:
+    extra_args:
+      - "--load-format"
+      - "fastsafetensors"
+      - "--no-enable-flashinfer-autotune"
+    extra_env:
+      # Loading ~1.56 TB of weights from network storage can take over 20 minutes.
+      VLLM_ENGINE_READY_TIMEOUT_S: "3600"
+
+guide: |
+  ## Overview
+
+  Kimi-K3.1 keeps the Kimi-K3 layout (Kimi Delta Attention, 896 routed experts with 16 active
+  per token, a latent MoE projection and a vision encoder) and adds DeepSeek-style sparse
+  attention (DSA, top-2048 indexer) to 24 of its MLA layers. The checkpoint ships MXFP4
+  routed-expert weights; everything else is BF16.
+
+  This recipe is the simplest working setup: one tensor-parallel group of 8 GPUs, either two
+  GB300 trays or one B300 node. Throughput was not tuned.
+
+  ## Client usage
+
+  ```bash
+  curl http://localhost:8000/v1/chat/completions \
+    -H "Content-Type: application/json" \
+    -d '{
+      "model": "moonshotai/Kimi-K3.1",
+      "messages": [{"role": "user", "content": "Explain sparse attention in two sentences."}],
+      "temperature": 0.7,
+      "top_p": 0.95
+    }'
+  ```
+
+  ## References
+
+  - [Model card](https://huggingface.co/moonshotai/Kimi-K3.1)
+  - [Kimi-K3 recipe](https://recipes.vllm.ai/moonshotai/Kimi-K3)
