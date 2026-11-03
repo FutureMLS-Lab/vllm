@@ -82,11 +82,25 @@ hardware_overrides:
       VLLM_ENGINE_READY_TIMEOUT_S: "3600"
 
 strategy_overrides:
-  # PD pools are TP8, as in the aggregated recipe. NIXL moves the KDA
-  # short-conv state in three reads, which needs the DS conv state layout.
+  # PD pools: a TP8 prefill pool with expert parallelism (one B300 node or two
+  # GB300 trays) and a DEP16 decode pool — TP1 x DP16 with expert parallelism
+  # (two B300 nodes or four GB300 trays). NIXL moves the KDA short-conv state
+  # in three reads, which needs the DS conv state layout.
   pd_cluster:
     env:
       VLLM_SSM_CONV_STATE_LAYOUT: "DS"
+    prefill:
+      nodes:
+        b300: 1    # 1 B300 node = 8 GPUs
+        gb300: 2   # 2 GB300 trays = 8 GPUs
+      parallelism: tep
+      tp: 8
+    decode:
+      nodes:
+        b300: 2    # 2 B300 nodes = 16 GPUs
+        gb300: 4   # 4 GB300 trays = 16 GPUs
+      parallelism: dep
+      tp: 1
 
 guide: |
   ## Overview
@@ -101,8 +115,9 @@ guide: |
 
   ## Prefill/decode disaggregation
 
-  The **Prefill/Decode Disaggregation** strategy runs one TP8 prefill pool and one TP8 decode
-  pool, and decode pulls each request's KV from prefill over NIXL. Every PD worker sets
+  The **Prefill/Decode Disaggregation** strategy runs one TP8 prefill pool (with expert
+  parallelism) and one DEP16 decode pool (TP1 x DP16 with expert parallelism), and decode
+  pulls each request's KV from prefill over NIXL. Every PD worker sets
   `VLLM_SSM_CONV_STATE_LAYOUT=DS`: NIXL transfers the Kimi Delta Attention conv state in three
   reads, which needs that layout, and the NIXL connector refuses to start without it.
 
