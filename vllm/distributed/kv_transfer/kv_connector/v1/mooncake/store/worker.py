@@ -1445,8 +1445,14 @@ class MooncakeStoreWorker:
                 "Mooncake package does not support ReplicateConfig.group_ids. "
                 "Falling back to the existing batch_put_from_multi_buffers path."
             )
+        if preferred_segment == "self":
+            preferred_segment = self.store.get_hostname()
+            self.preferred_segment = preferred_segment
         if preferred_segment is not None:
             self.store_replicate_config.preferred_segment = preferred_segment
+        if os.getenv("MOONCAKE_PREFER_SAME_NODE", "0") == "1":
+            self.store_replicate_config.prefer_alloc_in_same_node = True
+            logger.info("Mooncake prefer_alloc_in_same_node=True")
 
         logger.info(
             "Mooncake mode=%s (global_segment_size=%d, local_buffer_size=%d, "
