@@ -17,7 +17,7 @@ meta:
     gb300: verified
 
 model:
-  model_id: "moonshotai/Kimi-K3.1"
+  model_id: "moonshotai/Kimi-K3.1-Pro"
   min_vllm_version: "nightly"
   nightly_required: true
   install:
@@ -77,7 +77,6 @@ hardware_overrides:
     extra_args:
       - "--load-format"
       - "fastsafetensors"
-      - "--no-enable-flashinfer-autotune"
     extra_env:
       # Loading ~1.56 TB of weights from network storage can take over 20 minutes.
       VLLM_ENGINE_READY_TIMEOUT_S: "3600"
@@ -122,7 +121,7 @@ guide: |
   curl http://localhost:8000/v1/chat/completions \
     -H "Content-Type: application/json" \
     -d '{
-      "model": "moonshotai/Kimi-K3.1",
+      "model": "moonshotai/Kimi-K3.1-Pro",
       "messages": [{"role": "user", "content": "Explain sparse attention in two sentences."}],
       "temperature": 0.7,
       "top_p": 0.95
@@ -131,5 +130,5 @@ guide: |
 
   ## References
 
-  - [Model card](https://huggingface.co/moonshotai/Kimi-K3.1)
+  - [Model card](https://huggingface.co/moonshotai/Kimi-K3.1-Pro)
   - [Kimi-K3 recipe](https://recipes.vllm.ai/moonshotai/Kimi-K3)
