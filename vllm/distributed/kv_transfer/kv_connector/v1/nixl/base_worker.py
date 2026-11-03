@@ -2818,11 +2818,11 @@ class NixlBaseConnectorWorker:
                 1, self._head_sharded_draft_kv_heads // remote_tp_size
             )
             # A hybrid target already reads its SSM state from every source
-            # rank, so the draft's heads can be gathered from them too.
-            if (
-                (tp_ratio < 0 and not self._has_mamba)
-                or self.dcp_size > 1
-                or remote_dcp_size > 1
+            # rank, so the draft's heads can be gathered from them too. Under
+            # DCP only equal TP and DCP pair ranks 1:1 (rank i reads rank i).
+            if (tp_ratio < 0 and not self._has_mamba) or (
+                (self.dcp_size > 1 or remote_dcp_size > 1)
+                and (tp_ratio != 1 or self.dcp_size != remote_dcp_size)
             ):
                 raise NotImplementedError(
                     "NIXL head-sharded draft KV under an MLA target requires "
