@@ -186,6 +186,19 @@ def _merge_dcp_topk_global(
     if dcp_world_size <= 1:
         return
 
+    if current_platform.is_rocm():
+        from vllm.model_executor.kernels.attention.dsa.dcp_indexer_rocm import (
+            pack_dcp_candidates,
+            select_dcp_candidates,
+        )
+
+        packed = pack_dcp_candidates(
+            logits, topk_indices, dcp_rank, dcp_world_size, cp_interleave, row_starts
+        )
+        gathered = get_dcp_group().all_gather(packed, dim=1)
+        select_dcp_candidates(gathered, topk_indices)
+        return
+
     # CuteDSL-only path (no PyTorch fallback): Triton-pack each rank's
     # (score, global_id) candidates on-device, all-gather, then the CuteDSL
     # stable-topk selector.
@@ -1355,6 +1368,9 @@ class SparseAttnIndexer(CustomOp):
                 candidate_block_size=self.candidate_block_size,
                 candidate_write=self.candidate_write,
                 cache_layout=self.cache_layout,
+                dcp_rank=self.dcp_rank,
+                dcp_world_size=self.dcp_world_size,
+                cp_interleave=self._parallel_config.cp_kv_cache_interleave_size,
             )
         raise RuntimeError(
             "Sparse attention indexer ROCm path requires AITER or a supported "

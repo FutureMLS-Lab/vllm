@@ -41,6 +41,7 @@ import torch
 import vllm.envs as envs
 from vllm.distributed.parallel_state import get_tp_group
 from vllm.logger import init_logger
+from vllm.platforms import current_platform
 from vllm.utils.math_utils import round_up
 from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.attention.backend import CommonAttentionMetadata
@@ -53,10 +54,7 @@ from vllm.v1.attention.backends.mla.sparse_utils import (
     ConvertReqIndexToGlobalIndexKernel,
 )
 from vllm.v1.attention.ops.dcp import dcp_a2a_lse_reduce
-from vllm.v1.attention.ops.dcp_shardq.gather import (
-    DCP_CONTEXT_PUSH_KERNEL,
-    PAGE_TOKENS,
-)
+from vllm.v1.attention.ops.dcp_shardq import PAGE_TOKENS
 from vllm.v1.attention.ops.shardq import (
     ShardQSplit,
     _symm_buffer,
@@ -148,9 +146,10 @@ def scheduler_context_pages(vllm_config: "VllmConfig") -> int | None:
     a step's leading decode rows and steps of fewer than
     ``sparse_mla_shard_q_min_tokens`` prefill tokens, and the memory profile
     reserves those (``dcp_fallback_max_tokens``) instead of a whole
-    ``max_num_batched_tokens`` step. These are the configuration-level
-    conditions of SparseMLAShardQ's DCP ShardQ; when its layer-level ones fail
-    the cap merely keeps a step's prefill context within ``max_model_len``.
+    ``max_num_batched_tokens`` step. These are the configuration-level and
+    platform conditions of SparseMLAShardQ's DCP ShardQ; when its layer-level
+    ones fail the cap merely keeps a step's prefill context within
+    ``max_model_len``.
     """
     parallel_config = vllm_config.parallel_config
     kv_transfer_config = vllm_config.kv_transfer_config
@@ -161,6 +160,7 @@ def scheduler_context_pages(vllm_config: "VllmConfig") -> int | None:
         or dcp != parallel_config.tensor_parallel_size
         or parallel_config.cp_kv_cache_interleave_size != 1
         or parallel_config.use_ubatching
+        or not current_platform.is_device_capability_family(100)
         or parallel_config.prefill_context_parallel_size != 1
         or (
             kv_transfer_config is not None
@@ -367,6 +367,11 @@ class DcpShardQContext:
         DCP-local paged caches (with the step's kernel block tables) into the
         workspaces at ``dst_addrs``."""
         if self.max_local_pages:
+            # gather imports cutlass, so import it only on the SM100 path.
+            from vllm.v1.attention.ops.dcp_shardq.gather import (
+                DCP_CONTEXT_PUSH_KERNEL,
+            )
+
             first = self.num_decodes
             DCP_CONTEXT_PUSH_KERNEL(
                 mla_cache=mla_cache,
@@ -534,6 +539,9 @@ def register_warmup(layout: ContextLayout, world: int, num_topk_tokens: int) -> 
     workspace. (The prefill chunk metadata kernel warms its non-DCP form when
     ``sparse_mla_shard_q`` is set under DCP; ShardQ's exchange kernel warms
     with every ShardQ layer.)"""
+    # gather imports cutlass, so import it only on the SM100 path.
+    from vllm.v1.attention.ops.dcp_shardq.gather import DCP_CONTEXT_PUSH_KERNEL
+
     DCP_CONTEXT_PUSH_KERNEL.register_warmup(
         world=world,
         mla_row_bytes=layout.mla_row_bytes,

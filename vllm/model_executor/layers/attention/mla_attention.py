@@ -1196,71 +1196,100 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 )
             else:
                 mqa_q = (mqa_ql_nope, mqa_q_pe)
-            # concatenate nope + pe -> (B, N, L + P) (fp8 op above may have fused)
-            if self.impl.dcp_world_size > 1 and gathered_context is None:
-                assert self.dcp_manager is not None
-                if self.use_pcp:
-                    if self.impl.dcp_world_size > self.impl.pcp_world_size:
+            kvgather_rows = 0
+            if (
+                self.impl.dcp_world_size > 1
+                and self.impl.is_sparse
+                and not use_mha
+                and not qrep_decode
+                and not self.use_pcp
+                and hasattr(self.impl, "sparse_dcp_prefill_kvgather")
+                and self.impl.use_dcp_prefill_kvgather(attn_metadata, num_mqa_tokens)  # type: ignore[attr-defined]
+            ):
+                # Prefill rows gather the KV instead of every rank's queries:
+                # no query all-gather and no output all-to-all for them.
+                if isinstance(mqa_q, tuple):
+                    # NoPE MLA has an empty rope part: skip the concat copy.
+                    nope, pe = mqa_q
+                    mqa_q = (
+                        nope
+                        if pe.shape[-1] == 0 and nope.is_contiguous()
+                        else torch.cat(mqa_q, dim=-1)
+                    )
+                nd = attn_metadata.num_decode_tokens
+                prefill_out = self.impl.sparse_dcp_prefill_kvgather(  # type: ignore[attr-defined]
+                    mqa_q[nd:num_mqa_tokens], kv_cache, attn_metadata, nd
+                )
+                self._v_up_proj(prefill_out, out=output[nd:num_mqa_tokens])
+                kvgather_rows = num_mqa_tokens - nd
+                mqa_q = mqa_q[:nd]
+                mqa_output_slice = output[:nd]
+            if num_mqa_tokens > kvgather_rows:
+                # concatenate nope + pe -> (B, N, L + P) (fp8 op above may have fused)
+                if self.impl.dcp_world_size > 1 and gathered_context is None:
+                    assert self.dcp_manager is not None
+                    if self.use_pcp:
+                        if self.impl.dcp_world_size > self.impl.pcp_world_size:
+                            if isinstance(mqa_q, tuple):
+                                mqa_q = torch.cat(mqa_q, dim=-1)
+                            mqa_q = get_tp_group().all_gather(mqa_q, dim=1)
+                    else:
                         if isinstance(mqa_q, tuple):
+                            # concatenate mqa_ql_nope and mqa_q_pe -> (B, N, L + P)
                             mqa_q = torch.cat(mqa_q, dim=-1)
-                        mqa_q = get_tp_group().all_gather(mqa_q, dim=1)
-                else:
-                    if isinstance(mqa_q, tuple):
-                        # concatenate mqa_ql_nope and mqa_q_pe -> (B, N, L + P)
-                        mqa_q = torch.cat(mqa_q, dim=-1)
-                    if not qrep_decode:
-                        assert self.dcp_manager.query_gather is not None
-                        mqa_q = self.dcp_manager.query_gather(mqa_q)
+                        if not qrep_decode:
+                            assert self.dcp_manager.query_gather is not None
+                            mqa_q = self.dcp_manager.query_gather(mqa_q)
 
-            # call decode attn
-            if not self.impl.is_sparse:
-                assert attn_metadata.decode is not None
-            if shardq is not None:
-                attn_out = self.impl.forward_mqa_shardq(  # type: ignore[attr-defined]
-                    mqa_q, kv_cache, attn_metadata, self
-                )
-                lse = None
-                if gathered_context is not None and gathered_context.num_decodes:
-                    attn_out[: gathered_context.num_decode_tokens] = (
-                        self._dcp_decode_rows(
-                            mqa_q, kv_cache, attn_metadata, gathered_context
+                # call decode attn
+                if not self.impl.is_sparse:
+                    assert attn_metadata.decode is not None
+                if shardq is not None:
+                    attn_out = self.impl.forward_mqa_shardq(  # type: ignore[attr-defined]
+                        mqa_q, kv_cache, attn_metadata, self
+                    )
+                    lse = None
+                    if gathered_context is not None and gathered_context.num_decodes:
+                        attn_out[: gathered_context.num_decode_tokens] = (
+                            self._dcp_decode_rows(
+                                mqa_q, kv_cache, attn_metadata, gathered_context
+                            )
                         )
-                    )
-            else:
-                attn_out, lse = self.impl.forward_mqa(  # type: ignore[attr-defined]
-                    mqa_q, kv_cache, attn_metadata, self
-                )
-
-            # correct dcp attn_out with lse.
-            if self.impl.dcp_world_size > 1 and gathered_context is None:
-                assert lse is not None
-                assert self.dcp_manager is not None
-                decode_metadata = getattr(attn_metadata, "decode", None)
-                if not use_mha:
-                    seq_lens = cast(torch.Tensor, attn_metadata.seq_lens)  # type: ignore[attr-defined]
-                    query_start_loc = attn_metadata.query_start_loc
                 else:
-                    seq_lens = (
-                        decode_metadata.seq_lens
-                        if decode_metadata is not None
-                        else cast(torch.Tensor, attn_metadata.seq_lens)[  # type: ignore[attr-defined]
-                            : attn_metadata.num_decodes
-                        ]
+                    attn_out, lse = self.impl.forward_mqa(  # type: ignore[attr-defined]
+                        mqa_q, kv_cache, attn_metadata, self
                     )
-                    query_start_loc = attn_metadata.query_start_loc[
-                        : attn_metadata.num_decodes + 1
-                    ]
-                attn_out = self.dcp_manager.combine(
-                    attn_out,
-                    lse,
-                    seq_lens=seq_lens,
-                    query_start_loc=query_start_loc,
-                )
-                if self.use_pcp:
-                    attn_out = finalize_mla_pcp_decode(attn_out, self.num_heads)
 
-            # v_up projection
-            self._v_up_proj(attn_out, out=mqa_output_slice)
+                # correct dcp attn_out with lse.
+                if self.impl.dcp_world_size > 1 and gathered_context is None:
+                    assert lse is not None
+                    assert self.dcp_manager is not None
+                    decode_metadata = getattr(attn_metadata, "decode", None)
+                    if not use_mha and not kvgather_rows:
+                        seq_lens = cast(torch.Tensor, attn_metadata.seq_lens)  # type: ignore[attr-defined]
+                        query_start_loc = attn_metadata.query_start_loc
+                    else:
+                        seq_lens = (
+                            decode_metadata.seq_lens
+                            if decode_metadata is not None
+                            else cast(torch.Tensor, attn_metadata.seq_lens)[  # type: ignore[attr-defined]
+                                : attn_metadata.num_decodes
+                            ]
+                        )
+                        query_start_loc = attn_metadata.query_start_loc[
+                            : attn_metadata.num_decodes + 1
+                        ]
+                    attn_out = self.dcp_manager.combine(
+                        attn_out,
+                        lse,
+                        seq_lens=seq_lens,
+                        query_start_loc=query_start_loc,
+                    )
+                    if self.use_pcp:
+                        attn_out = finalize_mla_pcp_decode(attn_out, self.num_heads)
+
+                # v_up projection
+                self._v_up_proj(attn_out, out=mqa_output_slice)
 
         if quant_key is not None:
             quant_idx = num_mqa_tokens if mha_use_quant_output else num_actual_toks

@@ -5,13 +5,16 @@ from collections.abc import Iterable
 from typing import Any, cast
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from vllm import envs
-from vllm.config import CacheConfig, VllmConfig
+from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.distributed import (
+    get_dcp_group,
     get_pp_group,
     get_tensor_model_parallel_world_size,
+    get_tp_group,
 )
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul, SituAndMul
@@ -148,6 +151,78 @@ class KimiMLP(nn.Module):
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
         return x
+
+
+class KimiRoutedInputLinear(ReplicatedLinear):
+    """Distribute large prefill projections over identical TP/DCP groups."""
+
+    # Measured crossover on MI355X: smaller batches lose to gather overhead.
+    min_sharded_tokens = 8192
+    _token_group = None
+
+    def enable_token_sharding(self) -> None:
+        from vllm.platforms.rocm import on_gfx950
+
+        config = get_current_vllm_config()
+        parallel = config.parallel_config
+        if (
+            not on_gfx950()
+            or config.lora_config is not None
+            or parallel.use_ubatching
+            or parallel.tensor_parallel_size != 8
+            or parallel.decode_context_parallel_size != 8
+            or self.input_size != 7168
+            or self.output_size != 3584
+        ):
+            return
+        tp, dcp = get_tp_group(), get_dcp_group()
+        if tp.ranks == dcp.ranks and tp.rank_in_group == dcp.rank_in_group:
+            self._token_group = dcp
+
+    def forward(self, x: torch.Tensor):
+        group = self._token_group
+        # Small batches keep replicated GEMM: gathering costs more than it saves.
+        if (
+            group is None
+            or x.ndim != 2
+            or x.dtype != torch.bfloat16
+            or x.shape[0] < self.min_sharded_tokens
+        ):
+            return super().forward(x)
+
+        projected, bias = self._project_local(x)
+        return group.all_gather(projected, dim=0)[: x.shape[0]], bias
+
+    def _project_local(self, x: torch.Tensor):
+        group = self._token_group
+        assert group is not None
+        tokens = x.shape[0]
+        chunk = (tokens + group.world_size - 1) // group.world_size
+        start = group.rank_in_group * chunk
+        local = x[start : min(start + chunk, tokens)]
+        if local.shape[0] != chunk:
+            local = F.pad(local, (0, 0, 0, chunk - local.shape[0]))
+        return super().forward(local)
+
+    def forward_quantized(self, x: torch.Tensor):
+        """Exchange the same MXFP4 activations consumed by the routed experts."""
+        from aiter import dtypes
+        from aiter.ops.quant import per_1x32_mx_quant_hip
+
+        group = self._token_group
+        assert group is not None
+        projected, bias = self._project_local(x)
+        assert bias is None
+        values, scales = per_1x32_mx_quant_hip(
+            projected, quant_dtype=dtypes.fp4x2, shuffle=False
+        )
+        packed = torch.cat((values.view(torch.uint8), scales.view(torch.uint8)), dim=1)
+        gathered = group.all_gather(packed.view(torch.int32), dim=0)
+        gathered = gathered.view(torch.uint8)[: x.shape[0]]
+        split = self.output_size // 2
+        values = gathered[:, :split].contiguous().view(dtypes.fp4x2)
+        scales = gathered[:, split:].contiguous().view(dtypes.fp8_e8m0)
+        return values, scales
 
 
 class KimiRoutedOutputTransform(nn.Module):
@@ -287,11 +362,21 @@ class KimiMoE(nn.Module):
         self.routed_expert_up_proj: ReplicatedLinear | ColumnParallelLinear | None
         self.routed_output_transform: KimiRoutedOutputTransform | None
         if self.use_latent_moe:
-            self.routed_expert_down_proj = ReplicatedLinear(
+            # The checkpoint stores this projection in BF16; only an explicit
+            # online quantization config may change its weight precision.
+            down_quant_config = quant_config
+            if quant_config is not None and quant_config.get_name() != "online":
+                down_quant_config = quant_config.online_quantization_config
+            input_linear = (
+                KimiRoutedInputLinear
+                if getattr(config, "dsa_config", None) is not None
+                else ReplicatedLinear
+            )
+            self.routed_expert_down_proj = input_linear(
                 hidden_size,
                 self.moe_hidden_size,
                 bias=False,
-                quant_config=None,
+                quant_config=down_quant_config,
                 prefix=f"{prefix}.routed_expert_down_proj",
             )
             self.routed_expert_norm = (
@@ -358,6 +443,17 @@ class KimiMoE(nn.Module):
             routed_output_transform=self.routed_output_transform,
             runner_cls=ROCmLatentMoERunner if self.use_latent_moe else None,
         )
+        moe_parallel = self.experts.moe_config.moe_parallel_config
+        if (
+            isinstance(self.routed_expert_down_proj, KimiRoutedInputLinear)
+            and not moe_parallel.is_sequence_parallel
+            and moe_parallel.dp_size
+            == moe_parallel.pcp_size
+            == moe_parallel.ep_size
+            == 1
+        ):
+            # The sharded path adds an all_gather, so all ranks must take it or none.
+            self.routed_expert_down_proj.enable_token_sharding()
         if self.padded_moe_intermediate_size != moe_intermediate_size:
             w13_weight = getattr(self.experts, "w13_weight", None)
             if w13_weight is None:
@@ -1062,6 +1158,9 @@ class KimiLinearModel(nn.Module, EagleModelMixin):
                 continue
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
+                    continue
+                # DSA keeps its output gate separate from the fused Q/KV.
+                if weight_name == ".g_proj" and name in params_dict:
                     continue
                 # We have mlp.experts[0].gate_proj in the checkpoint.
                 # Since we handle the experts below in expert_params_mapping,

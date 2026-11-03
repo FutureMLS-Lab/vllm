@@ -30,8 +30,7 @@ from vllm.model_executor.warmup.jit_warmup_cutedsl_helper import (
     CuTeDSLLaunchSpec,
     VllmCuTeDSLJitKernel,
 )
-
-PAGE_TOKENS = 64
+from vllm.v1.attention.ops.dcp_shardq import PAGE_TOKENS
 
 
 @dsl_user_op

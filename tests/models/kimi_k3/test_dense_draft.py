@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Kimi-K3 drafts on Kimi-K3.1: dense MLA drafts (EAGLE3, DSpark) on
-FLASHINFER_MLA, GQA drafts (Qwen3 DSpark) in a KV cache group of their own."""
+"""Kimi-K3 drafts on Kimi-K3.1: dense MLA drafts (EAGLE3, DSpark) on dense MLA
+(FLASHINFER_MLA, ROCM_AITER_MLA on ROCm), GQA drafts (Qwen3 DSpark) in a KV
+cache group of their own."""
 
 from types import SimpleNamespace
 
@@ -10,6 +11,7 @@ import torch
 
 from vllm.model_executor.models.config import KimiK3ForConditionalGenerationConfig
 from vllm.models.kimi_k3.nvidia.gqa_draft import GQADraftKVCacheGrouping
+from vllm.platforms import current_platform
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.core.kv_cache_planning import get_kv_cache_groups
 from vllm.v1.kv_cache_interface import (
@@ -41,6 +43,8 @@ GQA_DRAFT = SimpleNamespace(num_key_value_heads=16)
     ],
 )
 def test_kimi_k31_defaults_draft_attention(method, draft_text_config, expected):
+    if current_platform.is_rocm() and draft_text_config is MLA_DRAFT:
+        expected = (AttentionBackendEnum.ROCM_AITER_MLA, "fp8")
     spec_config = SimpleNamespace(
         method=method,
         attention_backend=None,

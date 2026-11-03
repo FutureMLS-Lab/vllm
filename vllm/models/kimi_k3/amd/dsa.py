@@ -16,8 +16,11 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from vllm._aiter_ops import rocm_aiter_ops
+from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
-from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.distributed import get_dcp_group, get_tensor_model_parallel_world_size
+from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
@@ -34,12 +37,47 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     per_token_group_quant_fp8,
 )
-from vllm.model_executor.layers.sparse_attn_indexer import SparseAttnIndexer
+from vllm.model_executor.layers.sparse_attn_indexer import (
+    SparseAttnIndexer,
+    _merge_dcp_topk_global,
+)
 from vllm.models.kimi_k3.common.dsa_cache import KimiK3IndexerCache
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
+from vllm.triton_utils import tl, triton
+from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.backends.mla import indexer as v32_indexer
+from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadata
+from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
+    indexer_k_quant_and_cache_triton,
+    rocm_aiter_sparse_attn_indexer,
+    rocm_fp8_paged_mqa_logits,
+)
+
+from .ops.fp4_indexer import decode_layout, decode_tile_size, score_paged, store_keys
+from .ops.fp4_indexer_prefill import prefill_chunks, prefill_workspace_bytes
 
 logger = init_logger(__name__)
+
+
+@triton.jit
+def _index_weights_kernel(
+    values,
+    scales,
+    output,
+    value_stride,
+    weight_scale,
+    softmax_scale,
+    NUM_HEADS: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    head = tl.arange(0, BLOCK)
+    value = tl.load(values + row * value_stride + head, head < NUM_HEADS, 0)
+    # Preserve the projection dtype's rounding before the FP32 scale products.
+    value = (value.to(tl.float32) * weight_scale).to(values.dtype.element_ty)
+    scale = tl.load(scales + row * NUM_HEADS + head, head < NUM_HEADS, 0)
+    weight = value.to(tl.float32) * scale * softmax_scale
+    tl.store(output + row * NUM_HEADS + head, weight, head < NUM_HEADS)
 
 
 def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
@@ -51,8 +89,10 @@ def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
 class KimiK3DSAIndexerKNorm(nn.Module):
     """Bias-full fp32 LayerNorm for the DSA indexer shared key.
 
-    weight/bias are stored in fp32 directly (numerically equivalent to
-    casting per forward), keeping only the input/output dtype casts.
+    weight/bias load and stay in fp32; a copy in the activation dtype is cached
+    so the fp32 round trip does not cost two casts per call. F.layer_norm still
+    accumulates in fp32 for a bf16 input, so the only numeric change is that
+    weight/bias multiply in the activation dtype.
     """
 
     def __init__(self, dim: int, eps: float) -> None:
@@ -62,20 +102,291 @@ class KimiK3DSAIndexerKNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.bias = nn.Parameter(torch.zeros(dim, dtype=torch.float32))
 
+        # Not persistent: derived from weight/bias rather than loaded from a
+        # checkpoint, so state_dict() keeps exporting fp32.
+        self.weight_bf16: torch.Tensor | None
+        self.bias_bf16: torch.Tensor | None
+        self.register_buffer("weight_bf16", None, persistent=False)
+        self.register_buffer("bias_bf16", None, persistent=False)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return F.layer_norm(
-            x.float(), self.normalized_shape, self.weight, self.bias, self.eps
-        ).type_as(x)
+        weight, bias = self.weight_bf16, self.bias_bf16
+        if weight is None or weight.dtype != x.dtype:
+            weight = self.weight.to(x.dtype)
+            bias = self.bias.to(x.dtype)
+            # nn.Module.__setattr__ is expensive, and mutating a buffer during
+            # tracing would bake this branch into the captured graph.
+            if not torch.compiler.is_compiling():
+                self.weight_bf16, self.bias_bf16 = weight, bias
+        return F.layer_norm(x, self.normalized_shape, weight, bias, self.eps)
+
+
+def _indexer(
+    hidden: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    weights: torch.Tensor,
+    cache: torch.Tensor,
+    out: torch.Tensor,
+    scores: torch.Tensor,
+    prefix: str,
+    max_model_len: int,
+    max_keys: int,
+    rank: int,
+    world: int,
+    interleave: int,
+) -> None:
+    metadata = get_forward_context().attn_metadata
+    m = (
+        cast(DeepseekV32IndexerMetadata, metadata[prefix])
+        if isinstance(metadata, dict)
+        else None
+    )
+    if m is None or m.num_prefills:
+        rocm_aiter_sparse_attn_indexer(
+            hidden,
+            prefix,
+            cache,
+            q,
+            k,
+            weights,
+            128,
+            "ue8m0",
+            out.shape[1],
+            128,
+            max_model_len,
+            max_keys,
+            out,
+            cache_layout="NORMAL",
+            dcp_rank=rank,
+            dcp_world_size=world,
+            cp_interleave=interleave,
+        )
+        return
+
+    rows = m.num_decode_tokens
+    assert rows <= scores.shape[0]
+    indexer_k_quant_and_cache_triton(
+        k[: m.slot_mapping.numel()],
+        cache,
+        m.slot_mapping,
+        128,
+        "ue8m0",
+        cache_layout="NORMAL",
+    )
+    # Tracking already prepares causal token rows once in the shared builder.
+    decode = m.decode
+    assert decode is not None and not decode.requires_padding
+    assert decode.seq_lens.numel() == rows
+    assert decode.block_table.shape[0] == rows
+    ends = decode.seq_lens.reshape(-1)
+    width = (
+        (max_model_len + world * interleave - 1) // (world * interleave)
+    ) * interleave
+    logits = rocm_fp8_paged_mqa_logits(
+        q[:rows, None],
+        cache.unsqueeze(-2),
+        weights[:rows],
+        decode.seq_lens,
+        decode.block_table,
+        decode.schedule_metadata,
+        max_model_len=width,
+        cache_layout="NORMAL",
+    )
+    rocm_aiter_ops.indexer_top_k_decode(
+        logits,
+        1,
+        ends,
+        out[:rows],
+        out.shape[1],
+        stable=True,
+        values=scores[:rows],
+    )
+    out[rows : q.shape[0]].fill_(-1)
+
+
+def _fake(
+    hidden: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    weights: torch.Tensor,
+    cache: torch.Tensor,
+    out: torch.Tensor,
+    scores: torch.Tensor,
+    prefix: str,
+    max_model_len: int,
+    max_keys: int,
+    rank: int,
+    world: int,
+    interleave: int,
+) -> None:
+    pass
+
+
+direct_register_custom_op(
+    op_name="kimi_dcp_score_indexer",
+    op_func=_indexer,
+    mutates_args=["cache", "out", "scores"],
+    fake_impl=_fake,
+)
+
+
+def _select(logits, lengths, out, values=None):
+    rows, width = logits.shape
+    k = out.shape[1]
+    if values is not None:
+        from aiter.ops.topk import top_k_per_row_decode
+
+        top_k_per_row_decode(
+            logits, 1, lengths, out, rows, *logits.stride(), k, values=values
+        )
+    elif rocm_aiter_ops.is_indexer_top_k_supported(
+        is_prefill=False,
+        compress_ratio=1,
+        num_rows=rows,
+        max_valid_seq_len=width,
+        topk_tokens=k,
+    ):
+        rocm_aiter_ops.indexer_top_k_decode(logits, 1, lengths, out, k)
+    else:
+        torch.ops._C.top_k_per_row_decode(
+            logits, 1, lengths, out, rows, logits.stride(0), logits.stride(1), k
+        )
+
+
+@eager_break_during_capture
+def _fp4_indexer(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    weights: torch.Tensor,
+    cache: torch.Tensor,
+    out: torch.Tensor,
+    prefix: str,
+    max_model_len: int,
+    dcp_rank: int = 0,
+    dcp_world_size: int = 1,
+    interleave: int = 1,
+    weight_scale: float = 1.0,
+    scores: torch.Tensor | None = None,
+) -> None:
+    metadata = get_forward_context().attn_metadata
+    if not isinstance(metadata, dict):
+        from vllm.config import get_current_vllm_config
+        from vllm.v1.attention.backends.mla.indexer import (
+            get_max_prefill_buffer_size,
+        )
+
+        config = get_current_vllm_config()
+        _workspace = torch.empty(
+            prefill_workspace_bytes(
+                get_max_prefill_buffer_size(config),
+                config.scheduler_config.max_num_seqs,
+                dcp_world_size,
+                interleave,
+            ),
+            device=q.device,
+            dtype=torch.uint8,
+        )
+        return
+    m = metadata[prefix]
+    assert isinstance(m, DeepseekV32IndexerMetadata)
+    store_keys(k[: m.slot_mapping.numel()], cache, m.slot_mapping)
+    out[: q.shape[0]].fill_(-1)
+    if m.num_prefills:
+        assert m.prefill is not None
+        prefill_chunks(
+            q,
+            weights,
+            cache,
+            out,
+            m.prefill,
+            dcp_world_size,
+            interleave,
+            weight_scale,
+        )
+    if m.num_decodes:
+        decode = m.decode
+        block_table = m.block_table
+        assert decode is not None and block_table is not None
+        if (
+            decode.query_start_loc is not None
+            and not decode.requires_padding
+            and decode.seq_lens.numel() == m.num_decode_tokens
+        ):
+            # The builder already expands and DCP-localizes each causal bound.
+            starts = decode.query_start_loc
+            ends = decode.seq_lens.reshape(-1)
+        else:
+            starts, ends = decode_layout(
+                m.seq_lens,
+                decode.per_req_decode_lens,
+                m.num_decode_tokens,
+                dcp_rank,
+                dcp_world_size,
+                interleave,
+            )
+        tile_rows = decode_tile_size(
+            max_model_len, block_table.shape[1] * 64, out.shape[1], q.shape[1]
+        )
+        score_rows = scores if not m.num_prefills else None
+        for start in range(0, m.num_decode_tokens, tile_rows):
+            end = min(start + tile_rows, m.num_decode_tokens)
+            row_ends = ends[start:end]
+            rel_starts = starts if start == 0 else starts - start
+            logits = score_paged(
+                q[start:end],
+                cache,
+                weights[start:end].float() * weight_scale,
+                block_table[: starts.numel() - 1],
+                rel_starts.clamp(0, end - start),
+                row_ends,
+                min(end - start, decode.write_max_decode_len or end - start),
+            )
+            selected = out[start:end]
+            if score_rows is not None:
+                # The sparse backend merges scores directly into local CSR slots.
+                _select(logits, row_ends, selected, score_rows[start:end])
+            else:
+                _select(logits, row_ends, selected)
+                _merge_dcp_topk_global(
+                    logits, selected, out.shape[1], dcp_rank, dcp_world_size, interleave
+                )
+
+
+def _fp4_indexer_fake(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    weights: torch.Tensor,
+    cache: torch.Tensor,
+    out: torch.Tensor,
+    prefix: str,
+    max_model_len: int,
+    dcp_rank: int = 0,
+    dcp_world_size: int = 1,
+    interleave: int = 1,
+    weight_scale: float = 1.0,
+    scores: torch.Tensor | None = None,
+) -> None:
+    return
+
+
+direct_register_custom_op(
+    op_name="kimi_fp4_indexer",
+    op_func=_fp4_indexer,
+    mutates_args=["cache", "out", "scores"],
+    fake_impl=_fp4_indexer_fake,
+)
 
 
 class KimiK3DSAIndexer(nn.Module):
-    """wq/wk/wv indexer projections + ``SparseAttnIndexer`` (ROCm dispatch).
+    """wq/wk/wv indexer projections with FP8 or MXFP4 scoring on ROCm.
 
     Forward quantizes the indexer query, folds the scales into the per-head
     weights and drives ``torch.ops.vllm.rocm_aiter_sparse_attn_indexer`` via
     ``SparseAttnIndexer.forward_hip`` with ``cache_layout="NORMAL"``: the
     indexer pages are block-flat, which the Triton insert wrapper cannot infer
-    from the cache shape alone.
+    from the cache shape alone. MXFP4 uses group scales and dedicated FlyDSL
+    scoring with the same global token-index output contract.
     """
 
     def __init__(
@@ -97,6 +408,12 @@ class KimiK3DSAIndexer(nn.Module):
         self.index_head_dim = index_head_dim
         self.index_num_heads = index_num_heads
         self.indexer_weight_scale = self.index_num_heads**-0.5
+        self.use_fp4 = v32_indexer.dsa_indexer_uses_fp4(vllm_config)
+        if self.use_fp4 and (
+            index_head_dim != 128 or index_num_heads not in (16, 32, 64)
+        ):
+            raise ValueError("Kimi MXFP4 requires head_dim=128 and 16/32/64 heads")
+        self.cp_interleave = vllm_config.parallel_config.cp_kv_cache_interleave_size
         # MLAModules contract: MultiHeadLatentAttention asserts the indexer
         # exposes topk_tokens.
         self.topk_tokens = index_topk
@@ -143,10 +460,11 @@ class KimiK3DSAIndexer(nn.Module):
         self.scale_fmt = "ue8m0"
         self.quant_block_size = self.index_head_dim
         self.index_softmax_scale = self.index_head_dim**-0.5
-        # fp8 naive index cache: fp8 value bytes plus one fp32 scale per head
-        # (quant_block_size == index_head_dim by contract), hence +4 bytes.
+        # FP8: 128 values + one FP32 scale. MXFP4: 64 packed value bytes
+        # + four UE8M0 group scales. Both formats add four scale bytes.
         self.k_cache = KimiK3IndexerCache(
-            head_dim=self.index_head_dim + 4,
+            head_dim=(self.index_head_dim // 2 if self.use_fp4 else self.index_head_dim)
+            + 4,
             dtype=torch.uint8,
             prefix=f"{prefix}.k_cache",
             cache_config=cast(CacheConfig, cache_config),
@@ -154,16 +472,34 @@ class KimiK3DSAIndexer(nn.Module):
         self.max_model_len = vllm_config.model_config.max_model_len
         self.max_total_seq_len = v32_indexer.get_max_prefill_buffer_size(vllm_config)
         self.topk_indices_buffer = topk_indices_buffer
-        self.indexer_op = SparseAttnIndexer(
-            self.k_cache,
-            self.quant_block_size,
-            self.scale_fmt,
-            self.topk_tokens,
-            self.index_head_dim,
-            self.max_model_len,
-            self.max_total_seq_len,
-            topk_indices_buffer,
-            cache_layout="NORMAL",
+        self.dcp_scores = None
+        if vllm_config.parallel_config.decode_context_parallel_size > 1:
+            assert topk_indices_buffer is not None
+            spec = vllm_config.speculative_config
+            rows = max(
+                vllm_config.scheduler_config.max_num_seqs
+                * (1 + (spec.num_speculative_tokens if spec else 0)),
+                vllm_config.compilation_config.max_cudagraph_capture_size or 0,
+            )
+            self.dcp_scores = torch.empty(
+                (rows, self.topk_tokens),
+                dtype=torch.float32,
+                device=topk_indices_buffer.device,
+            )
+        self.indexer_op = (
+            None
+            if self.use_fp4
+            else SparseAttnIndexer(
+                self.k_cache,
+                self.quant_block_size,
+                self.scale_fmt,
+                self.topk_tokens,
+                self.index_head_dim,
+                self.max_model_len,
+                self.max_total_seq_len,
+                topk_indices_buffer,
+                cache_layout="NORMAL",
+            )
         )
 
     def _quantize_index_q_and_weights(
@@ -173,9 +509,8 @@ class KimiK3DSAIndexer(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """FP8-quantize the indexer query and fold scales into the weights.
 
-        Same quant layout as the upstream Indexer.forward (ue8m0 per-group
-        scales folded into fp32 weights with the softmax scale; index_v
-        already carries the 1/sqrt(num_heads) factor from forward).
+        Fold the query, head-count and softmax scales into FP32 weights,
+        preserving the projection dtype's intermediate rounding.
         """
         q_flat = index_q.reshape(-1, self.index_head_dim).contiguous()
         q_fp8, q_scale = per_token_group_quant_fp8(
@@ -185,12 +520,22 @@ class KimiK3DSAIndexer(nn.Module):
             use_ue8m0=True,
         )
         q_fp8 = q_fp8.view(index_q.shape)
-        q_scale = q_scale.view(index_q.shape[0], self.index_num_heads, -1)
-        weights = (
-            (index_weights.float().unsqueeze(-1) * q_scale * self.index_softmax_scale)
-            .squeeze(-1)
-            .contiguous()
+        weights = torch.empty(
+            (index_q.shape[0], self.index_num_heads),
+            dtype=torch.float32,
+            device=index_q.device,
         )
+        if index_q.shape[0]:
+            _index_weights_kernel[(index_q.shape[0],)](
+                index_weights,
+                q_scale,
+                weights,
+                index_weights.stride(0),
+                self.indexer_weight_scale,
+                self.index_softmax_scale,
+                NUM_HEADS=self.index_num_heads,
+                BLOCK=triton.next_power_of_2(self.index_num_heads),
+            )
         return q_fp8, weights
 
     def forward(
@@ -208,11 +553,47 @@ class KimiK3DSAIndexer(nn.Module):
             -1, self.index_num_heads, self.index_head_dim
         )
         index_k = self.k_index_norm(self.wk_index(hidden_states)[0])
-        index_v = self.wv_index(hidden_states)[0] * self.indexer_weight_scale
+        index_v = self.wv_index(hidden_states)[0]
+        if self.use_fp4:
+            dcp = get_dcp_group()
+            torch.ops.vllm.kimi_fp4_indexer(
+                index_q,
+                index_k,
+                index_v,
+                self.k_cache.kv_cache,
+                self.topk_indices_buffer,
+                self.k_cache.prefix,
+                self.max_model_len,
+                dcp.rank_in_group,
+                dcp.world_size,
+                self.cp_interleave,
+                self.indexer_weight_scale * self.index_softmax_scale,
+                self.dcp_scores,
+            )
+            return self.topk_indices_buffer
         q_fp8, weights = self._quantize_index_q_and_weights(index_q, index_v)
         # Under a dummy run kv_cache is an empty placeholder and the op takes
         # its workspace-reservation path.
-        return self.indexer_op.forward_hip(hidden_states, q_fp8, index_k, weights)
+        indexer_op = self.indexer_op
+        assert indexer_op is not None
+        if self.dcp_scores is not None:
+            torch.ops.vllm.kimi_dcp_score_indexer(
+                hidden_states,
+                q_fp8,
+                index_k,
+                weights,
+                self.k_cache.kv_cache,
+                self.topk_indices_buffer,
+                self.dcp_scores,
+                self.k_cache.prefix,
+                self.max_model_len,
+                self.max_total_seq_len,
+                indexer_op.dcp_rank,
+                indexer_op.dcp_world_size,
+                indexer_op._parallel_config.cp_kv_cache_interleave_size,
+            )
+            return self.topk_indices_buffer
+        return indexer_op.forward_hip(hidden_states, q_fp8, index_k, weights)
 
 
 class KimiK3DSAAttention(nn.Module):
@@ -244,13 +625,9 @@ class KimiK3DSAAttention(nn.Module):
             raise ValueError("dsa_config is required for KimiK3DSAAttention")
         vllm_config = get_current_vllm_config()
         parallel_config = vllm_config.parallel_config
-        if (
-            parallel_config.prefill_context_parallel_size > 1
-            or parallel_config.decode_context_parallel_size > 1
-        ):
+        if parallel_config.prefill_context_parallel_size > 1:
             raise NotImplementedError(
-                "Kimi-K3.1 DSA on ROCm does not support prefill/decode "
-                "context parallelism yet."
+                "Kimi-K3.1 DSA on ROCm does not support prefill context parallelism."
             )
         self.hidden_size = hidden_size
         self.qk_nope_head_dim = qk_nope_head_dim
@@ -441,6 +818,10 @@ class KimiK3DSAAttention(nn.Module):
             quant_config,
             prefix,
         )
+
+    def get_input_quant_key(self) -> None:
+        # The generic MLA wrapper also feeds these activations to the gate.
+        return None
 
     def forward(
         self,
