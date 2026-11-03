@@ -5,7 +5,7 @@ meta:
   provider: "Moonshot AI"
   description: "2.8T-parameter native multimodal MoE with Kimi Delta Attention, sparse MLA, and a 1M-token context window"
   date_added: 2026-11-02
-  date_updated: 2026-11-02
+  date_updated: 2026-11-03
   tasks:
     - multimodal
     - text
@@ -63,6 +63,7 @@ variants:
 compatible_strategies:
   - single_node_tp
   - multi_node_tp
+  - pd_cluster
 
 # One B300 node (8 GPUs) or two GB300 trays (2 x 4 GPUs) hold the checkpoint.
 strategy_min_gpus:
@@ -81,6 +82,13 @@ hardware_overrides:
       # Loading ~1.56 TB of weights from network storage can take over 20 minutes.
       VLLM_ENGINE_READY_TIMEOUT_S: "3600"
 
+strategy_overrides:
+  # PD pools are TP8, as in the aggregated recipe. NIXL moves the KDA
+  # short-conv state in three reads, which needs the DS conv state layout.
+  pd_cluster:
+    env:
+      VLLM_SSM_CONV_STATE_LAYOUT: "DS"
+
 guide: |
   ## Overview
 
@@ -91,6 +99,22 @@ guide: |
 
   This recipe is the simplest working setup: one tensor-parallel group of 8 GPUs, either two
   GB300 trays or one B300 node. Throughput was not tuned.
+
+  ## Prefill/decode disaggregation
+
+  The **Prefill/Decode Disaggregation** strategy runs one TP8 prefill pool and one TP8 decode
+  pool, and decode pulls each request's KV from prefill over NIXL. Every PD worker sets
+  `VLLM_SSM_CONV_STATE_LAYOUT=DS`: NIXL transfers the Kimi Delta Attention conv state in three
+  reads, which needs that layout, and the NIXL connector refuses to start without it.
+
+  ## KV cache offloading
+
+  The **Simple** option on the KV Offload row adds `SimpleCPUOffloadConnector`, a host-DRAM
+  prefix tier for each GPU. Under Prefill/Decode Disaggregation it is added to the prefill pool
+  only, next to NIXL in a MultiConnector; decode keeps plain NIXL. The tier pins
+  `cpu_bytes_to_use_per_rank` of host memory for every GPU, so size it from the host DRAM that
+  is free after the engines are up. The tested GB300 prefill workers used 128 GiB per GPU
+  (512 GiB per tray).
 
   ## Client usage
 
