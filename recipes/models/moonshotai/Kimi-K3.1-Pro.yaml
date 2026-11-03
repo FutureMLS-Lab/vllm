@@ -1,7 +1,7 @@
 # yaml-language-server: $schema=https://recipes.vllm.ai/recipe.schema.json
 meta:
-  title: "Kimi-K3.1"
-  slug: "kimi-k3.1"
+  title: "Kimi-K3.1-Pro"
+  slug: "kimi-k3.1-pro"
   provider: "Moonshot AI"
   description: "2.8T-parameter native multimodal MoE with Kimi Delta Attention, sparse MLA, and a 1M-token context window"
   date_added: 2026-11-02
@@ -48,9 +48,27 @@ features:
     description: "Skip the vision encoder for text-only workloads; frees its memory for KV cache."
     args:
       - "--language-model-only"
+  low_latency_decode:
+    label: "Low-latency decode"
+    description: "Run decode steps on the fused CuTe DSL decode path (latency_specialized), which covers the sparse attention layers. Fastest at low concurrency; needs FULL decode CUDA graphs."
+    # Qualified at TP8 and TP8 + DCP8 without expert parallelism.
+    strategies:
+      - single_node_tp
+      - multi_node_tp
+    args:
+      - "--additional-config"
+      - '{"decode_backend":"latency_specialized"}'
+  nvfp4_kv_cache:
+    label: "NVFP4 KV cache"
+    description: "Store the MLA latent in NVFP4 instead of FP8 for about 1.5x the KV cache tokens; the indexer keys stay FP8."
+    args:
+      - "--kv-cache-dtype"
+      - "nvfp4_ds_mla"
 
 opt_in_features:
   - text_only
+  - low_latency_decode
+  - nvfp4_kv_cache
 
 variants:
   default:
@@ -62,12 +80,14 @@ variants:
 
 compatible_strategies:
   - single_node_tp
+  - single_node_tep
   - multi_node_tp
   - pd_cluster
 
 # One B300 node (8 GPUs) or two GB300 trays (2 x 4 GPUs) hold the checkpoint.
 strategy_min_gpus:
   single_node_tp: 8
+  single_node_tep: 8
   multi_node_tp: 8
 
 default_strategy: single_node_tp
@@ -81,7 +101,23 @@ hardware_overrides:
       # Loading ~1.56 TB of weights from network storage can take over 20 minutes.
       VLLM_ENGINE_READY_TIMEOUT_S: "3600"
 
+# DCP8 over the TP8 group (one B300 node or two GB300 trays).
+decode_context_parallel:
+  sizes:
+    b300: [8]
+    gb300: [8]
+  match_tp: true
+
 strategy_overrides:
+  # TEP on one B300 node: experts on MegaMoE, which dispatches tokens over
+  # NVLink one-sided all-to-all.
+  single_node_tep:
+    extra_args:
+      - "--moe-backend"
+      - "deep_gemm_mega_moe"
+      - "--all2all-backend"
+      - "flashinfer_nvlink_one_sided"
+
   # PD pools: a TP8 prefill pool with expert parallelism (one B300 node or two
   # GB300 trays) and a DEP16 decode pool — TP1 x DP16 with expert parallelism
   # (two B300 nodes or four GB300 trays). NIXL moves the KDA short-conv state
@@ -110,8 +146,39 @@ guide: |
   attention (DSA, top-2048 indexer) to 24 of its MLA layers. The checkpoint ships MXFP4
   routed-expert weights; everything else is BF16.
 
-  This recipe is the simplest working setup: one tensor-parallel group of 8 GPUs, either two
+  The baseline is the simplest working setup: one tensor-parallel group of 8 GPUs, either two
   GB300 trays or one B300 node. Throughput was not tuned.
+
+  ## Tensor + expert parallelism
+
+  On one B300 node, the **Tensor + Expert Parallel** strategy keeps attention at TP8 and runs
+  the routed experts with expert parallelism on the MegaMoE kernel. It has the lowest
+  long-prompt time to first token of the single-node layouts: a single 340K-token prompt
+  prefills in about 10 s, against about 15 s at plain TP8 (8x B300, one request at a time,
+  pre-release checkpoint).
+
+  ## Long context: decode context parallelism
+
+  The **Decode Context Parallelism** row shards the MLA latent and indexer-key caches across
+  the 8 GPUs of the TP group instead of replicating them, so DCP8 holds about 7x the KV cache
+  tokens of TP8 (about 18.5M vs 2.6M tokens with FP8 KV on 8x B300). Prefill is as fast as
+  at TP8. Decode steps are 7–25% slower than TP8 at the same batch, so use DCP when KV
+  capacity is the limit: very long contexts or many long-lived agentic sessions.
+
+  ## Low-latency decode
+
+  The **Low-latency decode** feature switches decode steps to a fused CuTe DSL path tuned for
+  small batches; prefill and mixed steps still run the default path. On 8x B300 at TP8 it cuts
+  the decode step by 1.6–1.7x at batch 1 and 1.2–1.3x at batch 32–64. Under DCP8 it brings decode
+  to within 6% of TP8. It requires the V2 model runner and FULL decode CUDA graphs (the
+  defaults), TP8 or TP8 + DCP8, and no expert parallelism in this recipe.
+
+  ## NVFP4 KV cache
+
+  The **NVFP4 KV cache** feature stores the MLA latent in NVFP4 (352 bytes per token per layer
+  instead of 576) and holds about 1.5x the KV cache tokens of FP8. The indexer keys stay FP8,
+  so the top-2048 token selection is unchanged. GSM8K matched FP8 on 8x GB300 (96.1% vs 96.2%);
+  long-context accuracy has not been measured yet.
 
   ## Prefill/decode disaggregation
 
