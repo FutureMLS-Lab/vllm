@@ -61,13 +61,18 @@ def test_plan_filler(num_new_tokens, prefill_end, stops, expected):
 
 @pytest.mark.parametrize("unit", [None, 16])
 @pytest.mark.parametrize("export", [False, True])
+# The checkpoint alignment each backend declares: Mamba2's SSD (Nemotron 3
+# Super), FlashKDA (GLM-5.3-Flash) and FlashInfer's gated delta rule prefill
+# (Qwen3.8-Flash-Next), whose spec takes the prefix-cache grid, here 64.
+@pytest.mark.parametrize("alignment", [1, 16, 64])
 def test_chunk_exports_the_state_at_a_shared_prefix_junction(
-    export: bool, unit: int | None
+    export: bool, unit: int | None, alignment: int
 ):
     # 192-token steps: a lone request is exempt from the long-prefill cap.
     # A finer prefix-match unit leaves the junction on the block grid.
     scheduler = make_hybrid_scheduler(
         max_num_batched_tokens=192,
+        checkpoint_alignment=alignment,
         ring=0,
         mamba_prefill_export=export,
         prefix_match_unit=unit,

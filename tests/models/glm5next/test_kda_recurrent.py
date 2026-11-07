@@ -308,6 +308,7 @@ def test_prefill_checkpoint_resumes_suffix(
     layer.local_projection_size = heads * D
     layer.kda_safe_gate = True
     layer.kda_lower_bound = -5.0
+    layer.recoverssm_records = None
     layer.kda_prefill_backend = "flashkda"
     layer._flashkda_export = export_build
     layer._conv_state_dim_first = dim_first
@@ -523,3 +524,99 @@ def test_flashkda_export_build_is_flashkda_bit_for_bit(heads, lengths, offsets):
             ("out", "final_state", "checkpoint_state"), actual, expected
         ):
             assert torch.equal(_bits(a), _bits(e)), (name, with_checkpoints)
+
+
+@pytest.mark.parametrize(
+    "lengths, offsets",
+    [
+        # A two-block chunk of GLM-5.3-Flash's 4,352-token blocks exporting at
+        # its interior block boundary, beside a sequence that exports nothing:
+        # FlashKDA's value-split path on B200.
+        ((8704, 1500), (4352, 0)),
+        # Offsets inside a 64-token chunk and inside the first chunk: its
+        # full-width path on B200.
+        ((8704, 3000, 1500, 640), (4352, 2000, 0, 48)),
+    ],
+)
+@pytest.mark.parametrize("build", ["_flashkda_C", "_flashkda_export_C"])
+@torch.inference_mode()
+def test_flashkda_checkpoint_is_a_cut_run_bit_for_bit(build, lengths, offsets):
+    """Each checkpoint row is, bit for bit, the final state of its sequence
+    cut at the offset, in a call that cuts every sequence there: with
+    FlashKDA's own checkpoint path, which in-chunk export uses without the
+    SM100 export build, and with the export build, at GLM-5.3-Flash's per-GPU
+    shape at tensor parallel 2 (32 heads). The state 64 tokens later differs,
+    and a sequence without an offset gets no row."""
+    import itertools
+
+    from vllm.models.glm5next.common import kda
+
+    if kda._resolve_kda_prefill_backend("auto", D, torch.bfloat16, -5) != "flashkda":
+        pytest.skip("requires FlashKDA")
+    import vllm._flashkda_C  # noqa: F401
+
+    if build == "_flashkda_export_C":
+        pytest.importorskip("vllm._flashkda_export_C")
+    ops = getattr(torch.ops, build)
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    heads, num_seqs = 32, len(lengths)
+    starts = [0, *itertools.accumulate(lengths)]
+    q, k, v, g = (
+        torch.randn(1, starts[-1], heads, D, device=device, dtype=torch.bfloat16)
+        for _ in range(4)
+    )
+    beta = torch.randn(1, starts[-1], heads, device=device, dtype=torch.bfloat16)
+    a_log = torch.randn(heads, device=device) * 0.1
+    dt_bias = torch.randn(heads, D, device=device) * 0.1
+    initial_state = torch.randn(num_seqs, heads, D, D, device=device) * 0.1
+
+    def call(seq_lengths, checkpoint_offsets=None):
+        """Every sequence's first ``seq_lengths`` tokens in one call."""
+        index = torch.cat(
+            [torch.arange(start, start + n) for start, n in zip(starts, seq_lengths)]
+        ).to(device)
+        tokens = len(index)
+        cu_seqlens = torch.tensor(
+            [0, *itertools.accumulate(seq_lengths)], dtype=torch.int32, device=device
+        )
+        final_state = torch.empty_like(initial_state)
+        checkpoint_state = torch.full_like(initial_state, float("nan"))
+        workspace = torch.empty(
+            ops.get_workspace_size(tokens, heads, num_seqs),
+            dtype=torch.uint8,
+            device=device,
+        )
+        ops.fwd(
+            q[:, index],
+            k[:, index],
+            v[:, index],
+            g[:, index],
+            beta[:, index],
+            D**-0.5,
+            torch.empty_like(q[:, index]),
+            workspace,
+            a_log,
+            dt_bias,
+            -5.0,
+            initial_state,
+            final_state,
+            cu_seqlens,
+            None if checkpoint_offsets is None else checkpoint_state,
+            None
+            if checkpoint_offsets is None
+            else torch.tensor(checkpoint_offsets, dtype=torch.int32, device=device),
+        )
+        return final_state, checkpoint_state
+
+    _, exported = call(lengths, offsets)
+    cut, _ = call([offset or n for n, offset in zip(lengths, offsets)])
+    later, _ = call(
+        [offset + 64 if offset else n for n, offset in zip(lengths, offsets)]
+    )
+    for seq, offset in enumerate(offsets):
+        if not offset:
+            assert exported[seq].isnan().all(), seq
+            continue
+        assert torch.equal(_bits(exported[seq]), _bits(cut[seq])), seq
+        assert not torch.equal(_bits(exported[seq]), _bits(later[seq])), seq

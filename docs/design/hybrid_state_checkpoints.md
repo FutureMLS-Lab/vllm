@@ -88,9 +88,29 @@ A later cap on the chunk that moves the position out of it drops the export.
 
 A non-final chunk that the block-aligned split cannot schedule at all, because the step's remaining budget is smaller than a block, may instead end on a 64-token boundary when that leaves at least 1024 tokens (`export.plan_filler`).
 
+A position where a state must be cached falls strictly inside a non-final chunk only when the chunk spans more than one block or such positions lie off the block grid: with a prefix-match unit finer than the block (`prefix_match_unit`) or with shared-prefix checkpoints (`enable_mamba_shared_prefix_checkpoint`). Otherwise, for example with a long-prefill threshold of one block and fewer than two blocks of batched tokens, the option only adds fill chunks.
+
+### Backends
+
+The exported state comes from the backend's own prefill call: no extra prefill runs and the chunk is not cut. A Mamba layer can export when it declares a prefill checkpoint alignment (`MambaBase.get_prefill_checkpoint_alignment`), and `mamba_prefill_export` is refused at startup unless every Mamba layer of the model does.
+
+| Layer (model) | Prefill backend | Alignment | Compute capability 10.0 | Other GPUs |
+| --- | --- | --- | --- | --- |
+| Mamba2 (Nemotron 3 Super) | Triton SSD | 1 | `_compute_chunk_metadata` ends an SSD chunk at the offset, the scan returns every chunk's state and `store_prefill_checkpoint` writes it with the convolution window | the same |
+| Kimi delta attention (GLM-5.3-Flash) | FlashKDA | 16 | `vllm._flashkda_export_C` ([Export kernels](#export-kernels)); without that build, as on other GPUs | `vllm._flashkda_C`'s own checkpoint path (SM90, SM10x, SM12x), with an extra pass in calls that export |
+| Gated delta rule (Qwen3.8-Flash-Next) | FlashInfer | the prefix-cache grid | the vendored per-sequence kernel ([Export kernels](#export-kernels)) for 128-wide keys and values, else as on other GPUs | FlashInfer's stride checkpoints (SM90, and SM10x and SM12x with 128-wide keys and CUDA 13) |
+| PLE short convolution (Qwen3.8-Flash-Next) | short convolution | the prefix-cache grid | `MambaPrefillCheckpointExporter` copies the convolution window | the same |
+
+The Kimi delta attention and gated delta rule layers above declare no alignment on any other prefill backend (Triton, CuTe DSL, AITER, SYCL), so the option is refused where those run, for example on GPUs without the support above and on ROCm, XPU and CPU.
+
+Two of these paths change rounding:
+
+- An SSD offset off the chunk grid (multiples of the model's chunk size in absolute positions, 128 tokens for Nemotron 3 Super) adds a chunk to its sequence. The exported state is still the state a chunk ending there leaves, bit for bit, but the sequence's later outputs and final state may change by rounding. An offset on the grid changes nothing; block boundaries are on it when the block size is a multiple of the chunk size.
+- FlashInfer's stride checkpoints follow its route choice: a call with few sequences takes the context-parallel route, whose states differ from those of the sequence cut at the offset by rounding (about 1e-3 on B200).
+
 ### Export kernels
 
-The exported state comes from the backend's own prefill call: no extra prefill runs and the chunk is not cut. On SM100 GPUs two backends write it inside their prefill kernel; elsewhere they keep upstream's checkpoint paths.
+On compute capability 10.0, two backends write the exported state inside their prefill kernel:
 
 - **Gated delta rule, FlashInfer backend.** FlashInfer's chunked prefill writes checkpoints at one stride for every sequence of the call (`checkpoint_every_n_tokens`, the gcd of the batch's offsets) into a workspace. With `mamba_prefill_export`, `GDNAttentionMetadataBuilder` instead numbers one workspace row per sequence that exports (`plan_gdn_export_rows`), and the layer calls a vendored copy of that kernel (`vllm/third_party/flashinfer_gdn`) that writes each sequence's state at its own offset into its row; `MambaPrefillCheckpointExporter` then copies the rows into the cache blocks as before. These calls always take FlashInfer's non-context-parallel route; when few sequences leave SMs idle, the builder has each (sequence, value head) run as two tiles of half the state's rows (`plan_gdn_export_split`).
 - **Kimi delta attention, FlashKDA backend.** Calls with checkpoint offsets use `vllm._flashkda_export_C`: FlashKDA built with the kernel files of `csrc/flashkda_export/`, which store the checkpoint and the final state from registers.
@@ -175,7 +195,7 @@ A decode-boundary state comes from the block in which a verify step leaves the s
 
 `mamba_prefill_export` requires `mamba_cache_mode="align"`, Model Runner V2 and a backend that writes prefill checkpoints in every Mamba group. It is refused with the EAGLE block drop under speculative decoding (an exported position follows neither the drop nor the lookahead block hashes that replace it), ubatching, and context parallelism.
 
-The export kernels take effect only on compute capability 10.0, with the FlashInfer prefill backend for the gated delta rule and the FlashKDA backend for Kimi delta attention; FlashKDA's export build `vllm._flashkda_export_C` is built for 10.0f and 10.0a.
+The export kernels take effect only on compute capability 10.0, with the FlashInfer prefill backend for the gated delta rule and the FlashKDA backend for Kimi delta attention; FlashKDA's export build `vllm._flashkda_export_C` is built for 10.0f and 10.0a. Elsewhere those backends export through their upstream checkpoint paths, and Mamba2 exports through the SSD on every GPU (see [Backends](#backends)).
 
 `mamba_spec_state_layout="compact"` requires speculative decoding, a model whose Mamba layers all support it (`MambaBase.supports_compact_spec_state`), CUDA, the Triton Mamba backend, pipeline parallel size 1 and, with prefix caching, Model Runner V2. It excludes `--use-replayssm` and every KV connector but `MooncakeStoreConnector`.
 
@@ -187,10 +207,12 @@ The tests in `tests/v1/core/hybrid_checkpoint/` run on CPU; all but the graph te
 
 - `test_checkpoint_graph.py`: a removed unit's children move to its parent, branch points, and frontier keys that separate tokens, lengths and extra keys.
 - `test_frontier_checkpoints.py`: resuming at a frontier, catch-up inside an indexer group, decode-boundary states, evicting one block of a frontier, aborted requests, leaf replacement, a prefix-match unit smaller than the block, KV connectors (the frontier a connector that stores frontiers is handed, a load moved past cached pages, a deferred lookup) and refused configurations.
-- `test_prefill_export.py`: the planning rules, a sibling's chunk that exports the state at its shared-prefix junction, fill chunks and refused configurations.
+- `test_prefill_export.py`: the planning rules, a sibling's chunk that exports the state at its shared-prefix junction under each backend's checkpoint alignment, fill chunks and refused configurations.
 - `test_gds_eviction.py`: GreedyDual-Size against LRU under memory pressure, a frontier pinned by a waiting request, an exhausted pool giving up the pins of the waiting queue's back first, the pool's consistency after every step of a seeded multi-session run, leaf-last tiers and idle demotion, and refused configurations.
 - `test_speculative_frontiers.py`: frontier checkpoints under speculative decoding with an n-gram drafter, in both state layouts, under synchronous and asynchronous scheduling, with stops inside accepted drafts, an in-chunk export, pool pressure, aborts and refused configurations. A device stand-in (`spec_device.py`) checks every state read and every cached state against its token position, and must catch injected faults.
 
 The export kernels' invariants are checked on SM100 GPUs by `tests/kernels/mamba/test_gdn_prefill_flashinfer.py::test_prefill_export_is_flashinfer_bit_for_bit` (with and without the value split, with an untouched row and a state 64 tokens later as controls) and `tests/models/glm5next/test_kda_recurrent.py::test_flashkda_export_build_is_flashkda_bit_for_bit`; `tests/v1/attention/test_gdn_metadata_builder.py` checks the export rows and the value split on CPU.
+
+The paths other GPUs take are checked against cut sequences, bit for bit, at the served models' per-GPU shapes at tensor parallel 2, with a state one chunk later as a control: `tests/models/glm5next/test_kda_recurrent.py::test_flashkda_checkpoint_is_a_cut_run_bit_for_bit` (FlashKDA's own checkpoint path and the export build) and, on CUDA GPUs, `tests/kernels/mamba/test_mamba2_checkpoint_state.py::test_prefill_export_is_a_cut_run_bit_for_bit_at_nemotron_shapes` (the SSD path, where rows whose offset is on the chunk grid also keep the output and final state of the step without export). FlashInfer's stride checkpoints are checked within a tolerance, on both routes, by `tests/kernels/mamba/test_gdn_prefill_flashinfer.py::test_flashinfer_checkpoints_export_the_state_at_each_offset`. `tests/v1/attention/test_mamba2_prefill_checkpoints.py` checks on CPU that the Mamba2 metadata builder ends a chunk at the scheduler's position.
 
 Elsewhere, `tests/v1/worker/test_gpu_stop_truncation.py` checks the truncated acceptance against the scheduler's `check_stop`, `tests/kernels/mamba/test_precopy_mamba_align.py` checks the gather (CUDA), and `tests/models/glm5next/test_kda_compact_spec_state.py` checks GLM-5.3-Flash's compact verify and commit against its per-position verify.

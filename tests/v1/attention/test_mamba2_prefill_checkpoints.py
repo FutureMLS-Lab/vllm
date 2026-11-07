@@ -102,7 +102,7 @@ def _create_mamba2_builder(
     return builder
 
 
-def _build(builder, seq_lens, query_lens):
+def _build(builder, seq_lens, query_lens, prefill_checkpoint_positions=None):
     common = create_common_attn_metadata(
         BatchSpec(seq_lens=seq_lens, query_lens=query_lens),
         MAMBA_BLOCK_SIZE,
@@ -111,7 +111,10 @@ def _build(builder, seq_lens, query_lens):
     )
     # create_common_attn_metadata leaves is_prefilling unset; the builder
     # asserts on it. Every row here is a full prefill.
-    common = common.replace(is_prefilling=torch.ones(len(seq_lens), dtype=torch.bool))
+    common = common.replace(
+        is_prefilling=torch.ones(len(seq_lens), dtype=torch.bool),
+        prefill_checkpoint_positions=prefill_checkpoint_positions,
+    )
     return builder.build(common_prefix_len=0, common_attn_metadata=common)
 
 
@@ -134,6 +137,37 @@ def test_builder_emits_one_checkpoint_entry_per_prefill_row():
     # also proves the chunk split actually landed on the checkpoint.
     ckpt_chunk = meta.checkpoint_chunk_idx[0]
     assert meta.cu_chunk_seqlen_p[ckpt_chunk + 1].item() == 768
+
+
+def test_builder_checkpoints_at_the_scheduler_export_position():
+    """An in-chunk export (mamba_prefill_export) replaces a row's default
+    checkpoint position with the scheduler's.
+
+    Row 0's chunk exports the state at 512 instead of the default 768: a chunk
+    ends there and the state goes to the same block column. Row 1 exports
+    nothing and keeps the default. Row 2's position lies less than a hash
+    block into its query, where the backend cannot write it, so the row
+    declines, as the scheduler and MambaManager do.
+    """
+    builder = _create_mamba2_builder()
+    meta = _build(
+        builder,
+        seq_lens=[900, 900, 900],
+        query_lens=[900, 900, 900],
+        prefill_checkpoint_positions=[512, 0, 128],
+    )
+
+    assert meta.checkpoint_meta is not None
+    assert meta.checkpoint_chunk_idx is not None
+    assert meta.checkpoint_meta.checkpoint_offsets.tolist() == [512, 768, 0]
+    # Column cdiv(900, 256) - 2 == 2 of rows 0 and 1, whose tables start at
+    # blocks 0 and 4.
+    assert meta.checkpoint_meta.state_indices.tolist() == [2, 6, NULL_BLOCK_ID]
+    chunk_ends = meta.cu_chunk_seqlen_p.tolist()
+    ckpt_chunks = meta.checkpoint_chunk_idx.tolist()
+    assert chunk_ends[ckpt_chunks[0] + 1] == 512
+    assert chunk_ends[ckpt_chunks[1] + 1] == 900 + 768
+    assert ckpt_chunks[2] == 0
 
 
 def test_update_block_table_regathers_checkpoint_blocks():
