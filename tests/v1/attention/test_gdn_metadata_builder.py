@@ -6,6 +6,7 @@ Covers the fix for https://github.com/vllm-project/vllm/issues/34845.
 """
 
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -17,11 +18,17 @@ from tests.v1.attention.utils import (
 )
 from vllm.config import SpeculativeConfig
 from vllm.config.compilation import CUDAGraphMode
+from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
+    exports_gdn_states_per_sequence,
+)
+from vllm.platforms import current_platform
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.attention.backends.gdn_attn import (
     GDNAttentionMetadata,
     GDNAttentionMetadataBuilder,
     plan_flashinfer_checkpoints,
+    plan_gdn_export_rows,
+    plan_gdn_export_split,
 )
 from vllm.v1.attention.backends.utils import mamba_get_block_table_tensor
 from vllm.v1.kv_cache_interface import MambaSpec
@@ -506,3 +513,122 @@ def test_plan_flashinfer_checkpoints_selects_the_state_at_each_offset():
     # Row 1: state after 128 tokens of the first prefill. Row 3: after 192
     # tokens of the third prefill, whose states start at index 3.
     assert rows == [0, 1, 0, 5]
+
+
+def test_plan_gdn_export_rows_numbers_the_exported_states():
+    """Each checkpoint row with an offset gets the next row of the export
+    buffer; rows without one (the leading decode, a prefill too short to
+    checkpoint) get none of their own."""
+    num_rows, rows = plan_gdn_export_rows([0, 128, 0, 192])
+
+    assert num_rows == 2
+    assert rows == [0, 0, 0, 1]
+    assert plan_gdn_export_rows([0, 0]) == (0, [0, 0])
+
+
+@pytest.mark.parametrize(
+    "query_lens, v_split",
+    [
+        ([6272], 2),
+        ([12544], 2),
+        ([6272, 6272], 2),
+        ([1088, 600, 2000], 2),
+        # Four sequences take two rounds of split tiles; the snake balances these.
+        ([6272, 6272, 3200, 1500], 2),
+        # Here the longest sequence's tiles come last and run alone.
+        ([4352, 2000, 3000, 6528], 1),
+        ([2048] * 8, 1),
+        ([1024] * 16, 1),
+    ],
+)
+def test_plan_gdn_export_split_takes_the_shorter_makespan(query_lens, v_split):
+    """Qwen3.8-Flash-Next's 24 value heads per rank at tensor parallel 2 on
+    148 SMs."""
+    assert plan_gdn_export_split(query_lens, 24, 148) == v_split
+
+
+@pytest.mark.parametrize(
+    ("head_k_dim", "head_v_dim", "per_sequence"),
+    [(128, 128, True), (128, 256, False), (256, 128, False), (64, 64, False)],
+)
+def test_per_sequence_export_needs_128_wide_heads(
+    monkeypatch: pytest.MonkeyPatch,
+    head_k_dim: int,
+    head_v_dim: int,
+    per_sequence: bool,
+):
+    """The export kernel's tiles are 128 wide: other GDN head sizes keep
+    FlashInfer's own checkpoint path instead of failing at the first export."""
+    monkeypatch.setattr(
+        current_platform, "is_device_capability", lambda capability: capability == 100
+    )
+    vllm_config = SimpleNamespace(
+        cache_config=SimpleNamespace(
+            mamba_prefill_export=True, mamba_cache_mode="align"
+        )
+    )
+    assert (
+        exports_gdn_states_per_sequence(
+            vllm_config, "flashinfer", head_k_dim, head_v_dim
+        )
+        == per_sequence
+    )
+
+
+@pytest.mark.skipif(
+    not current_platform.is_device_capability(100),
+    reason="Per-sequence export runs in FlashInfer's SM100 prefill kernel.",
+)
+@pytest.mark.parametrize("prefill_export", [False, True])
+def test_prefill_export_replaces_the_flashinfer_stride_plan(prefill_export):
+    """With in-chunk export the checkpointed prefill exports one state per
+    sequence, so the builder plans export rows instead of FlashInfer's stride
+    over the batch; without it, the stride plan stays."""
+    device = torch.device("cuda")
+    vllm_config = create_vllm_config(
+        model_name="Qwen/Qwen3.5-0.8B", block_size=BLOCK_SIZE
+    )
+    vllm_config.cache_config.mamba_cache_mode = "align"
+    vllm_config.cache_config.prefix_match_unit = 64
+    vllm_config.cache_config.mamba_prefill_export = prefill_export
+    mamba_spec = MambaSpec(
+        block_size=64,
+        shapes=((16, 128, 128),),
+        dtypes=(torch.float16,),
+        mamba_cache_mode="align",
+        num_prefill_checkpoint_blocks=1,
+        prefill_checkpoint_alignment=64,
+    )
+    builder = GDNAttentionMetadataBuilder(
+        kv_cache_spec=mamba_spec,
+        layer_names=["layer.0"],
+        vllm_config=vllm_config,
+        device=device,
+    )
+    vllm_config.cache_config.hash_block_size = 64
+    vllm_config.cache_config.cache_hit_alignment_tokens = 64
+    # A decode, then prefills checkpointing 192 and 128 tokens into their
+    # queries (the last 64-token boundary before each sequence's last token).
+    batch = BatchSpec(seq_lens=[65, 200, 300], query_lens=[1, 200, 172])
+    common = create_common_attn_metadata(batch, 64, device, arange_block_indices=True)
+    common = common.replace(block_table_tensor=common.block_table_tensor + 1)
+
+    meta = builder.build(0, common)
+
+    assert builder.export_per_sequence == prefill_export
+    assert meta.checkpoint is not None
+    torch.testing.assert_close(
+        meta.checkpoint.checkpoint_offsets.cpu(),
+        torch.tensor([0, 192, 128], dtype=torch.int32),
+    )
+    if prefill_export:
+        assert meta.flashinfer_checkpoint_plan is None
+        assert meta.export_plan is not None
+        assert meta.export_plan.num_checkpoints == 2
+        assert meta.export_plan.rows.tolist() == [0, 0, 1]
+        # Two prefills of 16 value heads: 64 split tiles fit one round.
+        assert meta.export_plan.v_split == 2
+    else:
+        assert meta.export_plan is None
+        assert meta.flashinfer_checkpoint_plan is not None
+        assert meta.flashinfer_checkpoint_plan.every_n_tokens == 64

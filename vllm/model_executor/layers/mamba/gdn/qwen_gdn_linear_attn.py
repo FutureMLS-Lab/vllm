@@ -4,6 +4,7 @@
 
 import functools
 import itertools
+import math
 import os
 from collections.abc import Callable
 from dataclasses import replace
@@ -370,6 +371,71 @@ def fi_chunk_gated_delta_rule(
         return result.unsqueeze(0), None
 
 
+def exports_gdn_states_per_sequence(
+    vllm_config: VllmConfig, backend: str, head_k_dim: int, head_v_dim: int
+) -> bool:
+    """Whether the prefill kernel exports checkpoints itself, one state per
+    sequence (``vllm.third_party.flashinfer_gdn``), instead of FlashInfer
+    emitting states at one stride for the batch: with in-chunk export
+    (``mamba_prefill_export``) on FlashInfer's SM100 kernel, for 128-wide
+    key and value heads (the kernel's tiles)."""
+    cache_config = vllm_config.cache_config
+    return (
+        cache_config.mamba_prefill_export
+        and cache_config.mamba_cache_mode == "align"
+        and backend == "flashinfer"
+        and head_k_dim == head_v_dim == 128
+        and current_platform.is_device_capability(100)
+    )
+
+
+def fi_chunk_gated_delta_rule_export(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    initial_state: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    checkpoint_offsets: torch.Tensor,
+    checkpoint_rows: torch.Tensor,
+    checkpoint_state: torch.Tensor,
+    v_split: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """FlashInfer's SM100 prefill that also writes, for each sequence whose
+    ``checkpoint_offsets`` entry is set, its state at that offset to row
+    ``checkpoint_rows`` of ``checkpoint_state``. Inputs as for
+    ``fi_chunk_gated_delta_rule`` with q and k already L2-normalized; the
+    output and final state are bit-identical to FlashInfer's call without
+    checkpoints on its non-context-parallel route."""
+    from vllm.third_party.flashinfer_gdn import chunk_gated_delta_rule_export_sm100
+
+    q = q.squeeze(0).contiguous()
+    k = k.squeeze(0).contiguous()
+    v = v.squeeze(0).contiguous()
+    output = torch.empty_like(v)
+    final_state = torch.empty(
+        initial_state.shape, dtype=torch.float32, device=initial_state.device
+    )
+    chunk_gated_delta_rule_export_sm100(
+        q,
+        k,
+        v,
+        g.squeeze(0).contiguous().to(torch.float32),
+        beta.squeeze(0).contiguous().to(torch.float32),
+        output,
+        cu_seqlens,
+        initial_state.to(torch.float32),
+        final_state,
+        1.0 / math.sqrt(q.shape[-1]),
+        checkpoint_offsets=checkpoint_offsets,
+        checkpoint_state=checkpoint_state,
+        checkpoint_rows=checkpoint_rows,
+        v_split=v_split,
+    )
+    return output.unsqueeze(0), final_state
+
+
 @CustomOp.register("chunk_gated_delta_rule")
 class ChunkGatedDeltaRule(CustomOp):
     def __init__(self) -> None:
@@ -700,6 +766,15 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             self._checkpoint_exporter = MambaPrefillCheckpointExporter(
                 state_len=self.conv_kernel_size - 1
             )
+        self._export_per_sequence = (
+            self._checkpoint_alignment is not None
+            and exports_gdn_states_per_sequence(
+                vllm_config, self.gdn_prefill_backend, self.head_k_dim, self.head_v_dim
+            )
+        )
+        if self._export_per_sequence:
+            # Fail at startup, not at the first export.
+            import vllm.third_party.flashinfer_gdn  # noqa: F401
         self.enable_packed_recurrent_decode = (
             envs.VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE
         )
@@ -1396,6 +1471,10 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 cu_seqlens=cu_seqlens,
             )
 
+        if self._exports_checkpoints and self._export_per_sequence:
+            # Every exporting prefill runs it: a compile error must fail
+            # startup, not pass for an autotuner warning below.
+            self._warmup_export_kernel(q, k, v, g, beta, state)
         try:
             self.chunk_gated_delta_rule(
                 q=q,
@@ -1447,6 +1526,36 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
 
         torch.accelerator.empty_cache()
 
+    def _warmup_export_kernel(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        state: torch.Tensor,
+    ) -> None:
+        """Compile the per-sequence export kernel, with and without its value
+        split."""
+        (state_checkpoints,) = current_workspace_manager().get_simultaneous(
+            self._checkpoint_buffer_spec
+        )
+        cu_seqlens = torch.tensor([0, q.shape[1]], device=q.device, dtype=torch.int32)
+        for v_split in (1, 2):
+            fi_chunk_gated_delta_rule_export(
+                q=q,
+                k=k,
+                v=v,
+                g=g,
+                beta=beta,
+                initial_state=state,
+                cu_seqlens=cu_seqlens,
+                checkpoint_offsets=cu_seqlens[1:],
+                checkpoint_rows=torch.zeros(1, device=q.device, dtype=torch.int32),
+                checkpoint_state=state_checkpoints[:1],
+                v_split=v_split,
+            )
+
     def _warmup_flashinfer_prefill_variants(
         self,
         q: torch.Tensor,
@@ -1462,9 +1571,12 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         sequences) and its regular route, each with and without checkpoint
         output. A single sequence under ``use_cp="auto"`` takes the CP route
         wherever the heuristic can pick it; ``use_cp=False`` forces the other.
+        When the prefill exports one state per sequence, calls with
+        checkpoints run that kernel instead of FlashInfer's checkpoint ones
+        (``_warmup_export_kernel``).
         """
         checkpoint_buffers: list[torch.Tensor | None] = [None]
-        if self._exports_checkpoints:
+        if self._exports_checkpoints and not self._export_per_sequence:
             (state_checkpoints,) = current_workspace_manager().get_simultaneous(
                 self._checkpoint_buffer_spec
             )
@@ -1816,7 +1928,47 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             initial_state = ssm_state[prefill_state_indices]
             initial_state[~prefill_has_initial_state, ...] = 0
             plan = attn_metadata.flashinfer_checkpoint_plan
-            if plan is None:
+            export_plan = attn_metadata.export_plan
+            if export_plan is not None:
+                checkpoint = attn_metadata.checkpoint
+                prefill_query_start_loc = attn_metadata.prefill_query_start_loc
+                assert checkpoint is not None
+                assert prefill_query_start_loc is not None
+                assert non_spec_query_start_loc is not None
+                (state_checkpoints,) = current_workspace_manager().get_simultaneous(
+                    self._checkpoint_buffer_spec
+                )
+                state_checkpoints = state_checkpoints[: export_plan.num_checkpoints]
+                # The prefill kernel runs the trailing checkpoint rows.
+                num_prefill_rows = prefill_query_start_loc.shape[0] - 1
+                (
+                    core_attn_out_non_spec,
+                    last_recurrent_state,
+                ) = fi_chunk_gated_delta_rule_export(
+                    q=query_non_spec,
+                    k=key_non_spec,
+                    v=value_non_spec,
+                    g=g_non_spec,
+                    beta=beta_non_spec,
+                    initial_state=initial_state,
+                    cu_seqlens=prefill_query_start_loc,
+                    checkpoint_offsets=checkpoint.checkpoint_offsets[
+                        -num_prefill_rows:
+                    ],
+                    checkpoint_rows=export_plan.rows[-num_prefill_rows:],
+                    checkpoint_state=state_checkpoints,
+                    v_split=export_plan.v_split,
+                )
+                self._checkpoint_exporter.export(
+                    checkpoint,
+                    raw_qkv=conv_input_non_spec,
+                    conv_state=conv_state,
+                    recurrent_checkpoint=state_checkpoints,
+                    recurrent_state=ssm_state,
+                    cu_seqlens=non_spec_query_start_loc,
+                    recurrent_rows=export_plan.rows,
+                )
+            elif plan is None:
                 (
                     core_attn_out_non_spec,
                     last_recurrent_state,

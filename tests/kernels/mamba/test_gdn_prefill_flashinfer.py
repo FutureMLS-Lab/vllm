@@ -19,11 +19,13 @@ from vllm.model_executor.layers.mamba.checkpoint import (  # noqa: E402
     MambaPrefillCheckpointExporter,
     MambaPrefillCheckpointMetadata,
 )
-from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
+from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (  # noqa: E402
     fi_chunk_gated_delta_rule,
-)  # noqa: E402
+    fi_chunk_gated_delta_rule_export,
+)
 from vllm.v1.attention.backends.gdn_attn import (  # noqa: E402
     plan_flashinfer_checkpoints,
+    plan_gdn_export_rows,
 )
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID  # noqa: E402
 
@@ -187,3 +189,213 @@ def test_flashinfer_checkpoints_export_the_state_at_each_offset(use_cp, ssm_dtyp
     untouched = [i for i in range(num_blocks) if i not in written]
     assert not ssm_state[untouched].any()
     assert not conv_state[untouched].any()
+
+
+def _bits(tensor: torch.Tensor) -> torch.Tensor:
+    return tensor.contiguous().view(
+        torch.int16 if tensor.element_size() == 2 else torch.int32
+    )
+
+
+@pytest.mark.skipif(
+    not current_platform.is_device_capability(100),
+    reason="The per-sequence export is FlashInfer's SM100 prefill kernel.",
+)
+@pytest.mark.parametrize("ssm_dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("num_qk_heads, num_v_heads", [(2, 6), (8, 24)])
+@pytest.mark.parametrize("v_split", [1, 2])
+@pytest.mark.parametrize("gate", ["logsigmoid", "wide"])
+def test_prefill_export_is_flashinfer_bit_for_bit(
+    ssm_dtype, num_qk_heads, num_v_heads, v_split, gate
+):
+    """The export changes no arithmetic and writes only the asked-for states.
+
+    Output and final state are FlashInfer's call without checkpoints on its
+    non-context-parallel route, bit for bit, and each exported state is
+    FlashInfer's final state of its sequence cut at the offset: on a 64-token
+    chunk boundary, inside a chunk and at the sequence's end. The leading
+    decode row and a prefill without a checkpoint get none, the buffer row
+    past the last exported state stays as it was, and the exporter copies the
+    states into their cache blocks with the matching convolution windows. With
+    24 value heads the split's 192 tiles take two rounds of the 148 SMs. The
+    kernel applies exp to the log-space gate itself, so "wide" also draws gates
+    down to -100, where a model's strongly decaying heads put them.
+    """
+    torch.manual_seed(0)
+    device = "cuda"
+    head_dim, conv_dim, state_len = 128, 16, 3
+    offsets = [0, 128, 0, 208, 96]
+    query_lens = [200, 50, 300, 96]
+    state_indices = [NULL_BLOCK_ID, 3, NULL_BLOCK_ID, 5, 6]
+    num_blocks = 8
+
+    num_tokens = sum(query_lens)
+    q = F.normalize(
+        torch.randn(1, num_tokens, num_qk_heads, head_dim, device=device), dim=-1
+    ).bfloat16()
+    k = F.normalize(
+        torch.randn(1, num_tokens, num_qk_heads, head_dim, device=device), dim=-1
+    ).bfloat16()
+    v = torch.randn(1, num_tokens, num_v_heads, head_dim, device=device).bfloat16()
+    g = F.logsigmoid(torch.randn(1, num_tokens, num_v_heads, device=device))
+    if gate == "wide":
+        g = -100.0 * torch.rand(1, num_tokens, num_v_heads, device=device)
+    beta = torch.sigmoid(torch.randn(1, num_tokens, num_v_heads, device=device))
+    initial_state = 0.1 * torch.randn(
+        len(query_lens), num_v_heads, head_dim, head_dim, device=device
+    )
+    prefill_cu = [0]
+    for query_len in query_lens:
+        prefill_cu.append(prefill_cu[-1] + query_len)
+    cu_seqlens_prefill = torch.tensor(prefill_cu, device=device, dtype=torch.int32)
+
+    num_rows, rows = plan_gdn_export_rows(offsets)
+    state_rows = torch.full(
+        (num_rows + 1, num_v_heads, head_dim, head_dim), float("nan"), device=device
+    )
+    output, final_state = fi_chunk_gated_delta_rule_export(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        initial_state=initial_state,
+        cu_seqlens=cu_seqlens_prefill,
+        checkpoint_offsets=torch.tensor(offsets[1:], device=device, dtype=torch.int32),
+        checkpoint_rows=torch.tensor(rows[1:], device=device, dtype=torch.int32),
+        checkpoint_state=state_rows[:num_rows],
+        v_split=v_split,
+    )
+
+    def flashinfer(start: int, length: int, seq: int, num_seqs: int = 1):
+        if num_seqs == 1:
+            cu = torch.tensor([0, length], device=device, dtype=torch.int32)
+        else:
+            cu = cu_seqlens_prefill
+        return fi_chunk_gated_delta_rule(
+            q=q[:, start : start + length],
+            k=k[:, start : start + length],
+            v=v[:, start : start + length],
+            g=g[:, start : start + length],
+            beta=beta[:, start : start + length],
+            initial_state=initial_state[seq : seq + num_seqs],
+            output_final_state=True,
+            cu_seqlens=cu,
+            use_qk_l2norm_in_kernel=False,
+            use_cp=False,
+        )
+
+    expected_output, expected_final = flashinfer(0, num_tokens, 0, len(query_lens))
+    assert torch.equal(_bits(output), _bits(expected_output))
+    assert torch.equal(_bits(final_state), _bits(expected_final))
+    exported = {}
+    for row, offset in enumerate(offsets):
+        if not offset:
+            continue
+        seq = row - 1
+        _, cut = flashinfer(prefill_cu[seq], offset, seq)
+        exported[row] = state_rows[rows[row]]
+        assert torch.equal(_bits(exported[row]), _bits(cut[0])), (row, offset)
+        if offset + 64 <= query_lens[seq]:
+            # The comparison would catch a state taken one chunk late.
+            _, later = flashinfer(prefill_cu[seq], offset + 64, seq)
+            assert not torch.equal(_bits(exported[row]), _bits(later[0]))
+    assert state_rows[num_rows].isnan().all()
+
+    # The exporter sees the decode row's token in front of the prefills.
+    raw_qkv = torch.randn(1 + num_tokens, conv_dim, device=device).bfloat16()
+    cu_seqlens = torch.tensor([0] + [1 + n for n in prefill_cu], device=device)
+    conv_state = torch.zeros(
+        num_blocks, state_len, conv_dim, device=device, dtype=torch.bfloat16
+    ).transpose(-1, -2)
+    ssm_state = torch.zeros(
+        num_blocks, num_v_heads, head_dim, head_dim, device=device, dtype=ssm_dtype
+    )
+    MambaPrefillCheckpointExporter(state_len=state_len).export(
+        MambaPrefillCheckpointMetadata(
+            checkpoint_offsets=torch.tensor(offsets, device=device, dtype=torch.int32),
+            state_indices=torch.tensor(state_indices, device=device),
+        ),
+        raw_qkv=raw_qkv,
+        conv_state=conv_state,
+        recurrent_checkpoint=state_rows[:num_rows],
+        recurrent_state=ssm_state,
+        cu_seqlens=cu_seqlens,
+        recurrent_rows=torch.tensor(rows, device=device, dtype=torch.int32),
+    )
+    written = []
+    for row, state in exported.items():
+        block = state_indices[row]
+        written.append(block)
+        assert torch.equal(_bits(ssm_state[block]), _bits(state.to(ssm_dtype)))
+        end = cu_seqlens[row].item() + offsets[row]
+        assert torch.equal(conv_state[block], raw_qkv[end - state_len : end].T)
+    untouched = [i for i in range(num_blocks) if i not in written]
+    assert not ssm_state[untouched].any()
+    assert not conv_state[untouched].any()
+
+
+@pytest.mark.skipif(
+    not current_platform.is_device_capability(100),
+    reason="The per-sequence export is FlashInfer's SM100 prefill kernel.",
+)
+def test_split_export_launches_on_an_odd_sm_count(monkeypatch):
+    """A split build launches 2-CTA clusters, so its grid must stay even.
+
+    The persistent grid is bounded by the SM count. With an odd count (15 here)
+    and more tiles than SMs (one sequence, 24 value heads, 48 split tiles) the
+    call still launches and stays FlashInfer's bit for bit.
+    """
+    from vllm.third_party.flashinfer_gdn import gdn_prefill as export_prefill
+
+    monkeypatch.setattr(export_prefill, "get_num_sm", lambda device: 15)
+    export_prefill._get_compiled_cache.cache_clear()
+    try:
+        torch.manual_seed(0)
+        device = "cuda"
+        num_tokens, offset, head_dim = 300, 208, 128
+        q = F.normalize(
+            torch.randn(1, num_tokens, 8, head_dim, device=device), dim=-1
+        ).bfloat16()
+        k = F.normalize(
+            torch.randn(1, num_tokens, 8, head_dim, device=device), dim=-1
+        ).bfloat16()
+        v = torch.randn(1, num_tokens, 24, head_dim, device=device).bfloat16()
+        g = F.logsigmoid(torch.randn(1, num_tokens, 24, device=device))
+        beta = torch.sigmoid(torch.randn(1, num_tokens, 24, device=device))
+        initial_state = 0.1 * torch.randn(1, 24, head_dim, head_dim, device=device)
+        state_rows = torch.empty(1, 24, head_dim, head_dim, device=device)
+        output, final_state = fi_chunk_gated_delta_rule_export(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            initial_state=initial_state,
+            cu_seqlens=torch.tensor([0, num_tokens], device=device, dtype=torch.int32),
+            checkpoint_offsets=torch.tensor([offset], device=device, dtype=torch.int32),
+            checkpoint_rows=torch.tensor([0], device=device, dtype=torch.int32),
+            checkpoint_state=state_rows,
+            v_split=2,
+        )
+
+        def flashinfer(length: int):
+            return fi_chunk_gated_delta_rule(
+                q=q[:, :length],
+                k=k[:, :length],
+                v=v[:, :length],
+                g=g[:, :length],
+                beta=beta[:, :length],
+                initial_state=initial_state,
+                output_final_state=True,
+                cu_seqlens=torch.tensor([0, length], device=device, dtype=torch.int32),
+                use_qk_l2norm_in_kernel=False,
+                use_cp=False,
+            )
+
+        expected_output, expected_final = flashinfer(num_tokens)
+        assert torch.equal(_bits(output), _bits(expected_output))
+        assert torch.equal(_bits(final_state), _bits(expected_final))
+        assert torch.equal(_bits(state_rows[0]), _bits(flashinfer(offset)[1][0]))
+    finally:
+        export_prefill._get_compiled_cache.cache_clear()

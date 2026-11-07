@@ -30,9 +30,11 @@ import torch
 
 from vllm.model_executor.layers.mamba import mamba_utils as layer_mamba_utils
 from vllm.platforms import current_platform
+from vllm.v1.core.kv_cache_utils import MambaStateGather
 from vllm.v1.worker import mamba_utils as worker_mamba_utils
 from vllm.v1.worker.mamba_utils import (
     _TEMPORAL_TILES,
+    MambaSpecDecodeGPUContext,
     postprocess_mamba_fused_kernel,
     precopy_mamba_align_fused_kernel,
 )
@@ -492,6 +494,70 @@ def test_preprocess_fused_align_matches_scalar_bookkeeping(monkeypatch, token_bi
         if int(src) != -1 and int(src) != int(dst)
     ]
     assert fused_copy_calls == scalar_copy_calls
+
+
+@_parametrize("conv_state_dim_first", [False, True])
+@_cuda_required
+def test_state_gathers_fold_a_draft_column_into_the_first(
+    monkeypatch, conv_state_dim_first
+):
+    """A gather completes a published state in place: the recurrent state of
+    a later draft column's block, and the first column's window read
+    ``column`` tokens ahead, both land in the first column's block."""
+    device = torch.device("cuda")
+    torch.manual_seed(0)
+    num_blocks = 16
+    convs, ssms = _build_state(num_blocks, device, conv_state_dim_first)
+    # (column, dst, src): the window of dst shifted by column, src's state.
+    gathers = [(1, 3, 4), (2, 7, 9)]
+    conv_ref = [c.clone() for c in convs]
+    ssm_ref = [s.clone() for s in ssms]
+    for column, dst, src in gathers:
+        for layer in range(NUM_LAYERS):
+            if conv_state_dim_first:
+                conv_ref[layer][dst, :, : CONV_WIDTH - column] = convs[layer][
+                    dst, :, column:
+                ]
+            else:
+                conv_ref[layer][dst, : CONV_WIDTH - column] = convs[layer][dst, column:]
+            ssm_ref[layer][dst] = ssms[layer][src]
+    base, blk_stride, elem, inner, width, group, drc, drs = _build_meta(
+        convs, ssms, device, conv_state_dim_first
+    )
+    group_id = 5
+    context = MambaSpecDecodeGPUContext(
+        state_base_addrs=base,
+        state_block_strides=blk_stride,
+        state_elem_sizes=elem,
+        state_inner_sizes=inner,
+        state_conv_widths=width,
+        state_group_indices=group,
+        state_dim_row_count=drc,
+        state_dim_row_stride=drs,
+        block_size=16,
+        num_states=NUM_LAYERS * 2,
+        mamba_group_ids=[group_id],
+        num_groups=1,
+        num_accepted_tokens_out=torch.ones(1, dtype=torch.int32, device=device),
+        block_table_ptrs=torch.zeros(1, dtype=torch.int64, device=device),
+        aligned_index_block_table_ptrs=torch.zeros(1, dtype=torch.int64, device=device),
+        is_initialized=True,
+    )
+    monkeypatch.setattr(
+        worker_mamba_utils, "is_conv_state_dim_first", lambda: conv_state_dim_first
+    )
+
+    context.run_state_gathers(
+        [
+            MambaStateGather(column, (group_id,), (dst,), (src,))
+            for column, dst, src in gathers
+        ]
+    )
+    torch.accelerator.synchronize()
+
+    for layer in range(NUM_LAYERS):
+        torch.testing.assert_close(convs[layer], conv_ref[layer], rtol=0, atol=0)
+        torch.testing.assert_close(ssms[layer], ssm_ref[layer], rtol=0, atol=0)
 
 
 if __name__ == "__main__":

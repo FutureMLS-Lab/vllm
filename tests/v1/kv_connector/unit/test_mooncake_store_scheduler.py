@@ -61,12 +61,32 @@ def _make_bare_scheduler(
     scheduler._unfinished_requests = {}
     scheduler._request_trackers = {}
     scheduler._finished_partial_tail_metas = {}
+    scheduler._frontiers = None
+    scheduler._finished_frontier_metas = []
+    scheduler._supersede = False
+    scheduler._resumed_frontiers = {}
+    scheduler._boundary_tokens = {}
+    scheduler._store_units = False
+    scheduler._load_local_pages = False
+    scheduler._write_wait_s = 0.0
+    scheduler._writing_frontiers = {}
+    scheduler._frontier_jobs = {}
+    scheduler._frontier_waiters = set()
+    scheduler._supersede_lag = 0
+    scheduler._supersede_queue = {}
+    scheduler._unit_frontier = {}
+    scheduler._unit_lookups = {}
+    scheduler._unit_touches = []
+    scheduler._ring_group_ids = ()
+    scheduler._ring_unit = 1
     scheduler._gpu_block_pool = BlockPool(
         num_gpu_blocks=64, enable_caching=True, hash_block_size=hash_block_size
     )
     scheduler._num_workers = 1
     scheduler._next_store_job_id = 0
     scheduler._pinned_saves = {}
+    scheduler._unreleased = {}
+    scheduler._released_jobs = set()
     scheduler._boundary_state_group_ids = frozenset({1})
     scheduler._store_coord = MooncakeStoreCoordinator(
         [

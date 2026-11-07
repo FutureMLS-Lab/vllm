@@ -72,9 +72,45 @@ if(FLASH_KDA_ARCHS)
   target_compile_options(_flashkda_C PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:-UPy_LIMITED_API --expt-relaxed-constexpr --expt-extended-lambda --use_fast_math -O3>
     $<$<COMPILE_LANGUAGE:CXX>:-UPy_LIMITED_API>)
+
+  # FlashKDA with the checkpoint-exporting kernels of csrc/flashkda_export/,
+  # used by prefill calls with checkpoints under mamba_prefill_export. SM100
+  # only; its symbols stay hidden so they never resolve to _flashkda_C's.
+  cuda_archs_loose_intersection(
+    FLASH_KDA_EXPORT_ARCHS "10.0f;10.0a" "${FLASH_KDA_ARCHS}")
+  if(FLASH_KDA_EXPORT_ARCHS)
+    set(FLASH_KDA_EXPORT_SOURCES
+      csrc/flashkda_export_registration.cpp
+      ${flashkda_SOURCE_DIR}/csrc/flash_kda.cpp
+      csrc/flashkda_export/fwd_launch.cu)
+    set_gencode_flags_for_srcs(
+      SRCS "${FLASH_KDA_EXPORT_SOURCES}"
+      CUDA_ARCHS "${FLASH_KDA_EXPORT_ARCHS}")
+    define_extension_target(
+      _flashkda_export_C
+      DESTINATION vllm
+      LANGUAGE ${VLLM_GPU_LANG}
+      SOURCES ${FLASH_KDA_EXPORT_SOURCES}
+      COMPILE_FLAGS ${VLLM_GPU_FLAGS}
+      ARCHITECTURES ${VLLM_GPU_ARCHES}
+      INCLUDE_DIRECTORIES
+        ${CMAKE_CURRENT_SOURCE_DIR}/csrc/flashkda_export
+        ${flashkda_SOURCE_DIR}/csrc/smxx
+        ${FLASH_KDA_INCLUDES}
+      USE_SABI 3
+      WITH_SOABI)
+    target_compile_definitions(_flashkda_export_C PRIVATE
+      TORCH_TARGET_VERSION=0x020B000000000000ULL USE_CUDA)
+    target_compile_options(_flashkda_export_C PRIVATE
+      $<$<COMPILE_LANGUAGE:CUDA>:-UPy_LIMITED_API --expt-relaxed-constexpr --expt-extended-lambda --use_fast_math -O3 -Xcompiler=-fvisibility=hidden>
+      $<$<COMPILE_LANGUAGE:CXX>:-UPy_LIMITED_API -fvisibility=hidden>)
+  else()
+    add_custom_target(_flashkda_export_C)
+  endif()
 else()
   message(STATUS
     "FlashKDA will not compile: CUDA >=12.0 and a supported architecture "
     "(SM90, SM10x, or SM12x) are required")
   add_custom_target(_flashkda_C)
+  add_custom_target(_flashkda_export_C)
 endif()

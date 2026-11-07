@@ -24,6 +24,23 @@ Wire format (REQ/REP over IPC):
           (no payload frames)
         Response: [RESP_OK] or [RESP_ERR]
 
+      msg_type == FRONTIER_PROBE_MSG (``frontier_write_through``):
+          frames 1-3: as LOOKUP_MSG
+          frame 4: locator key length (u16)
+          frame 5: the locator keys concatenated
+        Response: b"R" and a LOOKUP_MSG response when no locator exists, else
+                  b"C", then a LOOKUP_MSG response's length (u32, 0 for
+                  none) and that response, then the locator entries, each
+                  frontier length (u32), key length (u8) and key.
+
+      msg_type == FRONTIER_VERIFY_MSG:
+          frames 1-3: as LOOKUP_MSG
+          frame 4: frontier length (u32), first block to load (u32), whether
+                   to fall back to the regular lookup (u8), then the frontier
+                   key
+        Response: b"T" when every object of the frontier's load exists, else
+                  b"R" and a LOOKUP_MSG response (with the fallback) or b"M".
+
 The first frame of every request is a named bytes tag (not a numeric
 sentinel that aliases the data field) so the protocol stays
 self-describing and extensible: adding new admin commands requires
@@ -34,6 +51,7 @@ Mirrors the named-tag convention used by the NIXL connector (see
 """
 
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (
+    FrontierProbe,
     MooncakeLookupResult,
     TailKeyBoundary,
 )
@@ -41,6 +59,8 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (
 # Request message-type tags. Frame 0 of every request.
 LOOKUP_MSG: bytes = b"lookup"
 RESET_MSG: bytes = b"reset"
+FRONTIER_PROBE_MSG: bytes = b"frontier_probe"
+FRONTIER_VERIFY_MSG: bytes = b"frontier_verify"
 
 # Single-byte response status codes for admin commands.
 RESP_OK: bytes = b"\x01"
@@ -79,3 +99,94 @@ def decode_lookup_response(payload: bytes) -> MooncakeLookupResult:
             )
         )
     return MooncakeLookupResult(hit_length, tuple(boundaries))
+
+
+def encode_frontier_probe(probe: FrontierProbe) -> bytes:
+    if not probe.entries:
+        assert probe.regular is not None
+        return b"R" + encode_lookup_response(probe.regular)
+    regular = b"" if probe.regular is None else encode_lookup_response(probe.regular)
+    payload = bytearray(b"C")
+    payload.extend(len(regular).to_bytes(4, "big"))
+    payload.extend(regular)
+    for length, key in probe.entries:
+        payload.extend(length.to_bytes(4, "big"))
+        payload.extend(len(key).to_bytes(1, "big"))
+        payload.extend(key)
+    return bytes(payload)
+
+
+def decode_frontier_locators(size_frame: bytes, blob: bytes) -> list[bytes]:
+    """FRONTIER_PROBE_MSG's frames 4 and 5: the locator keys."""
+    size = int.from_bytes(size_frame, "big")
+    if len(size_frame) != 2 or not size or len(blob) % size:
+        raise ValueError("Invalid Mooncake frontier probe request")
+    return [blob[i : i + size] for i in range(0, len(blob), size)]
+
+
+def decode_frontier_probe(payload: bytes) -> FrontierProbe:
+    if payload[:1] == b"R":
+        return FrontierProbe((), decode_lookup_response(payload[1:]))
+    if payload[:1] != b"C" or len(payload) < 5:
+        raise ValueError("Invalid Mooncake frontier probe response")
+    size = int.from_bytes(payload[1:5], "big")
+    if 5 + size > len(payload):
+        raise ValueError("Invalid Mooncake frontier probe response")
+    regular = decode_lookup_response(payload[5 : 5 + size]) if size else None
+    entries = []
+    offset = 5 + size
+    while offset < len(payload):
+        if offset + 5 > len(payload):
+            raise ValueError("Invalid Mooncake frontier probe response")
+        length = int.from_bytes(payload[offset : offset + 4], "big")
+        key_len = payload[offset + 4]
+        key = bytes(payload[offset + 5 : offset + 5 + key_len])
+        if len(key) != key_len:
+            raise ValueError("Invalid Mooncake frontier probe response")
+        entries.append((length, key))
+        offset += 5 + key_len
+    return FrontierProbe(tuple(entries), regular)
+
+
+def encode_frontier_verify(
+    length: int, first_block: int, fallback: bool, key: bytes
+) -> bytes:
+    return (
+        length.to_bytes(4, "big")
+        + first_block.to_bytes(4, "big")
+        + bytes([fallback])
+        + key
+    )
+
+
+def decode_frontier_verify(payload: bytes) -> tuple[int, int, bool, bytes]:
+    if len(payload) < 9:
+        raise ValueError("Invalid Mooncake frontier verify request")
+    return (
+        int.from_bytes(payload[:4], "big"),
+        int.from_bytes(payload[4:8], "big"),
+        bool(payload[8]),
+        bytes(payload[9:]),
+    )
+
+
+def encode_frontier_verified(result: MooncakeLookupResult | None) -> bytes:
+    """``result``: the frontier's hit (its ``frontier`` set), the regular
+    lookup that replaced it, or None for a miss without fallback."""
+    if result is None:
+        return b"M"
+    if result.frontier is not None:
+        return b"T"
+    return b"R" + encode_lookup_response(result)
+
+
+def decode_frontier_verified(
+    payload: bytes, length: int, key: bytes
+) -> MooncakeLookupResult | None:
+    if payload == b"T":
+        return MooncakeLookupResult(length, frontier=key)
+    if payload == b"M":
+        return None
+    if payload[:1] != b"R":
+        raise ValueError("Invalid Mooncake frontier verify response")
+    return decode_lookup_response(payload[1:])

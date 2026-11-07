@@ -14,6 +14,7 @@ from vllm.model_executor.layers.mamba.checkpoint import (
     MambaPrefillCheckpointBuilder,
     MambaPrefillCheckpointMetadata,
 )
+from vllm.platforms import current_platform
 from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.attention.backend import (
     AttentionBackend,
@@ -62,6 +63,72 @@ def plan_flashinfer_checkpoints(
     return every_n_tokens, cu_starts, rows
 
 
+def plan_gdn_export_rows(offsets: list[int]) -> tuple[int, list[int]]:
+    """Give each checkpoint row with an offset its own row of the export buffer.
+
+    Args:
+        offsets: Checkpoint offset into each checkpoint row's query, 0 for
+            none.
+
+    Returns:
+        ``(num_rows, rows)``: how many states the prefill exports and each
+        checkpoint row's index among them (0 for a row without a checkpoint,
+        which neither the kernel nor the exporter reads).
+
+    """
+    rows = []
+    num_rows = 0
+    for offset in offsets:
+        rows.append(num_rows if offset else 0)
+        num_rows += offset > 0
+    return num_rows, rows
+
+
+# Export kernel time per tile on B200: fixed and per 64-token chunk (us),
+# without and with its value split.
+_GDN_EXPORT_TILE_US = {1: (30.0, 1.87), 2: (25.0, 1.64)}
+_GDN_EXPORT_MAX_SPLIT_SEQS = 8
+
+
+def plan_gdn_export_split(query_lens: list[int], num_v_heads: int, num_sms: int) -> int:
+    """Choose the export kernel's value split for one prefill call.
+
+    The kernel runs one tile per (sequence, value head), or two with
+    ``v_split=2``, on at most one persistent CTA per SM, taking every other
+    round of tiles backwards when split. The split wins when the busiest CTA's
+    modeled time is shorter.
+
+    Args:
+        query_lens: Query length of each sequence of the prefill call.
+        num_v_heads: Value heads on this rank.
+        num_sms: SMs of the device.
+
+    Returns:
+        The ``v_split`` to pass to the kernel, 1 or 2.
+
+    """
+
+    def makespan(v_split: int) -> float:
+        fixed_us, chunk_us = _GDN_EXPORT_TILE_US[v_split]
+        costs = [
+            fixed_us + chunk_us * -(-query_len // 64)
+            for query_len in query_lens
+            for _ in range(num_v_heads * v_split)
+        ]
+        num_ctas = min(len(costs), num_sms)
+        load = [0.0] * num_ctas
+        for tile, cost in enumerate(costs):
+            work_round, position = divmod(tile, num_ctas)
+            if v_split > 1 and work_round % 2:
+                position = num_ctas - 1 - position
+            load[position] += cost
+        return max(load)
+
+    if len(query_lens) > _GDN_EXPORT_MAX_SPLIT_SEQS:
+        return 1
+    return 2 if makespan(2) < makespan(1) else 1
+
+
 @dataclass
 class GDNFlashInferCheckpointPlan:
     every_n_tokens: int
@@ -69,6 +136,17 @@ class GDNFlashInferCheckpointPlan:
     cu_starts: torch.Tensor
     # Per checkpoint row, its state among the ``num_checkpoints`` emitted.
     rows: torch.Tensor
+
+
+@dataclass
+class GDNExportPlan:
+    """Checkpoints the prefill kernel exports itself, one state per sequence
+    (``vllm.third_party.flashinfer_gdn``)."""
+
+    num_checkpoints: int
+    # (num checkpoint rows,) int32: per checkpoint row, its exported state.
+    rows: torch.Tensor
+    v_split: int
 
 
 class GDNAttentionBackend(AttentionBackend):
@@ -97,6 +175,7 @@ class GDNAttentionMetadata:
 
     checkpoint: MambaPrefillCheckpointMetadata | None = None
     flashinfer_checkpoint_plan: GDNFlashInferCheckpointPlan | None = None
+    export_plan: GDNExportPlan | None = None
     has_initial_state: torch.Tensor | None = None
 
     spec_query_start_loc: torch.Tensor | None = None  # shape: [num_spec_decodes + 1,]
@@ -152,6 +231,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         )
         from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
             _resolve_gdn_prefill_backend,
+            exports_gdn_states_per_sequence,
         )
 
         self.gdn_prefill_backend: Literal[
@@ -167,6 +247,27 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             and checkpoint_alignment is not None
             and checkpoint_alignment % FLASHINFER_GDN_CHECKPOINT_ALIGNMENT == 0
         )
+        # The temporal state, (value heads, V, K), is the spec's last shape.
+        temporal = kv_cache_spec.shapes[-1]
+        self.export_per_sequence = (
+            self.plan_flashinfer_checkpoints
+            and len(temporal) == 3
+            and exports_gdn_states_per_sequence(
+                vllm_config, self.gdn_prefill_backend, temporal[2], temporal[1]
+            )
+        )
+        if self.export_per_sequence:
+            from vllm.model_executor.layers.mamba.abstract import (
+                get_mamba_prefill_checkpoint_grid,
+            )
+
+            self.num_v_heads = temporal[0]
+            self.num_sms = current_platform.num_compute_units(device.index or 0)
+            # The layers' export buffer: an exporting sequence's offset is on
+            # the checkpoint grid, so a batch exports at most this many.
+            grid = get_mamba_prefill_checkpoint_grid(vllm_config)
+            batched = vllm_config.scheduler_config.max_num_batched_tokens
+            self.max_export_rows = -(-batched // grid)
 
         if self.speculative_config:
             assert self.speculative_config.num_speculative_tokens is not None
@@ -583,7 +684,24 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             checkpoint = self.checkpoint_builder.build(m, request_rows)
 
         flashinfer_checkpoint_plan: GDNFlashInferCheckpointPlan | None = None
-        if checkpoint is not None and self.plan_flashinfer_checkpoints:
+        export_plan: GDNExportPlan | None = None
+        if checkpoint is not None and self.export_per_sequence:
+            assert checkpoint.offsets is not None
+            assert checkpoint.query_lens is not None
+            num_checkpoints, rows = plan_gdn_export_rows(checkpoint.offsets)
+            assert num_checkpoints <= self.max_export_rows
+            # The prefill kernel runs the trailing checkpoint rows.
+            num_prefill_rows = prefill_query_start_loc_cpu.shape[0] - 1
+            export_plan = GDNExportPlan(
+                num_checkpoints=num_checkpoints,
+                rows=async_tensor_h2d(rows, query_start_loc.device, torch.int32),
+                v_split=plan_gdn_export_split(
+                    checkpoint.query_lens[-num_prefill_rows:],
+                    self.num_v_heads,
+                    self.num_sms,
+                ),
+            )
+        elif checkpoint is not None and self.plan_flashinfer_checkpoints:
             assert checkpoint.offsets is not None
             assert checkpoint.query_lens is not None
             # The prefill kernel runs the trailing checkpoint rows.
@@ -680,6 +798,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             num_actual_tokens=m.num_actual_tokens,
             checkpoint=checkpoint,
             flashinfer_checkpoint_plan=flashinfer_checkpoint_plan,
+            export_plan=export_plan,
             has_initial_state=has_initial_state,
             chunk_indices=chunk_indices,
             chunk_offsets=chunk_offsets,

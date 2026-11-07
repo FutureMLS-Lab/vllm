@@ -70,6 +70,7 @@ from vllm.model_executor.models.interfaces import (
     HasInnerState,
     IsHybrid,
     MixtureOfExperts,
+    SupportsCompactSpecState,
     SupportsEagle3,
     SupportsPP,
 )
@@ -362,12 +363,15 @@ class Glm5NextDecoderLayer(nn.Module):
         prefix: str = "",
         topk_indices_buffer: torch.Tensor | None = None,
         is_mtp_layer: bool = False,
+        quantized: bool = True,
         **kwargs,
     ) -> None:
+        """``quantized``: build the layer with the model's quantization
+        config; False for a layer the checkpoint stores unquantized."""
         super().__init__()
 
         cache_config = vllm_config.cache_config
-        quant_config = vllm_config.quant_config
+        quant_config = vllm_config.quant_config if quantized else None
         parallel_config = vllm_config.parallel_config
 
         self.hidden_size = config.hidden_size
@@ -1045,7 +1049,13 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
 
 
 class Glm5NextForCausalLM(
-    nn.Module, HasInnerState, SupportsPP, MixtureOfExperts, IsHybrid, SupportsEagle3
+    nn.Module,
+    HasInnerState,
+    SupportsPP,
+    MixtureOfExperts,
+    IsHybrid,
+    SupportsEagle3,
+    SupportsCompactSpecState,
 ):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -1148,6 +1158,7 @@ class Glm5NextForConditionalGeneration(
     IsHybrid,
     MixtureOfExperts,
     SupportsEagle3,
+    SupportsCompactSpecState,
 ):
     # The text model (KDA + dense-MLA + MoE) is a hybrid mamba model. The
     # multimodal wrapper must declare the same interfaces so vLLM treats it as

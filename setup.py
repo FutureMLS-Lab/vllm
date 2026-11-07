@@ -1122,6 +1122,7 @@ class precompiled_wheel_utils:
                             "vllm/_flashmla_C.abi3.so",
                             "vllm/_flashmla_extension_C.abi3.so",
                             "vllm/_flashkda_C.abi3.so",
+                            "vllm/_flashkda_export_C.abi3.so",
                             "vllm/_sparse_flashmla_C.abi3.so",
                             "vllm/_deepselect_C.abi3.so",
                             "vllm/vllm_flash_attn/_vllm_fa2_C.abi3.so",
@@ -1590,6 +1591,9 @@ if _is_cuda():
         CUDA_HOME and get_nvcc_cuda_version() >= Version("12.0")
     ):
         ext_modules.append(CMakeExtension(name="vllm._flashkda_C", optional=True))
+        ext_modules.append(
+            CMakeExtension(name="vllm._flashkda_export_C", optional=True)
+        )
     if envs.VLLM_USE_PRECOMPILED or (
         CUDA_HOME and get_nvcc_cuda_version() >= Version("12.3")
     ):

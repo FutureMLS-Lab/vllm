@@ -1,12 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import itertools
+import os
 import threading
 import time
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
+import zmq
 
 from vllm.config import set_current_vllm_config
 from vllm.distributed.kv_events import BlockStored
@@ -862,6 +866,82 @@ def test_lookup_key_client_discard_clears_state():
     gate.clear()
     assert client.lookup("req2", 128, [], non_block=True) is None
     gate.set()  # release the executor so the worker thread can drain
+
+
+# Lookup socket paths of their own (the port only names the IPC path).
+_lookup_ports = itertools.count(os.getpid() * 1000)
+
+
+def _lookup_config(**extra):
+    return create_vllm_config(
+        kv_connector="MooncakeStoreConnector",
+        kv_role="kv_both",
+        kv_connector_extra_config={"lookup_rpc_port": next(_lookup_ports), **extra},
+    )
+
+
+def test_lookup_server_answers_a_failed_request_and_keeps_serving():
+    """A request the worker fails to answer gets an error reply: the client's
+    lookup is a miss, and the server serves the next one."""
+    vllm_config = _lookup_config()
+
+    def lookup(num_tokens, block_hashes):
+        if num_tokens == 13:
+            raise RuntimeError("store lookup failed")
+        return MooncakeLookupResult(num_tokens // 2)
+
+    server = worker.LookupKeyServer(
+        SimpleNamespace(lookup=lookup, kv_send_thread=None), vllm_config
+    )
+    client = worker.LookupKeyClient(vllm_config)
+    try:
+        assert _poll_lookup(client, "a", num_tokens=13) == 0
+        assert _poll_lookup(client, "b", num_tokens=64) == 32
+    finally:
+        # The server thread returns after its next reply; only then may its
+        # socket be closed from this thread.
+        server.running = False
+        _poll_lookup(client, "c", num_tokens=64)
+        server.thread.join(10)
+        client.ctx.destroy(linger=0)
+        server.ctx.destroy(linger=0)
+
+
+def test_a_lookup_without_a_reply_in_time_is_a_miss():
+    """The client stops waiting after lookup_timeout_s; its next lookup gets
+    its own reply, not the late one."""
+    vllm_config = _lookup_config(lookup_timeout_s=0.2)
+    path = worker.get_zmq_rpc_path_lookup(vllm_config)
+    if os.path.exists(path.removeprefix("ipc://")):
+        os.unlink(path.removeprefix("ipc://"))
+    ctx = zmq.Context()
+    server = ctx.socket(zmq.REP)
+    server.bind(path)
+    client = worker.LookupKeyClient(vllm_config)
+    try:
+        assert _poll_lookup(client, "a", num_tokens=13) == 0
+        assert int.from_bytes(server.recv_multipart()[1], "big") == 13
+        server.send((99).to_bytes(4, "big"))
+        got: list[int | None] = []
+        poll = threading.Thread(
+            target=lambda: got.append(_poll_lookup(client, "b", num_tokens=64))
+        )
+        poll.start()
+        assert int.from_bytes(server.recv_multipart()[1], "big") == 64
+        server.send((32).to_bytes(4, "big"))
+        poll.join(10)
+        assert got == [32]
+    finally:
+        client.ctx.destroy(linger=0)
+        ctx.destroy(linger=0)
+
+
+def test_lookup_timeout_s_option():
+    assert worker._lookup_timeout_s({}) == worker.LOOKUP_TIMEOUT_S
+    assert worker._lookup_timeout_s({"lookup_timeout_s": 2}) == 2.0
+    for bad in (0, -1, True, "5", float("inf")):
+        with pytest.raises(ValueError, match="positive number"):
+            worker._lookup_timeout_s({"lookup_timeout_s": bad})
 
 
 def test_get_num_new_matched_tokens_async_defers_then_reports():

@@ -27,13 +27,15 @@ def compute_mamba_prefill_checkpoints(
     drop_eagle_block: bool,
     cache_hit_alignment_tokens: int,
     num_hash_lookahead_tokens: int = 0,
+    positions: list[int] | None = None,
 ) -> tuple[list[int], list[int]]:
     """Per-row internal prefill checkpoint offsets and cache block columns.
 
     Backends call this instead of re-deriving the rules, so they decline in
     lockstep with the scheduler and ``MambaManager``: allocating a checkpoint
     block without writing it leaves the prefix cache serving uninitialized
-    state.
+    state. ``positions`` (the scheduler's in-chunk exports, 0 for none)
+    replace a row's default checkpoint position.
 
     Returns:
         ``(offsets, cols)``: the checkpoint's offset into each row's query and
@@ -42,9 +44,11 @@ def compute_mamba_prefill_checkpoints(
     """
     offsets: list[int] = []
     cols: list[int] = []
-    for seq_len, query_len in zip(seq_lens, query_lens):
+    for row, (seq_len, query_len) in enumerate(zip(seq_lens, query_lens)):
         query_start = seq_len - query_len
-        position = get_mamba_prefill_checkpoint_position(
+        position = (
+            positions[row] if positions is not None else 0
+        ) or get_mamba_prefill_checkpoint_position(
             seq_len,
             cache_hit_alignment_tokens,
             drop_eagle_block=drop_eagle_block,
@@ -130,6 +134,7 @@ class MambaPrefillCheckpointBuilder:
         query_lens = [all_query_lens[row] for row in request_rows]
         seq_lens = m.seq_lens_cpu_upper_bound.tolist()
         block_size = self.kv_cache_spec.block_size
+        exports = m.prefill_checkpoint_positions
         checkpoint_offsets, checkpoint_cols = compute_mamba_prefill_checkpoints(
             [seq_lens[row] for row in request_rows],
             query_lens,
@@ -139,6 +144,9 @@ class MambaPrefillCheckpointBuilder:
             drop_eagle_block=self.drop_eagle_block,
             cache_hit_alignment_tokens=cache_hit_alignment_tokens,
             num_hash_lookahead_tokens=self.vllm_config.num_hash_lookahead_tokens,
+            positions=(
+                [exports[row] for row in request_rows] if exports is not None else None
+            ),
         )
         if not any(checkpoint_offsets):
             return None

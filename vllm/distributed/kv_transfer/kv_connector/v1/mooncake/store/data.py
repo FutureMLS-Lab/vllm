@@ -680,11 +680,79 @@ class MooncakeLookupResult:
         tail_key_boundaries: Hash boundary used to store each cache group's
             tail block when ``hit_length`` does not identify its store key.
             There is one entry per group for every nonzero hit.
+        frontier: The key of the Mamba frontier checkpoint whose length
+            ``hit_length`` is (``frontier_write_through``), else None.
 
     """
 
     hit_length: int
     tail_key_boundaries: tuple[TailKeyBoundary, ...] = ()
+    frontier: bytes | None = None
+
+
+@dataclass(frozen=True)
+class FrontierProbe:
+    """The worker's answer to a frontier probe: the ``(length, key)`` entries
+    of the locator records that exist, and the regular lookup when it ran (no
+    locator exists, or without ``lookup_newest_state``)."""
+
+    entries: tuple[tuple[int, bytes], ...]
+    regular: MooncakeLookupResult | None
+
+
+@dataclass(frozen=True)
+class FrontierPut:
+    """A finished request's Mamba frontier checkpoint for the store
+    (``frontier_write_through``): each block under ``(key, group)``, then
+    ``(length, key)`` in the locator record under ``locator``.
+
+    Attributes:
+        blocks: ``(store group id, block id)`` of the frontier's page and
+            states.
+        rings: ``(KV-cache group id, block id)`` of its indexer rings, which
+            are not prefix-cacheable groups; empty at a pool boundary.
+
+    """
+
+    key: bytes
+    length: int
+    locator: bytes
+    blocks: tuple[tuple[int, int], ...]
+    rings: tuple[tuple[int, int], ...]
+    # frontier_supersede_remove: ``(key, length)`` of the frontier the request
+    # resumed from, and ``(store group id, tokens)`` of the boundary states it
+    # stored past that frontier; removed once this frontier is written.
+    supersedes: tuple[tuple[bytes, int], ...] = ()
+    superseded_states: tuple[tuple[int, int], ...] = ()
+
+
+@dataclass(frozen=True)
+class StoreUnit:
+    """A resume point a store job writes, for the master's recovery-unit
+    eviction (``unit_policy_url``): the prefix hash at ``position`` (a state)
+    or the frontier key (``frontier``), and the deepest unit before it on the
+    request's path that the store holds, if any."""
+
+    key: bytes
+    position: int
+    parent: bytes | None
+    frontier: bool = False
+
+
+@dataclass
+class FrontierLoad:
+    """A load that resumes at a stored Mamba frontier checkpoint.
+
+    Attributes:
+        rings: ``(KV-cache group id, block id)`` of the request's indexer
+            rings the frontier's rings go into, set once its blocks are
+            allocated; empty when the frontier holds no ring.
+
+    """
+
+    key: bytes
+    length: int
+    rings: tuple[tuple[int, int], ...] = ()
 
 
 @dataclass
@@ -696,6 +764,7 @@ class LoadSpec:
     can_load: bool
     token_len: int = 0
     tail_key_boundaries: tuple[TailKeyBoundary, ...] = ()
+    frontier: FrontierLoad | None = None
 
 
 @dataclass
@@ -784,6 +853,12 @@ class ReqMeta:
     # Set on the save that first covers the whole prompt, so the scheduler
     # publishes the prompt's partial tail once rather than on every save.
     publish_partial_tail: bool = False
+    # A finished request's Mamba frontier checkpoint, written after its
+    # ``boundary_puts`` (the full pages its normal saves did not cover).
+    frontier: FrontierPut | None = None
+    # unit_policy_url: the resume points this job writes (its states and its
+    # frontier), registered with the master once written.
+    store_units: tuple[StoreUnit, ...] = ()
 
     @staticmethod
     def from_request_tracker(
@@ -867,9 +942,12 @@ class ReqMeta:
 
 @dataclass
 class MooncakeStoreWorkerMetadata(KVConnectorWorkerMetadata):
-    """Maps ``ReqMeta.store_job_id`` to the number of ranks done with that job."""
+    """Maps ``ReqMeta.store_job_id`` to the number of ranks done with that job;
+    ``released_saves`` (``staging_buffer_mib``) to the number of ranks
+    that no longer read its GPU blocks, before it completes."""
 
     completed_saves: dict[int, int] = field(default_factory=dict)
+    released_saves: dict[int, int] = field(default_factory=dict)
 
     def aggregate(
         self, other: "KVConnectorWorkerMetadata"
@@ -878,6 +956,10 @@ class MooncakeStoreWorkerMetadata(KVConnectorWorkerMetadata):
         for store_job_id, count in other.completed_saves.items():
             self.completed_saves[store_job_id] = (
                 self.completed_saves.get(store_job_id, 0) + count
+            )
+        for store_job_id, count in other.released_saves.items():
+            self.released_saves[store_job_id] = (
+                self.released_saves.get(store_job_id, 0) + count
             )
         return self
 
@@ -893,6 +975,9 @@ class MooncakeStoreConnectorMetadata(KVConnectorMetadata):
         self.requests: list[ReqMeta] = []
         self.unfinished_request_ids = unfinished_request_ids
         self.preempted_req_ids = preempted_req_ids
+        # unit_policy_url: keys of the store units the requests admitted since
+        # the last step resume at (each a use).
+        self.unit_touches: list[bytes] = []
 
     def add_request(self, req_meta: ReqMeta) -> None:
         self.requests.append(req_meta)

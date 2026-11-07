@@ -66,6 +66,7 @@ if TYPE_CHECKING:
     )
     from vllm.forward_context import ForwardContext
     from vllm.v1.core.block_pool import BlockPool
+    from vllm.v1.core.hybrid_checkpoint.frontier import FrontierCheckpoint
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
     from vllm.v1.kv_cache_interface import KVCacheConfig
     from vllm.v1.request import Request
@@ -205,6 +206,13 @@ class KVConnectorBase_V1(ABC):
         return False, as a dropped save is just a future cache miss.
         """
         return self._kv_transfer_config.is_kv_producer
+
+    @property
+    def stores_frontier_checkpoints(self) -> bool:
+        """Whether the scheduler hands this connector each finished request's
+        Mamba frontier checkpoint (``register_finished_frontier``), under
+        ``mamba_frontier_checkpoint``. Defaults to False."""
+        return False
 
     @classmethod
     def supports_sleep_mode(cls, kv_transfer_config: "KVTransferConfig") -> bool:
@@ -547,6 +555,35 @@ class KVConnectorBase_V1(ABC):
         """
         pass
 
+    def defer_lookup(self, request: "Request", num_computed_tokens: int) -> bool:
+        """Whether the scheduler should not look ``request`` up in the external
+        cache yet, given its whole local hit of ``num_computed_tokens`` tokens,
+        for example while the write of a frontier checkpoint that would extend
+        the hit is in flight. The scheduler then tries the request again at
+        its next step, as when ``get_num_new_matched_tokens`` returns None.
+        Asked under ``mamba_frontier_checkpoint`` only. Defaults to False."""
+        return False
+
+    def frontier_load_length(self, request: "Request") -> int | None:
+        """The length of the stored Mamba frontier checkpoint ``request``'s
+        pending load resumes it at, when the load may start later than the
+        local hit it was looked up with; else None (the default).
+
+        Called after ``get_num_new_matched_tokens`` returned a positive count
+        for a block-aligned local hit. The scheduler may then take full pages
+        it caches past that hit as local hits and call
+        ``move_frontier_load_start``.
+        """
+        return None
+
+    def move_frontier_load_start(self, request: "Request", num_tokens: int) -> None:
+        """The scheduler takes the full pages before ``num_tokens`` (on the
+        block grid, past the local hit of the lookup, at most the frontier's
+        block start) from its own cache, so ``request``'s pending frontier
+        load starts there. Called only for a load ``frontier_load_length``
+        reported."""
+        raise NotImplementedError
+
     def get_external_cache_hit_sources(
         self,
         request: "Request",
@@ -661,6 +698,15 @@ class KVConnectorBase_V1(ABC):
         and the request's blocks must remain alive until ``get_finished()``.
         """
         return False
+
+    def register_finished_frontier(
+        self, request: "Request", frontier: "FrontierCheckpoint"
+    ) -> None:
+        """Register a finished request's Mamba frontier checkpoint, its state
+        at its exact end inside a block, before its blocks are freed. Called
+        only when ``stores_frontier_checkpoints`` is True. A connector that
+        reads the blocks later must take its own references to them."""
+        return
 
     def take_events(self) -> Iterable["KVCacheEvent"]:
         """Take the KV cache events from the connector.

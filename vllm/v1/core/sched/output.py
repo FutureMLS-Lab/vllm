@@ -23,7 +23,7 @@ if TYPE_CHECKING:
     from vllm.multimodal.inputs import MultiModalFeatureSpec, MultiModalKwargsItem
     from vllm.pooling_params import PoolingParams
     from vllm.sampling_params import SamplingParams
-    from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
+    from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy, MambaStateGather
     from vllm.v1.request import Request
 else:
     AuxOutputConnectorMetadata = object
@@ -31,6 +31,7 @@ else:
     KVConnectorMetadata = object
     KVCacheBlockCopy = object
     LoRARequest = object
+    MambaStateGather = object
     MultiModalFeatureSpec = object
     PoolingParams = object
     SamplingParams = object
@@ -308,6 +309,11 @@ class SchedulerOutput:
     # CoW copies to apply after zeroing new blocks and before forward.
     kv_cache_block_copies: list[KVCacheBlockCopy] | None = None
 
+    # Mamba state gathers of finished requests' published states, applied
+    # before any other block operation of the step (speculative decoding with
+    # ``mamba_frontier_checkpoint``).
+    mamba_state_gathers: list[MambaStateGather] | None = None
+
     # Scheduler-local; always None by the time this reaches a worker.
     kv_connector_block_state: KVConnectorBlockState | None = None
 
@@ -323,6 +329,11 @@ class SchedulerOutput:
     # (non-final prefill chunks, or requests sure to reach max_tokens), so the
     # drafter can skip proposing them.
     skip_drafts: bool = False
+
+    # req_id -> absolute token position of the one Mamba state a non-final
+    # prefill chunk exports with the backend's prefill checkpoint
+    # (``mamba_prefill_export``). None: every chunk uses the upstream rule.
+    prefill_checkpoint_positions: dict[str, int] | None = None
 
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":

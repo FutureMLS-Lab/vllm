@@ -83,3 +83,10 @@ vllm serve XiaomiMiMo/MiMo-7B-Base \
   per lm_head weight, e.g. 0.6 or 0.35 GiB for a 248k x 2560 head; it is
   counted in the model weights, so with `--kv-cache-memory-bytes` leave room
   for it.
+- On hybrid models with prefix caching (Model Runner V2),
+  `"truncate_acceptance_at_stop": true` stops accepting drafts at a request's
+  stop, so that its recurrent state ends at its last token; Mamba frontier
+  checkpoints require it. `--mamba-spec-state-layout compact` keeps one state
+  block per running request instead of one per draft position, for models that
+  support it. See
+  [Hybrid State Checkpoints](../../design/hybrid_state_checkpoints.md#speculative-decoding).

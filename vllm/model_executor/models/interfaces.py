@@ -1239,6 +1239,34 @@ def supports_replayssm(
 
 
 @runtime_checkable
+class SupportsCompactSpecState(Protocol):
+    """The interface for models whose Mamba layers can verify draft tokens
+    without a state per draft position: the verify step records each
+    position's update and the accepted ones are folded in after sampling
+    (``mamba_spec_state_layout="compact"``). Every Mamba layer
+    of such a model sets ``MambaBase.supports_compact_spec_state``.
+    """
+
+    supports_compact_spec_state: ClassVar[Literal[True]] = True
+
+
+@overload
+def supports_compact_spec_state(
+    model: type[object],
+) -> TypeIs[type[SupportsCompactSpecState]]: ...
+
+
+@overload
+def supports_compact_spec_state(model: object) -> TypeIs[SupportsCompactSpecState]: ...
+
+
+def supports_compact_spec_state(
+    model: type[object] | object,
+) -> TypeIs[type[SupportsCompactSpecState]] | TypeIs[SupportsCompactSpecState]:
+    return getattr(model, "supports_compact_spec_state", False)
+
+
+@runtime_checkable
 class SupportsCrossEncoding(Protocol):
     """The interface required for all models that support cross encoding."""
 

@@ -170,6 +170,7 @@ if TYPE_CHECKING:
     VLLM_RUST_FRONTEND_PATH: str | None = "auto"
     VLLM_SERVER_DEV_MODE: bool = False
     VLLM_V1_OUTPUT_PROC_CHUNK_SIZE: int = 128
+    VLLM_DETOKENIZE_PRIME_SUFFIX: bool = False
     VLLM_MLA_DISABLE: bool = False
     VLLM_RAY_PER_WORKER_GPUS: float = 1.0
     VLLM_RAY_BUNDLE_INDICES: str = ""
@@ -1476,6 +1477,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_V1_OUTPUT_PROC_CHUNK_SIZE": lambda: int(
         os.getenv("VLLM_V1_OUTPUT_PROC_CHUNK_SIZE", "128")
     ),
+    # If set, the fast incremental detokenizer primes each request's decode
+    # stream with the shortest suffix of 4 to 23 prompt tokens that decodes
+    # cleanly instead of with the whole prompt. Priming with the whole prompt
+    # makes the first decode step take time proportional to the prompt length
+    # on the API server's event loop, which also delays every other request;
+    # the streamed text is the same either way.
+    "VLLM_DETOKENIZE_PRIME_SUFFIX": lambda: bool(
+        int(os.getenv("VLLM_DETOKENIZE_PRIME_SUFFIX", "0"))
+    ),
     # If set, vLLM will disable the MLA attention optimizations.
     "VLLM_MLA_DISABLE": lambda: bool(int(os.getenv("VLLM_MLA_DISABLE", "0"))),
     # If set, vLLM will pick up the provided Flash Attention MLA
@@ -2434,6 +2444,7 @@ def compile_factors() -> dict[str, object]:
         "VLLM_WORKER_MULTIPROC_METHOD",
         "VLLM_ENABLE_V1_MULTIPROCESSING",
         "VLLM_V1_OUTPUT_PROC_CHUNK_SIZE",
+        "VLLM_DETOKENIZE_PRIME_SUFFIX",
         "VLLM_CPU_KVCACHE_SPACE",
         "VLLM_CPU_MOE_PREPACK",
         "VLLM_ZENTORCH_WEIGHT_PREPACK",

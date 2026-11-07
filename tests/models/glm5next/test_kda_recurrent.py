@@ -265,12 +265,16 @@ def test_fused_recurrent_kda_more_than_65535_programs(num_seqs: int, num_heads: 
     assert torch.equal(full_state, ref_state)
 
 
+@pytest.mark.parametrize("export_build", [False, True])
 @pytest.mark.parametrize("offset", [16, 144, 256])
 @pytest.mark.parametrize("dim_first", [False, True])
 @pytest.mark.parametrize("num_spec", [0, 3])
 @torch.inference_mode()
-def test_prefill_checkpoint_resumes_suffix(monkeypatch, dim_first, num_spec, offset):
-    """Restoring both cached states must reproduce an uninterrupted prefill."""
+def test_prefill_checkpoint_resumes_suffix(
+    monkeypatch, dim_first, num_spec, offset, export_build
+):
+    """Restoring both cached states must reproduce an uninterrupted prefill,
+    with FlashKDA's checkpoint and with its export build."""
     from types import SimpleNamespace
 
     from vllm.model_executor.layers.mamba.checkpoint import (
@@ -288,6 +292,9 @@ def test_prefill_checkpoint_resumes_suffix(monkeypatch, dim_first, num_spec, off
         pytest.skip("requires FlashKDA")
     import vllm._flashkda_C  # noqa: F401
 
+    if export_build:
+        pytest.importorskip("vllm._flashkda_export_C")
+
     torch.manual_seed(42)
     device = torch.device("cuda")
     length, heads = 273, 2
@@ -302,6 +309,7 @@ def test_prefill_checkpoint_resumes_suffix(monkeypatch, dim_first, num_spec, off
     layer.kda_safe_gate = True
     layer.kda_lower_bound = -5.0
     layer.kda_prefill_backend = "flashkda"
+    layer._flashkda_export = export_build
     layer._conv_state_dim_first = dim_first
     layer._merged_conv_weight = torch.randn(width, 4, device=device) * 0.1
     layer.q_conv1d = SimpleNamespace(bias=None)
@@ -430,3 +438,88 @@ def test_prefill_checkpoint_resumes_suffix(monkeypatch, dim_first, num_spec, off
         actual[:, : length - offset], expected[:, suffix], atol=0.003, rtol=0.03
     )
     torch.testing.assert_close(recurrent[3], expected_state, atol=0.003, rtol=0.03)
+
+
+def _bits(tensor: torch.Tensor) -> torch.Tensor:
+    return tensor.contiguous().view(
+        torch.int16 if tensor.element_size() == 2 else torch.int32
+    )
+
+
+@pytest.mark.parametrize(
+    "heads, lengths, offsets",
+    [
+        (4, (2048,), (1024,)),
+        (4, (273, 1000, 1), (256, 992, 0)),
+        (4, (13056,), (8704,)),
+        (4, (64,) * 8, (16, 32, 48, 64, 0, 64, 48, 16)),
+        (32, (3000, 2000, 1500), (2048, 2000, 0)),
+    ],
+)
+@torch.inference_mode()
+def test_flashkda_export_build_is_flashkda_bit_for_bit(heads, lengths, offsets):
+    """vllm._flashkda_export_C computes FlashKDA's bits: the same output, final
+    state and checkpoint rows as vllm._flashkda_C for every call, with and
+    without checkpoint offsets, on its value-split path (few sequences) and its
+    full-width path (32 heads x 3 sequences)."""
+    import itertools
+
+    from vllm.models.glm5next.common import kda
+
+    if kda._resolve_kda_prefill_backend("auto", D, torch.bfloat16, -5) != "flashkda":
+        pytest.skip("requires FlashKDA")
+    import vllm._flashkda_C  # noqa: F401
+
+    pytest.importorskip("vllm._flashkda_export_C")
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    tokens, num_seqs = sum(lengths), len(lengths)
+    q, k, v, g = (
+        torch.randn(1, tokens, heads, D, device=device, dtype=torch.bfloat16)
+        for _ in range(4)
+    )
+    beta = torch.randn(1, tokens, heads, device=device, dtype=torch.bfloat16)
+    a_log = torch.randn(heads, device=device) * 0.1
+    dt_bias = torch.randn(heads, D, device=device) * 0.1
+    initial_state = torch.randn(num_seqs, heads, D, D, device=device) * 0.1
+    cu_seqlens = torch.tensor(
+        [0, *itertools.accumulate(lengths)], dtype=torch.int32, device=device
+    )
+    checkpoint_offsets = torch.tensor(offsets, dtype=torch.int32, device=device)
+
+    def call(ops, with_checkpoints: bool):
+        out = torch.empty_like(q)
+        final_state = torch.empty_like(initial_state)
+        checkpoint_state = torch.full_like(initial_state, float("nan"))
+        workspace = torch.empty(
+            ops.get_workspace_size(tokens, heads, num_seqs),
+            dtype=torch.uint8,
+            device=device,
+        )
+        ops.fwd(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            D**-0.5,
+            out,
+            workspace,
+            a_log,
+            dt_bias,
+            -5.0,
+            initial_state,
+            final_state,
+            cu_seqlens,
+            checkpoint_state if with_checkpoints else None,
+            checkpoint_offsets if with_checkpoints else None,
+        )
+        return out, final_state, checkpoint_state
+
+    for with_checkpoints in (False, True):
+        expected = call(torch.ops._flashkda_C, with_checkpoints)
+        actual = call(torch.ops._flashkda_export_C, with_checkpoints)
+        for name, a, e in zip(
+            ("out", "final_state", "checkpoint_state"), actual, expected
+        ):
+            assert torch.equal(_bits(a), _bits(e)), (name, with_checkpoints)

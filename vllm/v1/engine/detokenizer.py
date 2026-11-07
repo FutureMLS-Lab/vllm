@@ -8,6 +8,7 @@ import tokenizers.decoders
 from tokenizers import Tokenizer
 from transformers import TokenizersBackend
 
+import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.tokenizers import TokenizerLike
 from vllm.tokenizers.detokenizer_utils import (
@@ -21,6 +22,33 @@ logger = init_logger(__name__)
 
 # Error string from https://github.com/huggingface/tokenizers/blob/909fdde2a4ffedd9295206f705eb612be2a91b12/tokenizers/src/tokenizer/mod.rs#L1042
 INVALID_PREFIX_ERR_MSG = "Invalid prefix encountered"
+
+# Lengths of the prompt suffixes tried under VLLM_DETOKENIZE_PRIME_SUFFIX.
+PRIME_SUFFIX_MIN_TOKENS = 4
+PRIME_SUFFIX_MAX_TOKENS = 23
+
+
+def prompt_suffix_to_prime(
+    tokenizer: Tokenizer,
+    prompt_token_ids: list[int] | None,
+    skip_special_tokens: bool,
+) -> list[int] | None:
+    """The shortest suffix of 4 to 23 prompt tokens that decodes without a
+    replacement character, or the whole prompt when none does.
+
+    Such a suffix starts and ends on a character boundary, so a decode stream
+    primed with it streams the same text for the tokens that follow as one
+    primed with the whole prompt.
+    """
+    if prompt_token_ids is None or len(prompt_token_ids) <= PRIME_SUFFIX_MIN_TOKENS:
+        return prompt_token_ids
+    longest = min(len(prompt_token_ids), PRIME_SUFFIX_MAX_TOKENS)
+    for length in range(PRIME_SUFFIX_MIN_TOKENS, longest + 1):
+        suffix = prompt_token_ids[-length:]
+        text = tokenizer.decode(suffix, skip_special_tokens=skip_special_tokens)
+        if "\ufffd" not in text:
+            return suffix
+    return prompt_token_ids
 
 
 def uses_fast_detokenizer(tokenizer: TokenizerLike) -> bool:
@@ -189,11 +217,18 @@ class FastIncrementalDetokenizer(BaseIncrementalDetokenizer):
         self.tokenizer: Tokenizer = tokenizer._tokenizer
 
         # Use native prefill to prime the decode stream with prompt tokens.
-        # Look up DecodeStream on the module so backend patches (e.g. the
-        # fastokens shim that replaces ``tokenizers.decoders.DecodeStream``)
+        # Its first step decodes every primed token, so with
+        # VLLM_DETOKENIZE_PRIME_SUFFIX only a short suffix of the prompt is
+        # primed. Look up DecodeStream on the module so backend patches (e.g.
+        # the fastokens shim that replaces ``tokenizers.decoders.DecodeStream``)
         # are honored regardless of import order.
+        prime_ids = request.prompt_token_ids
+        if envs.VLLM_DETOKENIZE_PRIME_SUFFIX:
+            prime_ids = prompt_suffix_to_prime(
+                self.tokenizer, prime_ids, self.skip_special_tokens
+            )
         self.stream = tokenizers.decoders.DecodeStream(
-            ids=request.prompt_token_ids,
+            ids=prime_ids,
             skip_special_tokens=self.skip_special_tokens,
         )
 

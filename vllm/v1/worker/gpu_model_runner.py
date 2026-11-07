@@ -491,6 +491,14 @@ class GPUModelRunner(
         self.parallel_config = vllm_config.parallel_config
         self.scheduler_config = vllm_config.scheduler_config
         self.speculative_config = vllm_config.speculative_config
+        if (
+            self.speculative_config is not None
+            and self.speculative_config.truncate_acceptance_at_stop
+        ):
+            raise ValueError(
+                "speculative_config.truncate_acceptance_at_stop requires "
+                "Model Runner V2"
+            )
         self.observability_config = vllm_config.observability_config
 
         model_config = self.model_config
