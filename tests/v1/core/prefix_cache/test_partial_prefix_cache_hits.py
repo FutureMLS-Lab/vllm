@@ -196,6 +196,8 @@ def test_dcp_fine_hit_retention_uses_hash_alignment(
         mamba_partial_cache_hit=True,
         mamba_shared_prefix_checkpoint=False,
         mamba_has_prefill_checkpoint_blocks=bool(checkpoint_blocks),
+        mamba_checkpoints=None,
+        mamba_prefill_export=False,
         mamba_prefill_checkpoint_alignment=16,
     )
     producer = make_request(
@@ -255,6 +257,8 @@ def test_mamba_align_split_partial_tail_schedule(dcp_world_size: int):
         mamba_partial_cache_hit=True,
         mamba_shared_prefix_checkpoint=False,
         mamba_has_prefill_checkpoint_blocks=False,
+        mamba_checkpoints=None,
+        mamba_prefill_export=False,
     )
     split = Scheduler._mamba_block_aligned_split
 
@@ -304,6 +308,8 @@ def test_mamba_align_split_when_block_exceeds_scheduling_budget():
         mamba_partial_cache_hit=False,
         mamba_shared_prefix_checkpoint=False,
         mamba_has_prefill_checkpoint_blocks=False,
+        mamba_checkpoints=None,
+        mamba_prefill_export=False,
     )
     req = make_request("0", [0] * prompt_length, 32, sha256)
     split = Scheduler._mamba_block_aligned_split
@@ -346,6 +352,8 @@ def test_mamba_align_split_when_block_exceeds_long_prefill_threshold():
         mamba_partial_cache_hit=False,
         mamba_shared_prefix_checkpoint=False,
         mamba_has_prefill_checkpoint_blocks=False,
+        mamba_checkpoints=None,
+        mamba_prefill_export=False,
     )
     req = make_request("0", [0] * prompt_length, 32, sha256)
     split = Scheduler._mamba_block_aligned_split
@@ -638,6 +646,64 @@ def test_partial_hit_then_internal_checkpoint_uses_distinct_mamba_blocks():
     mamba_blocks = manager.get_blocks(replay.request_id).blocks[1]
     assert mamba_blocks[2].block_id == checkpoint_block_id
     assert mamba_blocks[3].block_id == running_block_id
+
+
+def test_chunk_running_past_partial_hit_block_does_not_cache_it():
+    """A partial hit resumes at 48, inside Mamba block [32, 64), and the final
+    chunk runs to 100 with its internal checkpoint at 96 in block 2. Block 1's
+    state column keeps the resumed state@48, so its full-block hash, which
+    promises state@64, must not be cached."""
+    hash_block_size = 16
+    mamba_block_size = 32
+    manager = make_full_mamba_manager(
+        dcp_world_size=1,
+        hash_block_size=hash_block_size,
+        full_block_size=hash_block_size,
+        mamba_block_size=mamba_block_size,
+        num_prefill_checkpoint_blocks=1,
+    )
+    owner = make_request("owner", list(range(56)), hash_block_size, sha256)
+    assert manager.allocate_slots(owner, owner.num_tokens) is not None
+    manager.free(owner)
+    manager.new_step_starts()
+
+    replay = make_request("replay", list(range(100)), hash_block_size, sha256)
+    computed_blocks, num_computed, _ = manager.get_computed_blocks(replay)
+    assert num_computed == 48
+    assert (
+        manager.allocate_slots(replay, 100 - 48, num_computed, computed_blocks)
+        is not None
+    )
+
+    pool = manager.block_pool
+    assert (
+        pool.get_cached_block(replay.block_hashes[64 // hash_block_size - 1], [1])
+        is None
+    )
+    checkpoint = pool.get_cached_block(
+        replay.block_hashes[96 // hash_block_size - 1], [1]
+    )
+    assert checkpoint is not None
+    assert checkpoint[0].block_hash_num_tokens == 96
+
+
+def test_exported_checkpoint_position_replaces_the_default():
+    """A scheduler export moves a row's checkpoint to its position when the
+    backend can write it there; rows without one keep the default rule."""
+    offsets, cols = compute_mamba_prefill_checkpoints(
+        [384, 384, 640],
+        [192, 192, 192],
+        hash_block_size=64,
+        mamba_block_size=64,
+        checkpoint_alignment=16,
+        drop_eagle_block=False,
+        cache_hit_alignment_tokens=64,
+        positions=[256, 0, 472],
+    )
+    # Row 0 exports 256; row 1 keeps its default position 320; row 2's export
+    # is off the 16-token checkpoint grid of its chunk, so nothing is written.
+    assert offsets == [64, 128, 0]
+    assert cols == [4, 4, -1]
 
 
 def test_internal_checkpoint_uses_partial_hash_lifecycle():
@@ -1997,6 +2063,8 @@ def test_mamba_align_split_stops_below_eagle_proof_boundary():
         mamba_partial_cache_hit=True,
         mamba_shared_prefix_checkpoint=False,
         mamba_has_prefill_checkpoint_blocks=False,
+        mamba_checkpoints=None,
+        mamba_prefill_export=False,
     )
     split = Scheduler._mamba_block_aligned_split
 

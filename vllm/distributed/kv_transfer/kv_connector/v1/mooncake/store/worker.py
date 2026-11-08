@@ -10,13 +10,17 @@ Includes the store worker, transfer threads, lookup server,
 and MooncakeDistributedStore integration.
 """
 
+import bisect
+import contextlib
 import dataclasses
+import itertools
 import math
 import os
 import queue
 import socket
 import threading
 import time
+from collections import Counter, deque
 from collections.abc import Callable, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import AbstractContextManager
@@ -45,6 +49,8 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.coordinator imp
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (  # noqa: E501
     BlobBlockHashes,
     ChunkedTokenDatabase,
+    FrontierProbe,
+    FrontierPut,
     KeyMetadata,
     LBHNCStoreLayout,
     LBNHCStoreLayout,
@@ -58,13 +64,38 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (  
     TPShardedStoreLayout,
     group_compact_kernel_blocks,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.frontier import (  # noqa: E501
+    _REMOVE_RETRIES,
+    RING_NAMESPACE,
+    FrontierStore,
+    FrontierStoreConfig,
+    decode_locator,
+    encode_locator,
+    merge_locator,
+    ring_group_ids,
+    ring_unit,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.protocol import (  # noqa: E501
+    FRONTIER_PROBE_MSG,
+    FRONTIER_VERIFY_MSG,
     LOOKUP_MSG,
     RESET_MSG,
     RESP_ERR,
     RESP_OK,
+    decode_frontier_locators,
+    decode_frontier_probe,
+    decode_frontier_verified,
+    decode_frontier_verify,
     decode_lookup_response,
+    encode_frontier_probe,
+    encode_frontier_verified,
+    encode_frontier_verify,
     encode_lookup_response,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.unit_policy import (  # noqa: E501
+    StoreUnits,
+    UnitPolicyClient,
+    unit_policy_refusal,
 )
 from vllm.distributed.mooncake_store import MooncakeStoreConfig, setup_mooncake_store
 from vllm.logger import init_logger
@@ -72,6 +103,7 @@ from vllm.utils.math_utils import cdiv
 from vllm.utils.network_utils import get_ip, make_zmq_socket
 from vllm.utils.torch_utils import is_non_overlapping_and_dense
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
+from vllm.v1.core.hybrid_checkpoint.cost import PrefillCostModel
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     maybe_convert_block_hash,
@@ -85,6 +117,7 @@ from vllm.v1.kv_cache_interface import (
     MLAAttentionSpec,
     SlidingWindowMLASpec,
     UniformTypeKVCacheSpecs,
+    group_kernel_blocks,
 )
 from vllm.v1.kv_cache_layout import KVCacheLayout
 
@@ -93,7 +126,211 @@ from .metrics import MooncakeStoreConnectorStats
 logger = init_logger(__name__)
 
 MOONCAKE_NO_AVAILABLE_HANDLE = -200
+# staging_buffer_mib: the put code of a key whose bytes the job did not copy
+# out, so it cannot be put. Not a Mooncake ErrorCode (those are -1 to -1999).
+MOONCAKE_NOT_STAGED = -10000
+# Default seconds a job waits for room in the staging buffer
+# (staging_wait_s) before it puts from GPU memory instead.
+STAGE_WAIT_S = 5.0
+# Bytes each staged segment's offset is rounded to.
+STAGE_ALIGN = 256
+# Default seconds a lookup waits for worker rank 0's reply
+# (lookup_timeout_s); a lookup without a reply in time is a miss.
+LOOKUP_TIMEOUT_S = 30.0
 _T = TypeVar("_T")
+
+
+def _lookup_newest_state(extra_config: dict[str, Any]) -> bool:
+    value = extra_config.get("lookup_newest_state", False)
+    if not isinstance(value, bool):
+        raise ValueError("lookup_newest_state must be a bool")
+    return value
+
+
+class StagingArea:
+    """``staging_buffer_mib``: pinned host memory, registered with
+    the store, into which each store job copies the GPU bytes it puts, so its
+    GPU blocks can be freed before the puts. One contiguous allocation per job,
+    freed in job order (the put thread runs jobs in order), so the buffer is a
+    ring. ``regions`` maps every registered KV storage: (base address, bytes, a
+    flat uint8 view). A job waits at most ``wait_s`` for room: the put thread
+    frees room as it finishes earlier jobs."""
+
+    def __init__(
+        self,
+        store: Any,
+        nbytes: int,
+        regions: Sequence[tuple[int, int, torch.Tensor]],
+        device: torch.device | None,
+        wait_s: float = STAGE_WAIT_S,
+    ) -> None:
+        on_gpu = device is not None and device.type == "cuda"
+        self.buffer = torch.empty(nbytes, dtype=torch.uint8, pin_memory=on_gpu)
+        self.base = self.buffer.data_ptr()
+        self.size = nbytes
+        self.wait_s = wait_s
+        ret = store.register_buffer(self.base, nbytes)
+        if ret != 0:
+            raise RuntimeError(f"register_buffer failed for the staging buffer: {ret}")
+        self._regions = sorted(regions, key=lambda r: r[0])
+        self._bases = [r[0] for r in self._regions]
+        self.stream = torch.cuda.Stream(device=device) if on_gpu else None
+        self._live: deque[tuple[int, int]] = deque()
+        self._cond = threading.Condition()
+        self.counts: Counter[str] = Counter()
+
+    def _region(self, addr: int) -> int:
+        i = bisect.bisect_right(self._bases, addr) - 1
+        if i < 0:
+            raise ValueError(f"address {addr:#x} is in no registered KV region")
+        return i
+
+    def _source(self, addr: int, size: int) -> torch.Tensor:
+        base, nbytes, view = self._regions[self._region(addr)]
+        if addr + size > base + nbytes:
+            raise ValueError(f"{size} bytes at {addr:#x} leave their KV region")
+        return view[addr - base : addr - base + size]
+
+    def _fit(self, n: int) -> int | None:
+        if not self._live:
+            return 0
+        first = self._live[0][0]
+        last, last_n = self._live[-1]
+        end = last + last_n
+        if end > first:  # live bytes are [first, end)
+            if end + n <= self.size:
+                return end
+            return 0 if n <= first else None
+        return end if end + n <= first else None  # live bytes wrap
+
+    def _alloc(self, n: int, timeout: float) -> int | None:
+        if n > self.size:
+            return None
+        deadline = time.monotonic() + timeout
+        with self._cond:
+            while (off := self._fit(n)) is None:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    return None
+                self._cond.wait(left)
+            self._live.append((off, n))
+            return off
+
+    def free(self, off: int) -> None:
+        with self._cond:
+            if self._live and self._live[0][0] == off:
+                self._live.popleft()
+            else:
+                self._live = deque(a for a in self._live if a[0] != off)
+            self._cond.notify_all()
+
+    def _copy_segment(
+        self, dst: torch.Tensor, src: torch.Tensor, dst_addr: int, src_addr: int
+    ) -> None:
+        dst.copy_(src, non_blocking=self.stream is not None)
+
+    def stage(
+        self, sources: Sequence[tuple[int, int]], timeout: float | None = None
+    ) -> tuple[int, dict[int, int]] | None:
+        """Copy each (GPU address, bytes) of ``sources`` into one allocation and
+        wait for the copies. Returns the allocation and each address's host
+        address, or None when the job does not fit within ``timeout`` (default
+        ``wait_s``). Segments adjacent in GPU memory are copied as one."""
+        sizes: dict[int, int] = {}
+        for addr, size in sources:
+            if sizes.setdefault(addr, size) != size:
+                raise ValueError(f"{addr:#x} is staged with two sizes")
+        # (GPU address, bytes, offset in the allocation), by address.
+        layout: list[tuple[int, int, int]] = []
+        total = 0
+        for addr in sorted(sizes):
+            layout.append((addr, sizes[addr], total))
+            total += -(-sizes[addr] // STAGE_ALIGN) * STAGE_ALIGN
+        off = self._alloc(total, self.wait_s if timeout is None else timeout)
+        if off is None:
+            if total > self.size:
+                self.counts["too_big"] += 1
+                logger.warning_once(
+                    "A Mooncake store job is larger than the whole staging buffer "
+                    "and puts from GPU memory; raise staging_buffer_mib to stage it."
+                )
+            else:
+                self.counts["timeouts"] += 1
+                logger.warning_once(
+                    "A Mooncake store job found no room in the staging buffer "
+                    "within staging_wait_s and puts from GPU memory; the store's "
+                    "puts are slower than the jobs arrive."
+                )
+            return None
+        try:
+            context = (
+                torch.cuda.stream(self.stream)
+                if self.stream is not None
+                else contextlib.nullcontext()
+            )
+            with context:
+                run: list[int] | None = None  # [GPU address, offset, bytes]
+                for addr, size, pos in layout:
+                    if (
+                        run is not None
+                        and addr == run[0] + run[2]
+                        and pos == run[1] + run[2]
+                        and self._region(addr) == self._region(run[0])
+                    ):
+                        run[2] += size
+                        continue
+                    if run is not None:
+                        self._copy_run(off, *run)
+                    run = [addr, pos, size]
+                if run is not None:
+                    self._copy_run(off, *run)
+            if self.stream is not None:
+                self.stream.synchronize()
+        except BaseException:
+            self.free(off)
+            raise
+        self.counts["jobs"] += 1
+        self.counts["bytes"] += total
+        return off, {addr: self.base + off + pos for addr, _, pos in layout}
+
+    def _copy_run(self, off: int, addr: int, pos: int, size: int) -> None:
+        self._copy_segment(
+            self.buffer[off + pos : off + pos + size],
+            self._source(addr, size),
+            self.base + off + pos,
+            addr,
+        )
+
+
+def _staging_buffer_mib(extra_config: dict[str, Any]) -> int:
+    value = extra_config.get("staging_buffer_mib", 0)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError("staging_buffer_mib must be a non-negative integer (MiB)")
+    return value
+
+
+def _lookup_timeout_s(extra_config: dict[str, Any]) -> float:
+    value = extra_config.get("lookup_timeout_s", LOOKUP_TIMEOUT_S)
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int | float)
+        or not value > 0
+        or math.isinf(value)
+    ):
+        raise ValueError("lookup_timeout_s must be a positive number (seconds)")
+    return float(value)
+
+
+def _staging_wait_s(extra_config: dict[str, Any]) -> float:
+    value = extra_config.get("staging_wait_s", STAGE_WAIT_S)
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int | float)
+        or not value >= 0
+        or math.isinf(value)
+    ):
+        raise ValueError("staging_wait_s must be a non-negative number (seconds)")
+    return float(value)
 
 
 def resolve_store_tp_size(extra_config: dict[str, Any]) -> int | None:
@@ -413,6 +650,13 @@ class KVCacheStoreSendingThread(KVTransferThread):
         supports_group_ids: bool = False,
         record_operation: Callable[..., None] | None = None,
         group_participates: Sequence[bool] | None = None,
+        frontiers: FrontierStore | None = None,
+        locator_config: Any = None,
+        store_units: StoreUnits | None = None,
+        unit_client: UnitPolicyClient | None = None,
+        unit_replicate_config: Any = None,
+        staging: StagingArea | None = None,
+        frontier_replicate_config: Any = None,
     ):
         super().__init__(
             store,
@@ -423,8 +667,40 @@ class KVCacheStoreSendingThread(KVTransferThread):
             name="KVCacheStoreSendingThread",
             record_operation=record_operation,
         )
+        # staging_buffer_mib: this thread copies each job's GPU bytes
+        # into ``staging`` and reports its blocks released; ``_putter`` runs the
+        # job from the copies, in order. ``_translation`` maps a GPU address to
+        # its copy for the job the putter runs (None: put from GPU memory), and
+        # ``_stored_at_copy`` holds the keys that job found in the store when
+        # it was copied, which it therefore did not copy.
+        self.staging = staging
+        self._released_saves: dict[int, int] = {}
+        self._staged_offset: dict[str, int] = {}
+        self._translation: dict[int, int] | None = None
+        self._stored_at_copy: frozenset[str] = frozenset()
+        self._staging_logged_at = time.monotonic()
+        if staging is not None:
+            self._put_queue: queue.Queue[Any] = queue.Queue()
+            self._putter = threading.Thread(
+                target=self._put_loop, daemon=True, name="KVCacheStoreStagedPutThread"
+            )
+            self._putter.start()
         # Only ranks with identical group bytes may stripe PUTs (e.g., MLA).
         self.group_put_steps = group_put_steps
+        # frontier_write_through: frontier objects, and the
+        # ReplicateConfig of locator upserts.
+        self.frontiers = frontiers
+        self.locator_config = locator_config
+        # frontier_soft_pin_rest: the ReplicateConfig of frontier objects,
+        # which leaves them unpinned (None: ``replicate_config``).
+        self.frontier_replicate_config = frontier_replicate_config
+        # unit_policy_url: each unit's own objects go under its id as their
+        # Mooncake group (a ReplicateConfig of their own, so ungrouped puts
+        # never carry group ids), and the rank that writes locators
+        # (``unit_client``) registers the units every job wrote.
+        self.store_units = store_units
+        self.unit_client = unit_client
+        self.unit_replicate_config = unit_replicate_config
         self.coord = coord
         self.kv_role = kv_role
         self.group_participates = (
@@ -481,6 +757,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 del self.stored_requests[req_id]
             self._skip_store_requests.discard(req_id)
             self._saved_offset.pop(req_id, None)
+            self._staged_offset.pop(req_id, None)
             self._retry_token_ids.pop(req_id, None)
 
     def finish_store_job(self, req_meta: ReqMeta) -> None:
@@ -507,6 +784,22 @@ class KVCacheStoreSendingThread(KVTransferThread):
             completed = self._completed_saves
             self._completed_saves = {}
         return completed
+
+    def take_released_saves(self) -> dict[int, int]:
+        with self.done_task_lock:
+            released = self._released_saves
+            self._released_saves = {}
+        return released
+
+    def _report_released(self, req_meta: ReqMeta) -> None:
+        """``staging_buffer_mib``: this rank no longer reads the
+        job's GPU blocks."""
+        store_job_id = req_meta.store_job_id
+        assert store_job_id is not None
+        with self.done_task_lock:
+            self._released_saves[store_job_id] = (
+                self._released_saves.get(store_job_id, 0) + 1
+            )
 
     def _record_saved(self, req_meta: ReqMeta, token_len: int) -> None:
         # Guard on job liveness so neither a concurrent finish/preempt pop nor a
@@ -568,6 +861,119 @@ class KVCacheStoreSendingThread(KVTransferThread):
             self._skip_store_requests.clear()
         return True
 
+    def _save_candidates(
+        self, req_meta: ReqMeta, token_len: int, save_start: int
+    ) -> tuple[
+        list[int],
+        list[int],
+        list[str],
+        list[int],
+        list[StoreShardId],
+        list[tuple[int, int, int, BlockHash]] | None,
+    ]:
+        """The normal save's chunks of ``[save_start, token_len)`` this rank
+        stores: starts, ends, keys, group indices, store shards and the KV
+        events' specs."""
+        # Within each lcm region only per-spec relevant chunks are loaded
+        # (e.g., SWA or linear attn), so mask out irrelevant chunks
+        store_masks = self.coord.store_mask(
+            token_len,
+            save_start,
+            num_prompt_tokens=req_meta.prefill_end_tokens,
+        )
+        block_ids_per_group = req_meta.block_ids
+        starts: list[int] = []
+        ends: list[int] = []
+        keys: list[str] = []
+        event_specs: list[tuple[int, int, int, BlockHash]] | None = (
+            [] if self.enable_kv_event else None
+        )
+        group_indices: list[int] = []
+        store_shard_ids: list[StoreShardId] = []
+        for g_idx, db in enumerate(self.token_databases):
+            if not self.group_participates[g_idx]:
+                continue
+            # Rotate the stride phase per group to balance load across ranks.
+            put_step = self.group_put_steps[g_idx]
+            put_step_rank = (self.tp_rank + g_idx) % put_step
+            group_blocks = block_ids_per_group[g_idx]
+            for start, end, block_hash in db.process_tokens(
+                token_len,
+                req_meta.block_hashes,
+                mask_num=save_start,
+                chunk_mask=store_masks[g_idx],
+                put_step=put_step,
+                put_step_rank=put_step_rank,
+            ):
+                block_idx = start // db.block_size
+                if block_idx >= len(group_blocks) or (
+                    group_blocks[block_idx] == NULL_BLOCK_ID
+                ):
+                    logger.debug(
+                        "Skipping unavailable Mooncake store source block "
+                        "(req=%s, group=%d, block=%d)",
+                        req_meta.req_id,
+                        g_idx,
+                        block_idx,
+                    )
+                    continue
+                for store_shard_id in db.store_layout.local_shard_ids:
+                    starts.append(start)
+                    ends.append(end)
+                    keys.append(db.store_layout.key_for(store_shard_id, block_hash))
+                    group_indices.append(g_idx)
+                    store_shard_ids.append(store_shard_id)
+                    if event_specs is not None:
+                        event_specs.append((start, end, g_idx, block_hash))
+        return starts, ends, keys, group_indices, store_shard_ids, event_specs
+
+    def _save_values(
+        self,
+        req_meta: ReqMeta,
+        starts: list[int],
+        ends: list[int],
+        group_indices: list[int],
+        store_shard_ids: list[StoreShardId],
+    ) -> tuple[list[list[int]], list[list[int]]]:
+        """The buffer addresses and sizes of the normal save's chunks, grouped
+        by KV-cache group in group order."""
+        addrs: list[list[int]] = []
+        sizes: list[list[int]] = []
+        chunks_per_group: list[list[tuple[int, int]]] = [
+            [] for _ in self.token_databases
+        ]
+        shards_per_group: list[list[StoreShardId]] = [[] for _ in self.token_databases]
+        for start, end, g_idx, store_shard_id in zip(
+            starts, ends, group_indices, store_shard_ids, strict=True
+        ):
+            chunks_per_group[g_idx].append((start, end))
+            shards_per_group[g_idx].append(store_shard_id)
+        for g_idx, chunks in enumerate(chunks_per_group):
+            if not chunks:
+                continue
+            db = self.token_databases[g_idx]
+            group_addrs, group_sizes, _ = db.store_layout.prepare_values(
+                chunks,
+                req_meta.block_ids[g_idx],
+                shards_per_group[g_idx],
+            )
+            addrs.extend(group_addrs)
+            sizes.extend(group_sizes)
+        return addrs, sizes
+
+    def _rewind_staged(self, req_meta: ReqMeta) -> None:
+        """``staging_buffer_mib``: a job ended without recording its normal
+        save, so the next job copied for the request starts where its saves
+        stopped."""
+        req_id = req_meta.req_id
+        with self.done_task_lock:
+            if req_meta.store_job_id not in self.stored_requests.get(req_id, ()):
+                return
+            if req_id in self._staged_offset:
+                self._staged_offset[req_id] = min(
+                    self._staged_offset[req_id], self._saved_offset.get(req_id, 0)
+                )
+
     def _boundary_puts(
         self, req_meta: ReqMeta
     ) -> list[tuple[str, list[int], list[int], KeyMetadata]]:
@@ -626,7 +1032,199 @@ class KVCacheStoreSendingThread(KVTransferThread):
         if not req_meta.boundary_puts or not req_meta.block_hashes:
             return True
         puts = self._boundary_puts(req_meta)
+        states = [unit for unit in req_meta.store_units if not unit.frontier]
+        unit_groups = None
+        if self.store_units is not None and states:
+            # A state's objects (and a partial tail's page) are keyed by the
+            # state's prefix hash; the other boundary puts are path pages.
+            ids = {
+                unit.key.hex(): self.store_units.unit_id(unit.key) for unit in states
+            }
+            unit_groups = [ids.get(key.rsplit("@", 1)[-1], "") for key, _, _, _ in puts]
+        if not self._put_missing(
+            req_meta,
+            puts,
+            "boundary-state",
+            "save_exists",
+            "save_put",
+            unit_groups=unit_groups,
+        ):
+            return False
+        if self.unit_client is not None and states:
+            assert self.store_units is not None
+            self.unit_client.send(
+                [
+                    self.store_units.upsert(unit, req_meta.block_hashes)
+                    for unit in states
+                ]
+            )
+        return True
 
+    def _offload_frontier(self, req_meta: ReqMeta) -> bool:
+        """``frontier_write_through``: persist this rank's objects of the
+        job's frontier checkpoint, deduped against the store, then (one rank)
+        add the frontier to its locator record. True when every put
+        succeeds."""
+        put = req_meta.frontier
+        assert put is not None and self.frontiers is not None
+        puts = self.frontiers.object_puts(put, self.tp_rank, self.group_put_steps)
+        unit_groups = None
+        if self.store_units is not None:
+            unit_groups = [self.store_units.unit_id(put.key)] * len(puts)
+        if not self._put_missing(
+            req_meta,
+            puts,
+            "frontier",
+            "frontier_exists",
+            "frontier_put",
+            unit_groups=unit_groups,
+            replicate_config=self.frontier_replicate_config,
+        ):
+            return False
+        if self.frontiers.writes_locators:
+            self._add_to_locator(put)
+        if self.unit_client is not None:
+            assert self.store_units is not None
+            self.unit_client.send(
+                [
+                    self.store_units.upsert(unit, req_meta.block_hashes, put.locator)
+                    for unit in req_meta.store_units
+                    if unit.frontier
+                ]
+            )
+        if put.supersedes or put.superseded_states:
+            if self.store_units is None:
+                self._remove_superseded(req_meta)
+            elif self.unit_client is not None:
+                self._mark_superseded_dead(req_meta)
+        return True
+
+    def _mark_superseded_dead(self, req_meta: ReqMeta) -> None:
+        """``unit_policy_url``: the units ``frontier_supersede_remove`` would
+        remove (the frontier the request resumed from and the states it stored
+        past it) are dead: the master evicts them first."""
+        put = req_meta.frontier
+        assert put is not None and self.store_units is not None
+        assert self.unit_client is not None
+        hash_block_size = self.coord.hash_block_size
+        keys = [key for key, _ in put.supersedes]
+        for num_tokens in sorted({tokens for _, tokens in put.superseded_states}):
+            hash_idx = num_tokens // hash_block_size - 1
+            if 0 <= hash_idx < len(req_meta.block_hashes):
+                keys.append(bytes(req_meta.block_hashes[hash_idx]))
+        self.unit_client.send([self.store_units.dead(key) for key in keys])
+
+    def _remove_superseded(self, req_meta: ReqMeta) -> None:
+        """``frontier_supersede_remove`` and ``frontier_keep_states``: remove,
+        without force, this rank's share of the frontiers and boundary states
+        the job supersedes. Mooncake refuses an object whose lease has not
+        expired, so a reader that checked one keeps it; refused and missing
+        objects are left to the store's eviction, except that with
+        ``frontier_remove_retry_s`` the refused ones are tried again with a
+        later job."""
+        put = req_meta.frontier
+        assert put is not None and self.frontiers is not None
+        keys: list[str] = []
+        for key, length in put.supersedes:
+            keys.extend(
+                self.frontiers.object_keys(
+                    key, length, self.tp_rank, self.group_put_steps
+                )
+            )
+        hash_block_size = self.coord.hash_block_size
+        for group_id, num_tokens in put.superseded_states:
+            hash_idx = num_tokens // hash_block_size - 1
+            if not self.group_participates[group_id] or not (
+                0 <= hash_idx < len(req_meta.block_hashes)
+            ):
+                continue
+            db = self.token_databases[group_id]
+            put_step = self.group_put_steps[group_id]
+            if (cdiv(num_tokens, db.block_size) - 1) % put_step != (
+                self.tp_rank + group_id
+            ) % put_step:
+                continue
+            keys.append(db.key_for(req_meta.block_hashes[hash_idx]))
+        retries_left = [_REMOVE_RETRIES] * len(keys)
+        for retry_key, left in self.frontiers.due_retries():
+            keys.append(retry_key)
+            retries_left.append(left)
+        if not keys:
+            return
+        start = time.perf_counter()
+        try:
+            codes = list(self.store.batch_remove(keys))
+        except Exception as e:
+            self._record_operation(
+                "frontier_remove",
+                start,
+                len(keys),
+                status="error",
+                num_failed_keys=len(keys),
+            )
+            logger.error("Mooncake frontier removal failed: %s", e)
+            return
+        removed = sum(1 for code in codes if code == 0)
+        self._record_operation(
+            "frontier_remove",
+            start,
+            len(keys),
+            status="ok" if removed == len(keys) else "partial_failure",
+            num_failed_keys=len(keys) - removed,
+        )
+        self.frontiers.note_removals(codes)
+        self.frontiers.defer_leased(keys, codes, retries_left)
+
+    def _add_to_locator(self, put: FrontierPut) -> None:
+        """Upsert the frontier's locator record with ``(length, key)`` first,
+        merged into the store's copy (never a cached one, which misses what
+        other engines added). Two engines updating one record at once may drop
+        an entry; a dropped frontier is then not found, never misread."""
+        assert self.frontiers is not None
+        key = self.frontiers.locator_key(put.locator)
+        start = time.perf_counter()
+        try:
+            entries = []
+            if self.store.batch_is_exist([key])[0] == 1:
+                entries = decode_locator(
+                    self.frontiers.read_record(self.store, key, cached_ok=False)
+                )
+            record = encode_locator(merge_locator(entries, put.length, put.key))
+            ret = self.store.upsert(key, record, self.locator_config)
+        except Exception as e:
+            self.frontiers.remember_record(key, None)
+            self._record_operation(
+                "frontier_locator", start, 1, status="error", num_failed_keys=1
+            )
+            logger.error("Failed to update frontier locator %s: %s", key, e)
+            return
+        self.frontiers.remember_record(key, record if ret == 0 else None)
+        self._record_operation(
+            "frontier_locator",
+            start,
+            1,
+            num_bytes=len(record),
+            status="ok" if ret == 0 else "partial_failure",
+            num_failed_keys=int(ret != 0),
+        )
+        if ret != 0:
+            logger.warning("Frontier locator %s upsert failed (code=%s)", key, ret)
+
+    def _put_missing(
+        self,
+        req_meta: ReqMeta,
+        puts: list[tuple[str, list[int], list[int], KeyMetadata]],
+        kind: str,
+        exists_op: str,
+        put_op: str,
+        unit_groups: list[str] | None = None,
+        replicate_config: Any = None,
+    ) -> bool:
+        """Put the objects of ``puts`` the store does not hold yet, after the
+        job's step fence. True when none is missing or every put succeeds.
+        ``unit_groups`` (``unit_policy_url``): each object's unit id, or ""
+        for an object no unit owns. ``replicate_config``: the puts' config,
+        by default ``self.replicate_config``."""
         if not puts:
             return True
         keys = [key for key, _, _, _ in puts]
@@ -645,19 +1243,20 @@ class KVCacheStoreSendingThread(KVTransferThread):
             exists = self.store.batch_is_exist(keys)
         except Exception as e:
             self._record_operation(
-                "save_exists",
+                exists_op,
                 exists_start,
                 len(keys),
                 status="error",
                 num_failed_keys=len(keys),
             )
             logger.error(
-                "Failed to check boundary-state keys for request %s: %s",
+                "Failed to check %s keys for request %s: %s",
+                kind,
                 req_meta.req_id,
                 e,
             )
             return False
-        self._record_operation("save_exists", exists_start, len(keys))
+        self._record_operation(exists_op, exists_start, len(keys))
         missing = [i for i, e in enumerate(exists) if e != 1]
         if not missing:
             return True
@@ -666,6 +1265,13 @@ class KVCacheStoreSendingThread(KVTransferThread):
         sizes = [sizes[i] for i in missing]
         if group_ids is not None:
             group_ids = [group_ids[i] for i in missing]
+        if replicate_config is None:
+            replicate_config = self.replicate_config
+        if unit_groups is not None:
+            unit_groups = [unit_groups[i] for i in missing]
+            if any(unit_groups):
+                replicate_config = self.unit_replicate_config
+                replicate_config.group_ids = unit_groups
         if req_meta.current_event is not None:
             # Fence the CoW block copy enqueued earlier this step.
             req_meta.current_event.synchronize()
@@ -675,12 +1281,10 @@ class KVCacheStoreSendingThread(KVTransferThread):
         batch_bytes = _sum_batch_bytes(sizes)
         put_start = time.perf_counter()
         try:
-            res = self.store.batch_put_from_multi_buffers(
-                keys, addrs, sizes, self.replicate_config
-            )
+            res = self._put_buffers(keys, addrs, sizes, replicate_config)
         except Exception as e:
             self._record_operation(
-                "save_put",
+                put_op,
                 put_start,
                 len(keys),
                 num_bytes=batch_bytes,
@@ -688,7 +1292,8 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 num_failed_keys=len(keys),
             )
             logger.error(
-                "Failed to put boundary-state keys for request %s: %s",
+                "Failed to put %s keys for request %s: %s",
+                kind,
                 req_meta.req_id,
                 e,
             )
@@ -696,7 +1301,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
 
         failed = [i for i, value in enumerate(res) if value < 0]
         self._record_operation(
-            "save_put",
+            put_op,
             put_start,
             len(keys),
             num_bytes=batch_bytes,
@@ -706,8 +1311,8 @@ class KVCacheStoreSendingThread(KVTransferThread):
         if failed:
             failed_codes = {res[i] for i in failed}
             logger.warning(
-                "Boundary-state put failed for request %s: %d/%d keys failed "
-                "(codes=%s)",
+                "%s put failed for request %s: %d/%d keys failed (codes=%s)",
+                kind.capitalize(),
                 req_meta.req_id,
                 len(failed),
                 len(keys),
@@ -720,11 +1325,163 @@ class KVCacheStoreSendingThread(KVTransferThread):
         if self._clear_store_pressure():
             logger.info(
                 "Mooncake CPU/disk offloading pressure cleared after a "
-                "successful boundary-state batch"
+                "successful %s batch",
+                kind,
             )
         return True
 
     def _handle_request(self, req_meta: ReqMeta):
+        if self.staging is None:
+            self._run_job(req_meta)
+        else:
+            self._stage_job(req_meta)
+
+    def _stage_job(self, req_meta: ReqMeta) -> None:
+        """``staging_buffer_mib``: copy what the job will put out of
+        GPU memory, report its blocks released, and queue it for the putter. A
+        job that cannot be copied keeps its blocks until it completes."""
+        assert self.staging is not None
+        staged = None
+        stored: frozenset[str] = frozenset()
+        try:
+            sources, stored = self._job_sources(req_meta)
+            if sources and req_meta.current_event is not None:
+                req_meta.current_event.synchronize()
+            staged = self.staging.stage(sources) if sources else (None, {})
+            if staged is not None:
+                self._report_released(req_meta)
+        except Exception:
+            logger.exception(
+                "Mooncake store job copy failed (req=%s); it puts from GPU memory",
+                req_meta.req_id,
+            )
+            staged = None
+        self._put_queue.put((req_meta, staged, stored))
+        now = time.monotonic()
+        if now - self._staging_logged_at >= 60.0:
+            self._staging_logged_at = now
+            logger.info(
+                "Mooncake staged store jobs: %s",
+                dict(sorted(self.staging.counts.items())),
+            )
+
+    def _put_loop(self) -> None:
+        assert self.staging is not None
+        while True:
+            req_meta, staged, stored = self._put_queue.get()
+            try:
+                self._translation = None if staged is None else staged[1]
+                self._stored_at_copy = stored
+                self._run_job(req_meta)
+            except Exception:
+                logger.exception("Error in staged put (req=%s)", req_meta.req_id)
+            finally:
+                self._translation = None
+                self._stored_at_copy = frozenset()
+                if staged is not None and staged[0] is not None:
+                    self.staging.free(staged[0])
+
+    def _job_sources(
+        self, req_meta: ReqMeta
+    ) -> tuple[list[tuple[int, int]], frozenset[str]]:
+        """Every (GPU address, bytes) the job will put: its boundary states,
+        frontier checkpoint and normal saves that the store does not hold, and
+        the keys it holds. Normal saves start where this rank's earlier jobs of
+        the request were copied, so a request's range is copied once."""
+        if not self.is_live_store_job(req_meta) or self._should_skip_request(
+            req_meta.req_id
+        ):
+            return [], frozenset()
+        puts: list[tuple[str, list[int], list[int], Any]] = []
+        if req_meta.boundary_puts and req_meta.block_hashes:
+            puts += self._boundary_puts(req_meta)
+        if req_meta.frontier is not None:
+            assert self.frontiers is not None
+            puts += self.frontiers.object_puts(
+                req_meta.frontier, self.tp_rank, self.group_put_steps
+            )
+        lcm_block_size = self.coord.lcm_block_size
+        token_len = req_meta.token_len_chunk // lcm_block_size * lcm_block_size
+        if token_len:
+            with self.done_task_lock:
+                save_start = max(
+                    self._saved_offset.get(req_meta.req_id, 0),
+                    self._staged_offset.get(req_meta.req_id, 0),
+                )
+                self._staged_offset[req_meta.req_id] = max(save_start, token_len)
+            starts, ends, keys, group_indices, store_shard_ids, _ = (
+                self._save_candidates(req_meta, token_len, save_start)
+            )
+            for key, addrs, sizes in zip(
+                keys,
+                *self._save_values(
+                    req_meta, starts, ends, group_indices, store_shard_ids
+                ),
+                strict=True,
+            ):
+                puts.append((key, addrs, sizes, None))
+        if not puts:
+            return [], frozenset()
+        exists = self.store.batch_is_exist([key for key, _, _, _ in puts])
+        sources = [
+            (addr, size)
+            for (_, addrs, sizes, _), present in zip(puts, exists, strict=True)
+            if present != 1
+            for addr, size in zip(addrs, sizes, strict=True)
+        ]
+        stored = frozenset(
+            key
+            for (key, _, _, _), present in zip(puts, exists, strict=True)
+            if present == 1
+        )
+        return sources, stored
+
+    def _put_buffers(
+        self,
+        keys: list[str],
+        addrs: list[list[int]],
+        sizes: list[list[int]],
+        config: Any,
+    ) -> list[int]:
+        """``batch_put_from_multi_buffers``, from the job's copies when it was
+        copied out: a key whose bytes were not copied is not put. One the store
+        held when the job was copied counts as stored: it was evicted since, as
+        it could have been right after a put."""
+        translation = self._translation
+        if translation is None:
+            return self.store.batch_put_from_multi_buffers(keys, addrs, sizes, config)
+        assert self.staging is not None
+        counts = self.staging.counts
+        res = [MOONCAKE_NOT_STAGED] * len(keys)
+        staged = []
+        for i, key_addrs in enumerate(addrs):
+            if all(x in translation for x in key_addrs):
+                staged.append(i)
+            elif keys[i] in self._stored_at_copy:
+                res[i] = 0
+                counts["evicted_after_copy"] += 1
+            else:
+                counts["unstaged_keys"] += 1
+        if not staged:
+            return res
+        group_ids = getattr(config, "group_ids", None)
+        if group_ids is not None and len(staged) != len(keys):
+            config.group_ids = [group_ids[i] for i in staged]
+        try:
+            out = self.store.batch_put_from_multi_buffers(
+                [keys[i] for i in staged],
+                [[translation[x] for x in addrs[i]] for i in staged],
+                [sizes[i] for i in staged],
+                config,
+            )
+        finally:
+            if group_ids is not None:
+                config.group_ids = group_ids
+        for i, code in zip(staged, out, strict=True):
+            res[i] = code
+        return res
+
+    def _run_job(self, req_meta: ReqMeta):
         # The single `finally` is the only way out, so the scheduler releases
         # this job's GPU block references however the job ends.
         save_completed = False
@@ -737,7 +1494,6 @@ class KVCacheStoreSendingThread(KVTransferThread):
             # which is also ``store_mask``'s precondition.
             lcm_block_size = self.coord.lcm_block_size
             token_len = req_meta.token_len_chunk // lcm_block_size * lcm_block_size
-            block_ids_per_group = req_meta.block_ids
             current_event = req_meta.current_event
 
             if not self.is_live_store_job(req_meta):
@@ -763,65 +1519,18 @@ class KVCacheStoreSendingThread(KVTransferThread):
             # normal positional save, which may be skipped this step).
             if not self._maybe_offload_boundary_states(req_meta):
                 return
+            # A finish's frontier checkpoint, after the full pages before it.
+            if req_meta.frontier is not None and not self._offload_frontier(req_meta):
+                return
 
             if token_len == 0:
                 return
 
             # Resume from where this rank left off; only the new suffix is saved.
             save_start = self._saved_offset.get(req_id, 0)
-
-            # Within each lcm region only per-spec relevant chunks are loaded
-            # (e.g., SWA or linear attn), so mask out irrelevant chunks
-            store_masks = self.coord.store_mask(
-                token_len,
-                save_start,
-                num_prompt_tokens=req_meta.prefill_end_tokens,
+            starts, ends, keys, group_indices, store_shard_ids, event_specs = (
+                self._save_candidates(req_meta, token_len, save_start)
             )
-
-            starts: list[int] = []
-            ends: list[int] = []
-            keys: list[str] = []
-            event_specs: list[tuple[int, int, int, BlockHash]] | None = (
-                [] if self.enable_kv_event else None
-            )
-            group_indices: list[int] = []
-            store_shard_ids: list[StoreShardId] = []
-            for g_idx, db in enumerate(self.token_databases):
-                if not self.group_participates[g_idx]:
-                    continue
-                # Rotate the stride phase per group to balance load across ranks.
-                put_step = self.group_put_steps[g_idx]
-                put_step_rank = (self.tp_rank + g_idx) % put_step
-                group_blocks = block_ids_per_group[g_idx]
-                for start, end, block_hash in db.process_tokens(
-                    token_len,
-                    req_meta.block_hashes,
-                    mask_num=save_start,
-                    chunk_mask=store_masks[g_idx],
-                    put_step=put_step,
-                    put_step_rank=put_step_rank,
-                ):
-                    block_idx = start // db.block_size
-                    group_blocks = block_ids_per_group[g_idx]
-                    if block_idx >= len(group_blocks) or (
-                        group_blocks[block_idx] == NULL_BLOCK_ID
-                    ):
-                        logger.debug(
-                            "Skipping unavailable Mooncake store source block "
-                            "(req=%s, group=%d, block=%d)",
-                            req_id,
-                            g_idx,
-                            block_idx,
-                        )
-                        continue
-                    for store_shard_id in db.store_layout.local_shard_ids:
-                        starts.append(start)
-                        ends.append(end)
-                        keys.append(db.store_layout.key_for(store_shard_id, block_hash))
-                        group_indices.append(g_idx)
-                        store_shard_ids.append(store_shard_id)
-                        if event_specs is not None:
-                            event_specs.append((start, end, g_idx, block_hash))
 
             if not keys:
                 self._record_saved(req_meta, token_len)
@@ -883,34 +1592,9 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 req_id,
             )
 
-            addrs: list[list[int]] = []
-            sizes: list[list[int]] = []
-            chunks_per_group: list[list[tuple[int, int]]] = [
-                [] for _ in self.token_databases
-            ]
-            shards_per_group: list[list[StoreShardId]] = [
-                [] for _ in self.token_databases
-            ]
-            for start, end, g_idx, store_shard_id in zip(
-                starts,
-                ends,
-                group_indices,
-                store_shard_ids,
-                strict=True,
-            ):
-                chunks_per_group[g_idx].append((start, end))
-                shards_per_group[g_idx].append(store_shard_id)
-            for g_idx, chunks in enumerate(chunks_per_group):
-                if not chunks:
-                    continue
-                db = self.token_databases[g_idx]
-                group_addrs, group_sizes, _ = db.store_layout.prepare_values(
-                    chunks,
-                    block_ids_per_group[g_idx],
-                    shards_per_group[g_idx],
-                )
-                addrs.extend(group_addrs)
-                sizes.extend(group_sizes)
+            addrs, sizes = self._save_values(
+                req_meta, starts, ends, group_indices, store_shard_ids
+            )
 
             if current_event is not None:
                 current_event.synchronize()
@@ -924,12 +1608,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
             batch_bytes = _sum_batch_bytes(sizes)
             put_start = time.perf_counter()
             try:
-                res = self.store.batch_put_from_multi_buffers(
-                    keys,
-                    addrs,
-                    sizes,
-                    self.replicate_config,
-                )
+                res = self._put_buffers(keys, addrs, sizes, self.replicate_config)
             except Exception as e:
                 self._record_operation(
                     "save_put",
@@ -1041,6 +1720,8 @@ class KVCacheStoreSendingThread(KVTransferThread):
                     token_ids_start,
                     event_token_ids,
                 )
+            if self.staging is not None and token_len and not save_completed:
+                self._rewind_staged(req_meta)
             self.finish_store_job(req_meta)
             self.request_queue.task_done()
 
@@ -1061,6 +1742,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
         request_queue: queue.Queue[Any] | None = None,
         group_participates: Sequence[bool] | None = None,
         is_hma_required: bool = False,
+        frontiers: FrontierStore | None = None,
     ):
         super().__init__(
             store,
@@ -1072,6 +1754,8 @@ class KVCacheStoreRecvingThread(KVTransferThread):
             record_operation=record_operation,
             request_queue=request_queue,
         )
+        # frontier_write_through: loads that resume at a stored frontier.
+        self.frontiers = frontiers
         self.group_participates = (
             list(group_participates)
             if group_participates is not None
@@ -1120,7 +1804,58 @@ class KVCacheStoreRecvingThread(KVTransferThread):
             self._invalid_block_ids.clear()
         return invalid_block_ids
 
+    def _load_frontier(self, req_meta: ReqMeta) -> None:
+        """Load the pages after the local hit and the frontier's objects in
+        one batch; any failure fails the request's whole load, which the
+        scheduler then recomputes (kv_load_failure_policy recompute)."""
+        assert self.frontiers is not None
+        req_id = req_meta.req_id
+        keys: list[str] = []
+        block_ids: list[int] = []
+        batch_bytes = 0
+        start = time.perf_counter()
+        try:
+            keys, addrs, sizes, block_ids = self.frontiers.load_plan(req_meta)
+            batch_bytes = _sum_batch_bytes(sizes)
+            res = self.store.batch_get_into_multi_buffers(keys, addrs, sizes)
+            failed = [i for i, value in enumerate(res) if value < 0]
+            self._record_operation(
+                "frontier_get",
+                start,
+                len(keys),
+                num_bytes=batch_bytes,
+                status="partial_failure" if failed else "ok",
+                num_failed_keys=len(failed),
+            )
+            if failed:
+                self._report_load_error(req_id, [block_ids[i] for i in failed])
+                logger.warning(
+                    "Failed to get %d of %d frontier keys for request %s "
+                    "(first_failures=%s)",
+                    len(failed),
+                    len(keys),
+                    req_id,
+                    [(keys[i], res[i]) for i in failed[:3]],
+                )
+        except Exception as e:
+            self._report_load_error(req_id, block_ids)
+            self._record_operation(
+                "frontier_get",
+                start,
+                len(keys),
+                num_bytes=batch_bytes,
+                status="error",
+                num_failed_keys=len(keys),
+            )
+            logger.warning("Failed to get frontier keys for request %s: %s", req_id, e)
+        finally:
+            self.set_finished_request(req_id)
+            self.request_queue.task_done()
+
     def _handle_request(self, req_meta: ReqMeta):
+        if req_meta.load_spec is not None and req_meta.load_spec.frontier is not None:
+            self._load_frontier(req_meta)
+            return
         token_len = req_meta.load_spec.token_len  # type: ignore[union-attr]
         req_id = req_meta.req_id
         mask_num = (
@@ -1448,10 +2183,80 @@ class MooncakeStoreWorker:
         if preferred_segment == "self":
             preferred_segment = self.store.get_hostname()
             self.preferred_segment = preferred_segment
+        # lookup_newest_state (a fix to this connector, off by default): probe
+        # the state groups' keys from the deepest unit down and stop at the
+        # first hit. Every exist check grants a Mooncake lease, and the lease
+        # orders eviction; probing every unit keeps every per-turn state on the
+        # prompt's path as fresh as the prompt, and those superseded states then
+        # crowd whole sessions out of the store.
+        self._newest_state_lookup = _lookup_newest_state(extra_config)
+        if self._newest_state_lookup:
+            logger.info(
+                "Mooncake lookup probes state keys deepest first (lookup_newest_state)."
+            )
+        # frontier_write_through: Mamba frontier checkpoints in the store,
+        # with locator records upserted under a group-free config.
+        self._frontier_config = FrontierStoreConfig.from_vllm_config(vllm_config)
+        self._frontiers_on = self._frontier_config.write_through
+        # staging_buffer_mib: pinned staging each store job copies what it puts
+        # into, so its GPU blocks are freed before the puts.
+        self._staging_mib = _staging_buffer_mib(extra_config)
+        self._staging_wait_s = _staging_wait_s(extra_config)
+        if "staging_wait_s" in extra_config and not self._staging_mib:
+            raise ValueError("staging_wait_s needs staging_buffer_mib")
+        self._staging: StagingArea | None = None
+        self.frontiers: FrontierStore | None = None
+        self._locator_replicate_config = (
+            ReplicateConfig() if self._frontiers_on else None
+        )
+        # unit_policy_url: the master's recovery-unit eviction; each unit's
+        # objects are put under its id as their group.
+        self._store_units_on = self._frontier_config.unit_policy_url is not None
+        self._unit_replicate_config = (
+            ReplicateConfig() if self._store_units_on else None
+        )
+        self.store_units: StoreUnits | None = None
+        self.unit_client: UnitPolicyClient | None = None
+        if self._store_units_on and (
+            refusal := unit_policy_refusal(
+                self._supports_group_ids, self.enable_group_semantics
+            )
+        ):
+            raise ValueError(refusal)
+        # frontier_soft_pin_rest: pages and block-boundary states go out
+        # soft-pinned, frontier objects under a config of their own that leaves
+        # them unpinned.
+        self._frontier_replicate_config = None
+        if self._frontier_config.soft_pin_rest:
+            if not hasattr(self.store_replicate_config, "soft_pin_action"):
+                raise ValueError(
+                    "frontier_soft_pin_rest needs a Mooncake package with "
+                    "ReplicateConfig.soft_pin_action"
+                )
+            if self.enable_group_semantics:
+                raise ValueError(
+                    "frontier_soft_pin_rest and enable_group_semantics are exclusive"
+                )
+            from mooncake.store import SoftPinAction  # type: ignore
+
+            self.store_replicate_config.soft_pin_action = SoftPinAction.ENABLE
+            self._frontier_replicate_config = ReplicateConfig()
+            logger.info(
+                "Mooncake puts pages and block-boundary states soft-pinned, "
+                "frontier checkpoints unpinned (frontier_soft_pin_rest)."
+            )
         if preferred_segment is not None:
             self.store_replicate_config.preferred_segment = preferred_segment
+            if self._locator_replicate_config is not None:
+                self._locator_replicate_config.preferred_segment = preferred_segment
+            if self._unit_replicate_config is not None:
+                self._unit_replicate_config.preferred_segment = preferred_segment
+            if self._frontier_replicate_config is not None:
+                self._frontier_replicate_config.preferred_segment = preferred_segment
         if os.getenv("MOONCAKE_PREFER_SAME_NODE", "0") == "1":
             self.store_replicate_config.prefer_alloc_in_same_node = True
+            if self._frontier_replicate_config is not None:
+                self._frontier_replicate_config.prefer_alloc_in_same_node = True
             logger.info("Mooncake prefer_alloc_in_same_node=True")
 
         logger.info(
@@ -1551,6 +2356,19 @@ class MooncakeStoreWorker:
         )
         self.token_dbs = self._build_token_databases(metadata, store_layout_cls)
         self._init_lookup_key_prefixes()
+        if self._frontiers_on:
+            self.frontiers = self._build_frontier_store(metadata)
+        if self._store_units_on:
+            assert self.frontiers is not None
+            coefficients = self.cache_config.prefill_cost_coefficients
+            assert coefficients is not None
+            self.store_units = StoreUnits(
+                self.frontiers, PrefillCostModel(*coefficients)
+            )
+            if self.frontiers.writes_locators:
+                url = self._frontier_config.unit_policy_url
+                assert url is not None
+                self.unit_client = UnitPolicyClient(url)
 
     def _supports_tp_sharded_store_layout(
         self,
@@ -1744,6 +2562,66 @@ class MooncakeStoreWorker:
             for g_idx, db in enumerate(self.token_dbs)
         )
 
+    def _build_frontier_store(self, metadata: KeyMetadata) -> FrontierStore:
+        """``frontier_write_through``: the keys of frontier objects.
+        An indexer ring is no store group: each rank keeps its own copy under
+        a ring namespace and its KV-cache group id."""
+        ring_dbs: dict[int, ChunkedTokenDatabase] = {}
+        for group_id in ring_group_ids(self._kv_cache_config):
+            ring_size = self._kv_cache_config.kv_cache_groups[
+                group_id
+            ].kv_cache_spec.block_size
+            ring_dbs[group_id] = ChunkedTokenDatabase(
+                dataclasses.replace(
+                    metadata,
+                    group_id=group_id,
+                    store_namespace=f"{metadata.store_namespace}@{RING_NAMESPACE}",
+                ),
+                ring_size,
+                hash_block_size=ring_size,
+            )
+        rank_namespaces = tuple(
+            (tp_rank, pcp_rank, 0, pp_rank)
+            for pcp_rank in range(self.pcp_size)
+            for tp_rank in range(self.tp_size)
+            for pp_rank in range(self.pp_size)
+        )
+        prefix = f"{metadata.cache_prefix}@" if metadata.cache_prefix else ""
+        return FrontierStore(
+            self.token_dbs,
+            self._lookup_key_prefixes,
+            ring_dbs,
+            {
+                group_id: db.store_layout.lookup_key_prefixes(rank_namespaces)
+                for group_id, db in ring_dbs.items()
+            },
+            self.coord.mamba_group_ids,
+            self.block_size,
+            self.hash_block_size,
+            ring_unit(self._kv_cache_config),
+            f"{prefix}{metadata.model_name}{metadata.store_namespace}",
+            writes_locators=self.tp_rank == 0 and self.pp_rank == 0,
+            cache_locators=self._frontier_config.locator_cache,
+            state_size=self._mamba_block_size(),
+            remove_retry_s=self._frontier_config.remove_retry_s,
+        )
+
+    def _mamba_block_size(self) -> int | None:
+        """Tokens per Mamba block, which the model runner finds a request's
+        state block by; None without Mamba groups."""
+        sizes = {
+            self.coord.kv_cache_groups[g].kv_cache_spec.block_size
+            for g in self.coord.mamba_group_ids
+        }
+        if not sizes:
+            return None
+        if sizes != {self.cache_config.mamba_block_size}:
+            raise ValueError(
+                f"Mamba groups of {sorted(sizes)} tokens per block, but "
+                f"mamba_block_size is {self.cache_config.mamba_block_size}"
+            )
+        return sizes.pop()
+
     def register_kv_caches(
         self,
         kv_caches: dict[str, torch.Tensor],
@@ -1764,6 +2642,10 @@ class MooncakeStoreWorker:
         assert self.cache_config.num_gpu_blocks is not None
         self.num_blocks = self.cache_config.num_gpu_blocks
         use_group_regions = self._kv_cache_config.hisparse_host_num_blocks is not None
+        if use_group_regions and self.frontiers is not None:
+            raise ValueError(
+                "frontier_write_through needs one KV region for every group"
+            )
 
         if not use_group_regions:
             store_layer_names = {
@@ -1777,7 +2659,19 @@ class MooncakeStoreWorker:
                 for layer_name, cache in kv_caches.items()
                 if layer_name in store_layer_names
             ]
-            for cache in cache_tensors:
+            ring_tensors: dict[int, list[torch.Tensor]] = {}
+            if self.frontiers is not None:
+                for group_id in self.frontiers.ring_dbs:
+                    ring_tensors[group_id] = [
+                        group_kernel_blocks(
+                            _layer_views(kv_caches[layer_name])[0], self.num_blocks
+                        )
+                        for layer_name in self._kv_cache_config.kv_cache_groups[
+                            group_id
+                        ].layer_names
+                    ]
+            staging_regions: list[tuple[int, int, torch.Tensor]] = []
+            for cache in itertools.chain(cache_tensors, *ring_tensors.values()):
                 cache_storage = cache.untyped_storage()
                 base_addr = cache_storage.data_ptr()
                 if base_addr in seen_storage_ptrs:
@@ -1794,6 +2688,25 @@ class MooncakeStoreWorker:
                     )
                 else:
                     self._device_regions[base_addr] = region_len
+                if self._staging_mib:
+                    view = torch.empty(0, dtype=torch.uint8, device=cache.device)
+                    staging_regions.append(
+                        (base_addr, region_len, view.set_(cache_storage))
+                    )
+            if self._staging_mib and self.can_put:
+                self._staging = StagingArea(
+                    self.store,
+                    self._staging_mib << 20,
+                    staging_regions,
+                    cache_tensors[0].device if cache_tensors else None,
+                    self._staging_wait_s,
+                )
+                logger.info(
+                    "Mooncake store jobs copy their GPU bytes to %d MiB of pinned "
+                    "staging per rank and release their blocks before the puts "
+                    "(staging_buffer_mib).",
+                    self._staging_mib,
+                )
             for group, db in zip(self._kv_cache_groups, self.token_dbs, strict=True):
                 # In a hybrid model each KV cache group registers only its own
                 # layers. A group with no layers on this PP rank registers all.
@@ -1808,6 +2721,11 @@ class MooncakeStoreWorker:
                 db.store_layout.register_kv_caches(
                     group_caches or cache_tensors, self.num_blocks
                 )
+            if self.frontiers is not None:
+                for group_id, db in self.frontiers.ring_dbs.items():
+                    db.store_layout.register_kv_caches(
+                        ring_tensors[group_id], self.num_blocks
+                    )
 
         registered_buffers: dict[int, int] = {}
         num_host_segments = 0
@@ -1933,6 +2851,13 @@ class MooncakeStoreWorker:
                     group.kv_cache_spec.prefix_cacheable
                     for group in self._kv_cache_groups
                 ],
+                frontiers=self.frontiers,
+                locator_config=self._locator_replicate_config,
+                store_units=self.store_units,
+                unit_client=self.unit_client,
+                unit_replicate_config=self._unit_replicate_config,
+                staging=self._staging,
+                frontier_replicate_config=self._frontier_replicate_config,
             )
             self.kv_send_thread.start()
 
@@ -1955,6 +2880,7 @@ class MooncakeStoreWorker:
                     for group in self._kv_cache_groups
                 ],
                 is_hma_required=self._is_hma_required,
+                frontiers=self.frontiers,
             )
             recv_thread.name = f"KVCacheStoreRecvingThread-{i}"
             recv_thread.start()
@@ -1989,6 +2915,12 @@ class MooncakeStoreWorker:
         """
         if self._capacity_only:
             return
+
+        if self.unit_client is not None and metadata.unit_touches:
+            assert self.store_units is not None
+            self.unit_client.send(
+                [self.store_units.touch(key) for key in metadata.unit_touches]
+            )
 
         for request in metadata.requests:
             load_spec = request.load_spec
@@ -2134,9 +3066,12 @@ class MooncakeStoreWorker:
         if self.kv_send_thread is None:
             return None
         completed_saves = self.kv_send_thread.take_completed_saves()
-        if not completed_saves:
+        released_saves = self.kv_send_thread.take_released_saves()
+        if not completed_saves and not released_saves:
             return None
-        return MooncakeStoreWorkerMetadata(completed_saves=completed_saves)
+        return MooncakeStoreWorkerMetadata(
+            completed_saves=completed_saves, released_saves=released_saves
+        )
 
     def lookup(
         self, num_tokens: int, block_hashes: Sequence[BlockHash]
@@ -2160,6 +3095,9 @@ class MooncakeStoreWorker:
         candidate_meta: list[tuple[int, bytes]] = []
         fine_grained = self.coord.enable_partial_hash_hits
         lookup_masks = None if fine_grained else self.coord.lookup_mask(token_len)
+        newest = self._newest_state_lookup and fine_grained
+        # lookup_newest_state: state group -> units, probed after the others.
+        deferred: dict[int, int] = {}
         for g_idx, db in enumerate(self.token_dbs):
             if not self._kv_cache_groups[g_idx].kv_cache_spec.prefix_cacheable:
                 continue
@@ -2167,6 +3105,9 @@ class MooncakeStoreWorker:
             key_prefixes = self._lookup_key_prefixes[g_idx]
             if fine_grained:
                 max_units = min(len(block_hashes), token_len // self.hash_block_size)
+                if newest and g_idx in self.coord.mamba_group_ids:
+                    deferred[g_idx] = max_units
+                    continue
                 unit_ids: range | list[int] = range(max_units)
                 group_hashes: Sequence[BlockHash] = block_hashes
             else:
@@ -2194,43 +3135,36 @@ class MooncakeStoreWorker:
                     )
                 candidate_meta.append((g_idx, bytes(h)))
 
-        if not candidate_keys:
+        if not candidate_keys and not deferred:
             return MooncakeLookupResult(0)
 
-        lookup_start = time.perf_counter()
-        try:
-            res = self.store.batch_is_exist(candidate_keys)
-            self._record_kv_connector_operation(
-                "lookup_exists",
-                time.perf_counter() - lookup_start,
-                len(candidate_keys),
-            )
-        except Exception as e:
-            self._record_kv_connector_operation(
-                "lookup_exists",
-                time.perf_counter() - lookup_start,
-                len(candidate_keys),
-                status="error",
-                num_failed_keys=len(candidate_keys),
-            )
-            logger.error("Remote connection failed in lookup: %s", e)
+        exists_set: set[tuple[int, bytes]] = set()
+        if not self._probe_exists(candidate_keys, candidate_meta, exists_set):
             return MooncakeLookupResult(0)
-
-        # A (group, hash) is "present" only when every namespace that will be
-        # loaded has it (per-group count: sharded groups need every rank's
-        # shard, replicated groups one namespace per unique KV head).
-        exists_set = set()
-        pos = 0
-        for g_idx, hash_bytes in candidate_meta:
-            count = len(self._lookup_key_prefixes[g_idx])
-            if all(res[pos + j] == 1 for j in range(count)):
-                exists_set.add((g_idx, hash_bytes))
-            pos += count
 
         cached_block_pool = ExternalCachedBlockPool(
             self.hash_block_size,
             exists_set,
         )
+        if deferred:
+            newest_hit = self._newest_state_hit(
+                num_tokens,
+                token_len,
+                block_hashes,
+                deferred,
+                exists_set,
+                cached_block_pool,
+            )
+            if newest_hit is None:
+                return MooncakeLookupResult(0)
+            return MooncakeLookupResult(
+                newest_hit,
+                self._tail_key_boundaries(
+                    block_hashes,
+                    newest_hit,
+                    cached_block_pool,
+                ),
+            )
         _, hit_length = self.coord.find_longest_cache_hit(
             block_hashes,
             token_len,
@@ -2253,6 +3187,194 @@ class MooncakeStoreWorker:
                 cached_block_pool,
             ),
         )
+
+    def frontier_probe(
+        self,
+        num_tokens: int,
+        block_hashes: Sequence[BlockHash],
+        locators: list[bytes],
+    ) -> FrontierProbe:
+        """``frontier_write_through``: the entries of the locator records
+        that exist. The regular lookup also runs when none exists or, without
+        ``lookup_newest_state``, always, so it leases what it always did."""
+        assert self.frontiers is not None
+        keys = [self.frontiers.locator_key(locator) for locator in locators]
+        entries: list[tuple[int, bytes]] = []
+        start = time.perf_counter()
+        try:
+            exists = self.store.batch_is_exist(keys)
+            for key, present in zip(keys, exists, strict=True):
+                if present == 1:
+                    entries.extend(
+                        decode_locator(self.frontiers.read_record(self.store, key))
+                    )
+            self._record_kv_connector_operation(
+                "frontier_probe", time.perf_counter() - start, len(keys)
+            )
+        except Exception as e:
+            self._record_kv_connector_operation(
+                "frontier_probe",
+                time.perf_counter() - start,
+                len(keys),
+                status="error",
+                num_failed_keys=len(keys),
+            )
+            logger.error("Mooncake frontier probe failed: %s", e)
+            entries = []
+        regular = (
+            None
+            if entries and self._newest_state_lookup
+            else self.lookup(num_tokens, block_hashes)
+        )
+        return FrontierProbe(tuple(entries), regular)
+
+    def frontier_verify(
+        self,
+        num_tokens: int,
+        block_hashes: Sequence[BlockHash],
+        length: int,
+        first_block: int,
+        fallback: bool,
+        key: bytes,
+    ) -> MooncakeLookupResult | None:
+        """The frontier's hit when every object a load resuming at it needs exists
+        on every rank (each check leases it), else the regular lookup with
+        ``fallback`` or None."""
+        assert self.frontiers is not None
+        keys = self.frontiers.verify_keys(block_hashes, key, length, first_block)
+        start = time.perf_counter()
+        try:
+            exists = self.store.batch_is_exist(keys)
+            missing = sum(1 for present in exists if present != 1)
+            self._record_kv_connector_operation(
+                "frontier_verify",
+                time.perf_counter() - start,
+                len(keys),
+                num_failed_keys=missing,
+            )
+        except Exception as e:
+            self._record_kv_connector_operation(
+                "frontier_verify",
+                time.perf_counter() - start,
+                len(keys),
+                status="error",
+                num_failed_keys=len(keys),
+            )
+            logger.error("Mooncake frontier verify failed: %s", e)
+            missing = len(keys)
+        if not missing:
+            return MooncakeLookupResult(length, frontier=key)
+        return self.lookup(num_tokens, block_hashes) if fallback else None
+
+    def _probe_exists(
+        self,
+        keys: list[str],
+        meta: list[tuple[int, bytes]],
+        exists_set: set[tuple[int, bytes]],
+    ) -> bool:
+        """Add to ``exists_set`` each ``meta`` entry whose keys all exist.
+
+        A (group, hash) is "present" only when every namespace that will be
+        loaded has it (per-group count: sharded groups need every rank's
+        shard, replicated groups one namespace per unique KV head). False when
+        the store call fails.
+        """
+        if not keys:
+            return True
+        lookup_start = time.perf_counter()
+        try:
+            res = self.store.batch_is_exist(keys)
+            self._record_kv_connector_operation(
+                "lookup_exists",
+                time.perf_counter() - lookup_start,
+                len(keys),
+            )
+        except Exception as e:
+            self._record_kv_connector_operation(
+                "lookup_exists",
+                time.perf_counter() - lookup_start,
+                len(keys),
+                status="error",
+                num_failed_keys=len(keys),
+            )
+            logger.error("Remote connection failed in lookup: %s", e)
+            return False
+        pos = 0
+        for g_idx, hash_bytes in meta:
+            count = len(self._lookup_key_prefixes[g_idx])
+            if all(res[pos + j] == 1 for j in range(count)):
+                exists_set.add((g_idx, hash_bytes))
+            pos += count
+        return True
+
+    def _newest_state_hit(
+        self,
+        num_tokens: int,
+        token_len: int,
+        block_hashes: Sequence[BlockHash],
+        deferred: dict[int, int],
+        exists_set: set[tuple[int, bytes]],
+        cached_block_pool: ExternalCachedBlockPool,
+    ) -> int | None:
+        """``lookup_newest_state``: the official hit (``token_len``, then below
+        the request end when it covers every token), with the state groups'
+        keys probed from the deepest unit down and the other groups' keys
+        already in ``exists_set``.
+
+        A hit ends on a unit where every state group has a key, and with every
+        state assumed present the hit is at least as long. State units are
+        probed below that bound in batches (8 units, then twice as many each
+        time); the first batch that gives a hit gives the official hit, since
+        every deeper unit has been probed. Only the probed keys get a lease.
+        None when the store call fails.
+        """
+        hbs = self.hash_block_size
+        every_state = set(exists_set)
+        for g_idx, max_units in deferred.items():
+            every_state.update(
+                (g_idx, bytes(block_hashes[u])) for u in range(max_units)
+            )
+        optimistic = ExternalCachedBlockPool(hbs, every_state)
+        # State units at and above `probed` have been probed; the next batch
+        # probes `step` units below it.
+        probed = max(deferred.values())
+        step = 8
+
+        def deepest(max_length: int) -> int | None:
+            nonlocal probed, step
+            _, bound = self.coord.find_longest_cache_hit(
+                block_hashes, max_length, optimistic
+            )
+            if bound <= 0:
+                return 0
+            probed = min(probed, bound // hbs)
+            while True:
+                _, hit = self.coord.find_longest_cache_hit(
+                    block_hashes, max_length, cached_block_pool
+                )
+                if hit > 0 or probed == 0:
+                    return hit
+                lo = max(0, probed - step)
+                keys: list[str] = []
+                meta: list[tuple[int, bytes]] = []
+                for g_idx, max_units in deferred.items():
+                    for u in range(lo, min(probed, max_units)):
+                        h = block_hashes[u]
+                        hash_hex = h.hex()
+                        for key_prefix in self._lookup_key_prefixes[g_idx]:
+                            keys.append(PoolKey.build_key_string(key_prefix, hash_hex))
+                        meta.append((g_idx, bytes(h)))
+                if not self._probe_exists(keys, meta, exists_set):
+                    return None
+                probed, step = lo, step * 2
+
+        hit_length = deepest(token_len)
+        if hit_length is None or hit_length < num_tokens:
+            return hit_length
+        usable_length = self.coord.align_lookup_length(num_tokens - 1)
+        if usable_length <= 0:
+            return 0
+        return deepest(usable_length)
 
     def _tail_key_boundaries(
         self,
@@ -2333,6 +3455,10 @@ class MooncakeStoreWorker:
                     thread.name,
                     thread.request_queue.unfinished_tasks,
                 )
+        unit_client = getattr(self, "unit_client", None)
+        if unit_client is not None:
+            self.unit_client = None
+            unit_client.close()
         try:
             store.close()
         except Exception as e:
@@ -2376,41 +3502,72 @@ class LookupKeyServer:
 
         def process_request():
             while self.running:
-                all_frames = self.socket.recv_multipart(copy=False)
-                msg_type = bytes(all_frames[0])
-
-                if msg_type == LOOKUP_MSG:
-                    num_tokens = int.from_bytes(all_frames[1], byteorder="big")
-                    hash_len = int.from_bytes(all_frames[2], byteorder="big")
-                    blob = all_frames[3].buffer
-                    block_hashes = BlobBlockHashes(blob, hash_len)
-                    result = self.store_worker.lookup(num_tokens, block_hashes)
-                    self.socket.send(encode_lookup_response(result))
-
-                elif msg_type == RESET_MSG:
-                    try:
-                        # Drain in-flight puts before wiping the master;
-                        # otherwise stale puts can repopulate it post-reset.
-                        # Safe across HMA: store.remove_all wipes the underlying
-                        # flat key space, clearing every (group_id, hash) entry.
-                        if self.store_worker.kv_send_thread is not None:
-                            self.store_worker.kv_send_thread.request_queue.join()
-                        self.store_worker.store.remove_all(force=True)
-                        logger.info("Mooncake store reset via remove_all succeeded.")
-                        self.socket.send(RESP_OK)
-                    except Exception as e:
-                        logger.error("Mooncake remove_all failed: %s", e)
-                        self.socket.send(RESP_ERR)
-
-                else:
-                    logger.warning(
-                        "LookupKeyServer received unknown msg_type: %r",
-                        msg_type,
+                try:
+                    all_frames = self.socket.recv_multipart(copy=False)
+                except zmq.ContextTerminated:  # type: ignore[attr-defined]
+                    return
+                try:
+                    reply = self._reply(all_frames)
+                except Exception:
+                    # Every request gets a reply, so the REQ client is never
+                    # left waiting and this thread keeps serving.
+                    logger.exception(
+                        "LookupKeyServer failed to answer a %r request",
+                        bytes(all_frames[0]) if all_frames else b"",
                     )
-                    self.socket.send(RESP_ERR)
+                    reply = RESP_ERR
+                self.socket.send(reply)
 
         self.thread = threading.Thread(target=process_request, daemon=True)
         self.thread.start()
+
+    def _reply(self, all_frames: list[Any]) -> bytes:
+        msg_type = bytes(all_frames[0])
+        if msg_type == LOOKUP_MSG:
+            num_tokens = int.from_bytes(all_frames[1], byteorder="big")
+            hash_len = int.from_bytes(all_frames[2], byteorder="big")
+            blob = all_frames[3].buffer
+            block_hashes = BlobBlockHashes(blob, hash_len)
+            result = self.store_worker.lookup(num_tokens, block_hashes)
+            return encode_lookup_response(result)
+
+        if msg_type in (FRONTIER_PROBE_MSG, FRONTIER_VERIFY_MSG):
+            num_tokens = int.from_bytes(all_frames[1], byteorder="big")
+            hash_len = int.from_bytes(all_frames[2], byteorder="big")
+            block_hashes = BlobBlockHashes(all_frames[3].buffer, hash_len)
+            if msg_type == FRONTIER_PROBE_MSG:
+                locators = decode_frontier_locators(
+                    bytes(all_frames[4].buffer), bytes(all_frames[5].buffer)
+                )
+                probe = self.store_worker.frontier_probe(
+                    num_tokens, block_hashes, locators
+                )
+                return encode_frontier_probe(probe)
+            length, first_block, fallback, key = decode_frontier_verify(
+                bytes(all_frames[4].buffer)
+            )
+            verified = self.store_worker.frontier_verify(
+                num_tokens, block_hashes, length, first_block, fallback, key
+            )
+            return encode_frontier_verified(verified)
+
+        if msg_type == RESET_MSG:
+            try:
+                # Drain in-flight puts before wiping the master;
+                # otherwise stale puts can repopulate it post-reset.
+                # Safe across HMA: store.remove_all wipes the underlying
+                # flat key space, clearing every (group_id, hash) entry.
+                if self.store_worker.kv_send_thread is not None:
+                    self.store_worker.kv_send_thread.request_queue.join()
+                self.store_worker.store.remove_all(force=True)
+                logger.info("Mooncake store reset via remove_all succeeded.")
+                return RESP_OK
+            except Exception as e:
+                logger.error("Mooncake remove_all failed: %s", e)
+                return RESP_ERR
+
+        logger.warning("LookupKeyServer received unknown msg_type: %r", msg_type)
+        return RESP_ERR
 
     def close(self):
         self.socket.close(linger=0)
@@ -2434,12 +3591,20 @@ class LookupKeyClient:
     def __init__(self, vllm_config: VllmConfig):
         self.ctx = zmq.Context()  # type: ignore[attr-defined]
         socket_path = get_zmq_rpc_path_lookup(vllm_config)
+        assert vllm_config.kv_transfer_config is not None
+        extra_config = vllm_config.kv_transfer_config.kv_connector_extra_config
+        self.timeout_ms = round(1000 * _lookup_timeout_s(extra_config))
         self.socket = make_zmq_socket(
             self.ctx,
             socket_path,
             zmq.REQ,  # type: ignore[attr-defined]
             bind=False,
         )
+        # A request without a reply in time fails; the socket then sends the
+        # next one and drops the late reply.
+        self.socket.setsockopt(zmq.REQ_RELAXED, 1)  # type: ignore[attr-defined]
+        self.socket.setsockopt(zmq.REQ_CORRELATE, 1)  # type: ignore[attr-defined]
+        self.socket.setsockopt(zmq.RCVTIMEO, self.timeout_ms)  # type: ignore[attr-defined]
 
         # Async lookup support
         self.executor = ThreadPoolExecutor(
@@ -2450,16 +3615,63 @@ class LookupKeyClient:
     def _lookup(
         self, num_tokens: int, block_hashes: list[BlockHash]
     ) -> MooncakeLookupResult:
-        hash_len = len(block_hashes[0]) if block_hashes else 0
-        all_frames = (
-            LOOKUP_MSG,
-            num_tokens.to_bytes(4, byteorder="big"),
-            hash_len.to_bytes(2, byteorder="big"),
-            b"".join(block_hashes),
+        self.socket.send_multipart(
+            (LOOKUP_MSG, *_hash_frames(num_tokens, block_hashes)), copy=False
         )
-        self.socket.send_multipart(all_frames, copy=False)
-        resp = self.socket.recv()
-        return decode_lookup_response(resp)
+        return decode_lookup_response(self._recv())
+
+    def _recv(self) -> bytes:
+        try:
+            return self.socket.recv()
+        except zmq.Again:  # type: ignore[attr-defined]
+            raise TimeoutError(
+                "no reply from the Mooncake lookup server within "
+                f"{self.timeout_ms / 1000:g} s (lookup_timeout_s)"
+            ) from None
+
+    def lookup_now(
+        self, num_tokens: int, block_hashes: Sequence[BlockHash]
+    ) -> MooncakeLookupResult:
+        """The regular lookup, from a function ``run`` executes."""
+        return self._lookup(num_tokens, list(block_hashes))
+
+    def frontier_probe(
+        self,
+        num_tokens: int,
+        block_hashes: Sequence[BlockHash],
+        locators: list[bytes],
+    ) -> FrontierProbe:
+        """The entries of the locator records that exist
+        (``frontier_write_through``), from a function ``run``
+        executes."""
+        frames = (
+            FRONTIER_PROBE_MSG,
+            *_hash_frames(num_tokens, list(block_hashes)),
+            len(locators[0]).to_bytes(2, byteorder="big"),
+            b"".join(locators),
+        )
+        self.socket.send_multipart(frames, copy=False)
+        return decode_frontier_probe(self._recv())
+
+    def frontier_verify(
+        self,
+        num_tokens: int,
+        block_hashes: Sequence[BlockHash],
+        length: int,
+        first_block: int,
+        fallback: bool,
+        key: bytes,
+    ) -> MooncakeLookupResult | None:
+        """The frontier's hit when every object its load needs exists, else the
+        regular lookup (``fallback``) or None; from a function ``run``
+        executes."""
+        frames = (
+            FRONTIER_VERIFY_MSG,
+            *_hash_frames(num_tokens, list(block_hashes)),
+            encode_frontier_verify(length, first_block, fallback, key),
+        )
+        self.socket.send_multipart(frames, copy=False)
+        return decode_frontier_verified(self._recv(), length, key)
 
     def lookup(
         self,
@@ -2470,9 +3682,21 @@ class LookupKeyClient:
     ) -> MooncakeLookupResult | None:
         """If non_block is True, will return None until the result is ready,
         so the caller retries on a later step."""
+        return self.run(
+            req_id, lambda: self._lookup(num_tokens, list(block_hashes)), non_block
+        )
+
+    def run(
+        self,
+        req_id: str,
+        fn: Callable[[], MooncakeLookupResult],
+        non_block: bool = False,
+    ) -> MooncakeLookupResult | None:
+        """Run ``fn``, a lookup over this client's socket, on the client's
+        thread; with ``non_block``, None until it has finished."""
         future = self.futures.get(req_id)
         if future is None:
-            future = self.executor.submit(self._lookup, num_tokens, list(block_hashes))
+            future = self.executor.submit(fn)
             self.futures[req_id] = future
         if non_block and not future.done():
             return None
@@ -2499,7 +3723,12 @@ class LookupKeyClient:
         rollout drain. Returns True on ACK, False on NACK.
         """
         self.socket.send(RESET_MSG)
-        resp = self.socket.recv()
+        # The server drains the in-flight puts first, however long they take.
+        self.socket.setsockopt(zmq.RCVTIMEO, -1)  # type: ignore[attr-defined]
+        try:
+            resp = self.socket.recv()
+        finally:
+            self.socket.setsockopt(zmq.RCVTIMEO, self.timeout_ms)  # type: ignore[attr-defined]
         return bytes(resp) == RESP_OK
 
     def reset(self) -> bool:
@@ -2508,6 +3737,19 @@ class LookupKeyClient:
     def close(self):
         self.executor.shutdown(wait=False, cancel_futures=True)
         self.socket.close(linger=0)
+
+
+def _hash_frames(
+    num_tokens: int, block_hashes: list[BlockHash]
+) -> tuple[bytes, bytes, bytes]:
+    """LOOKUP_MSG's frames 1-3: the token count, the hash length and the
+    hashes."""
+    hash_len = len(block_hashes[0]) if block_hashes else 0
+    return (
+        num_tokens.to_bytes(4, byteorder="big"),
+        hash_len.to_bytes(2, byteorder="big"),
+        b"".join(block_hashes),
+    )
 
 
 def get_zmq_rpc_path_lookup(vllm_config: VllmConfig) -> str:

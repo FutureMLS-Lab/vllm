@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm.model_executor.models.interfaces import supports_compact_spec_state
 from vllm.models.glm5next.common.kda import Glm5NextLinearAttention
 from vllm.models.glm5next.common.model import (
     Glm5NextForCausalLM,
@@ -39,3 +40,37 @@ def test_kda_recurrent_state_dtype_follows_ssm_cache_dtype(ssm_dtype, expected):
     layer = Glm5NextLinearAttention.__new__(Glm5NextLinearAttention)
     layer.model_config, layer.cache_config = model_config, cache_config
     assert layer.get_state_dtype() == want
+
+
+def test_compact_spec_state_keeps_the_state_page():
+    """``mamba_spec_state_layout`` "compact" (RecoverSSM verify) leaves the
+    state page as it is: the verify records live outside the KV cache."""
+    hf_config = SimpleNamespace(
+        linear_num_heads=4, linear_head_dim=32, linear_conv_kernel_dim=4
+    )
+
+    def vllm_config(use_kda_recoverssm: bool) -> SimpleNamespace:
+        return SimpleNamespace(
+            model_config=SimpleNamespace(
+                dtype=torch.bfloat16, hf_text_config=hf_config
+            ),
+            cache_config=SimpleNamespace(
+                mamba_cache_dtype="auto",
+                mamba_ssm_cache_dtype="auto",
+                use_kda_recoverssm=use_kda_recoverssm,
+            ),
+            parallel_config=SimpleNamespace(tensor_parallel_size=1),
+            speculative_config=SimpleNamespace(num_speculative_tokens=3),
+        )
+
+    for model_cls in (Glm5NextForCausalLM, Glm5NextForConditionalGeneration):
+        assert supports_compact_spec_state(model_cls)
+        for get in (
+            model_cls.get_mamba_state_dtype_from_config,
+            model_cls.get_mamba_state_shape_from_config,
+        ):
+            assert get(vllm_config(True)) == get(vllm_config(False))
+        assert model_cls.get_mamba_state_dtype_from_config(vllm_config(True)) == (
+            torch.bfloat16,
+            torch.float32,
+        )

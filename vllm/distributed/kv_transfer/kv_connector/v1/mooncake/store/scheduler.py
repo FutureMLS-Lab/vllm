@@ -5,6 +5,7 @@
 # (vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/).
 """Scheduler-side logic for MooncakeStoreConnector."""
 
+import time
 from collections.abc import Sequence
 
 from vllm.config import VllmConfig
@@ -16,19 +17,36 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.coordinator imp
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (  # noqa: E501
     BoundaryPut,
+    FrontierLoad,
+    FrontierPut,
     LoadSpec,
+    MooncakeLookupResult,
     MooncakeStoreConnectorMetadata,
     MooncakeStoreWorkerMetadata,
     ReqMeta,
     RequestTracker,
+    StoreUnit,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.frontier import (  # noqa: E501
+    FrontierLookup,
+    FrontierStoreConfig,
+    ring_group_ids,
+    ring_unit,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.worker import (  # noqa: E501
     LookupKeyClient,
 )
 from vllm.logger import init_logger
+from vllm.utils.hashing import get_hash_fn_by_name
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 from vllm.v1.core.block_pool import BlockPool
+from vllm.v1.core.hybrid_checkpoint.frontier import FrontierCheckpoint
+from vllm.v1.core.hybrid_checkpoint.keys import (
+    FRONTIER_LOCATOR_TOKENS,
+    frontier_locator_key,
+    frontier_locator_unit,
+)
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.kv_cache_utils import (
     resolve_kv_cache_block_sizes,
@@ -43,6 +61,15 @@ from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request
 
 logger = init_logger(__name__)
+
+# frontier_supersede_lag and frontier_keep_states: chains of frontiers kept,
+# the oldest dropped first.
+_SUPERSEDE_CHAINS = 4096
+
+# frontier_keep_states: a recurrent checkpoint of a session's chain: its
+# position, the key of the frontier there (None: boundary states only) and the
+# store group ids of the boundary states there.
+_Checkpoint = tuple[int, bytes | None, tuple[int, ...]]
 
 
 def _new_req_prefill_tokens(request: NewRequestData) -> list[int]:
@@ -196,6 +223,10 @@ class MooncakeStoreScheduler:
         self._next_store_job_id = 0
         # store_job_id -> (referenced block ids, ranks yet to report completion)
         self._pinned_saves: dict[int, tuple[list[int], int]] = {}
+        # staging_buffer_mib: store_job_id -> ranks yet to report the
+        # job's blocks released, and the jobs whose blocks are already free.
+        self._unreleased: dict[int, int] = {}
+        self._released_jobs: set[int] = set()
 
         # Per-request state
         self.load_specs: dict[str, LoadSpec] = {}  # to be loaded
@@ -203,6 +234,83 @@ class MooncakeStoreScheduler:
         self._unfinished_requests: dict[str, tuple[Request, tuple[list[int], ...]]] = {}
         self._unfinished_request_ids: set[str] = set()
         self._finished_partial_tail_metas: dict[str, ReqMeta] = {}
+
+        # frontier_write_through: lookups also find stored Mamba frontier
+        # checkpoints, and finished requests' frontiers become store jobs.
+        self._frontiers: FrontierLookup | None = None
+        self._ring_group_ids = ring_group_ids(kv_cache_config)
+        self._ring_unit = ring_unit(kv_cache_config)
+        self._finished_frontier_metas: list[ReqMeta] = []
+        self._frontier_config = FrontierStoreConfig.from_vllm_config(vllm_config)
+        # frontier_supersede_remove: request id -> (key, length) of the
+        # frontier it resumed from, and (store group id, tokens) of the
+        # boundary states it stored.
+        self._supersede = False
+        self._resumed_frontiers: dict[str, tuple[bytes, int]] = {}
+        self._boundary_tokens: dict[str, set[tuple[int, int]]] = {}
+        if self._frontier_config.write_through and not self._capacity_only:
+            self._frontiers = FrontierLookup(
+                self.client,
+                self._block_size,
+                self._hash_block_size,
+                get_hash_fn_by_name(vllm_config.cache_config.prefix_caching_hash_algo),
+                memo_s=self._frontier_config.lookup_memo_s,
+                reuse_s=self._frontier_config.lookup_reuse_s,
+            )
+            self._supersede = self._frontier_config.supersede_remove
+        # frontier_supersede_states: false keeps the boundary states.
+        self._supersede_states = self._frontier_config.supersede_states
+        # frontier_load_local_pages: a stored frontier's load skips the pages
+        # the GPU caches.
+        self._load_local_pages = (
+            self._frontiers is not None and self._frontier_config.load_local_pages
+        )
+        # unit_policy_url: request id -> (key, position) of the deepest store
+        # unit on its path (the one it resumed at, then each unit it wrote),
+        # its last lookup's (local hit, store hit, frontier key), and the keys
+        # of the units admitted requests resumed at.
+        self._store_units = (
+            self._frontiers is not None
+            and self._frontier_config.unit_policy_url is not None
+        )
+        self._unit_frontier: dict[str, tuple[bytes, int]] = {}
+        self._unit_lookups: dict[str, tuple[int, int, bytes | None]] = {}
+        self._unit_touches: list[bytes] = []
+        # frontier_write_wait_s: the frontiers whose write job has not
+        # completed on every rank, key -> (length, the writer's hash at the
+        # frontier's anchor unit, finish time), the job writing each, and the
+        # requests that waited for one and have not been looked up since.
+        self._write_wait_s = (
+            self._frontier_config.write_wait_s if self._frontiers is not None else 0.0
+        )
+        self._writing_frontiers: dict[bytes, tuple[int, bytes | None, float]] = {}
+        self._frontier_jobs: dict[int, bytes] = {}
+        self._frontier_waiters: set[str] = set()
+        # frontier_supersede_lag: by the key of a session's newest frontier,
+        # what its chain's last finishes would have superseded (oldest first),
+        # each emitted ``lag`` finishes later.
+        self._supersede_lag = (
+            self._frontier_config.supersede_lag if self._supersede else 0
+        )
+        self._supersede_queue: dict[
+            bytes,
+            list[tuple[tuple[tuple[bytes, int], ...], tuple[tuple[int, int], ...]]],
+        ] = {}
+        # frontier_keep_states: by the key of a session's newest frontier, the
+        # request hash at its anchor unit, the prompt length of the chain's
+        # first request and the checkpoints its chain holds in the store past
+        # that prompt, deepest last; by anchor hash, the newest frontiers
+        # anchored there.
+        self._keep_states = (
+            self._frontier_config.keep_states if self._frontiers is not None else 0
+        )
+        self._keep_margin = self._frontier_config.keep_margin_tokens
+        self._chains: dict[bytes, tuple[bytes, int, list[_Checkpoint]]] = {}
+        self._chain_heads: dict[bytes, list[bytes]] = {}
+
+    @property
+    def stores_frontiers(self) -> bool:
+        return self._frontiers is not None
 
     def bind_gpu_block_pool(self, gpu_block_pool: BlockPool) -> None:
         self._gpu_block_pool = gpu_block_pool
@@ -228,16 +336,52 @@ class MooncakeStoreScheduler:
         if request.num_tokens < align:
             return 0, False
 
-        lookup_result = self.client.lookup(
-            request.request_id,
-            request.num_tokens,
-            request.block_hashes,
-            non_block=self.lookup_async,
-        )
+        if self._frontiers is not None:
+            lookup_result = self._frontiers.lookup(
+                request, num_computed_tokens, non_block=self.lookup_async
+            )
+        else:
+            lookup_result = self.client.lookup(
+                request.request_id,
+                request.num_tokens,
+                request.block_hashes,
+                non_block=self.lookup_async,
+            )
         if lookup_result is None:
             # Lookup not ready yet; scheduler will retry on a later step.
             return None, False
         num_external_hit_tokens = lookup_result.hit_length
+        if self._frontiers is not None and self._frontiers.record_paths:
+            path, elapsed_ms = self._frontiers.paths.pop(
+                request.request_id, ("none", 0.0)
+            )
+            logger.debug(
+                "Mooncake frontier lookup: req=%s tokens=%d local=%d path=%s "
+                "ms=%.1f hit=%d frontier=%d",
+                request.request_id,
+                request.num_tokens,
+                num_computed_tokens,
+                path,
+                elapsed_ms,
+                num_external_hit_tokens,
+                lookup_result.frontier is not None,
+            )
+        if request.request_id in self._frontier_waiters:
+            self._frontier_waiters.discard(request.request_id)
+            assert self._frontiers is not None
+            hit = (
+                lookup_result.frontier is not None
+                and num_external_hit_tokens > num_computed_tokens
+            )
+            self._frontiers.counts["waited_hits" if hit else "waited_misses"] += 1
+        if self._supersede:
+            self._note_resumed_frontier(request, num_computed_tokens, lookup_result)
+        if self._store_units:
+            self._unit_lookups[request.request_id] = (
+                num_computed_tokens,
+                num_external_hit_tokens,
+                lookup_result.frontier,
+            )
 
         if num_external_hit_tokens < num_computed_tokens:
             need_to_allocate = 0
@@ -260,9 +404,109 @@ class MooncakeStoreScheduler:
             kvpool_cached_tokens=num_external_hit_tokens,
             can_load=False,
             tail_key_boundaries=lookup_result.tail_key_boundaries,
+            frontier=(
+                None
+                if lookup_result.frontier is None
+                else FrontierLoad(lookup_result.frontier, num_external_hit_tokens)
+            ),
         )
 
         return need_to_allocate, self.load_async
+
+    def _note_resumed_frontier(
+        self, request: Request, local: int, result: MooncakeLookupResult
+    ) -> None:
+        """``frontier_supersede_remove``: the stored frontier a request loads
+        and resumes from. A local hit reaches the connector block-aligned, so
+        a frontier the request resumes from on the GPU is not seen here."""
+        if result.frontier is not None and result.hit_length > local:
+            self._resumed_frontiers[request.request_id] = (
+                bytes(result.frontier),
+                result.hit_length,
+            )
+        else:
+            self._resumed_frontiers.pop(request.request_id, None)
+
+    def _note_resume_unit(self, request: Request, position: int) -> None:
+        """``unit_policy_url``: the request starts computing at ``position``,
+        its resume point: the frontier its lookup found in the store or on the
+        GPU (inside a hash unit only a frontier), else the state at that hash
+        unit. A use of that unit, and the parent of the first unit the request
+        writes. The connector's lookup sees only the block-aligned local hit,
+        so the position comes from the schedule."""
+        assert self._frontiers is not None
+        req_id = request.request_id
+        lookup = self._unit_lookups.pop(req_id, None)
+        self._unit_frontier.pop(req_id, None)
+        if position == 0:
+            return
+        unit = self._hash_block_size
+        if lookup is not None and lookup[1] == position and lookup[2] is not None:
+            key = lookup[2]
+        elif position % unit:
+            key = self._frontiers.key_at(request, position)
+        else:
+            key = request.block_hashes[position // unit - 1]
+        self._unit_frontier[req_id] = (bytes(key), position)
+        self._unit_touches.append(bytes(key))
+
+    def _next_unit(
+        self, req_id: str, key: bytes, position: int, frontier: bool
+    ) -> StoreUnit:
+        """``unit_policy_url``: the unit a job of ``req_id`` writes at
+        ``position``, under the request's deepest store unit before it."""
+        deepest = self._unit_frontier.get(req_id)
+        parent = deepest[0] if deepest is not None and deepest[1] < position else None
+        self._unit_frontier[req_id] = (key, position)
+        return StoreUnit(key, position, parent, frontier)
+
+    def frontier_load_length(self, request: Request) -> int | None:
+        """``frontier_load_local_pages``: the length of the stored frontier the
+        request's pending load resumes at, or None."""
+        load_spec = self.load_specs.get(request.request_id)
+        if (
+            not self._load_local_pages
+            or load_spec is None
+            or load_spec.frontier is None
+        ):
+            return None
+        return load_spec.kvpool_cached_tokens
+
+    def move_frontier_load_start(self, request: Request, num_tokens: int) -> None:
+        """``frontier_load_local_pages``: the request takes the full pages
+        before ``num_tokens`` (on the block grid, past its lookup's local hit,
+        at most the frontier's block start) from the GPU's cache, so its
+        pending load reads only the pages from there and the frontier."""
+        load_spec = self.load_specs[request.request_id]
+        assert load_spec.frontier is not None
+        block_start = load_spec.frontier.length // self._block_size * self._block_size
+        assert num_tokens % self._block_size == 0, num_tokens
+        assert load_spec.vllm_cached_tokens < num_tokens <= block_start, (
+            load_spec.vllm_cached_tokens,
+            num_tokens,
+            block_start,
+        )
+        load_spec.vllm_cached_tokens = num_tokens
+        logger.debug(
+            "Mooncake frontier load: req=%s starts at %d of %d (the pages before "
+            "it are cached)",
+            request.request_id,
+            num_tokens,
+            load_spec.frontier.length,
+        )
+
+    def frontier_ring_groups(self, request: Request) -> tuple[int, ...]:
+        """The indexer-ring groups a pending load resuming at a stored
+        frontier writes: every ring, unless the frontier ends on a pool
+        boundary."""
+        load_spec = self.load_specs.get(request.request_id)
+        if (
+            load_spec is None
+            or load_spec.frontier is None
+            or load_spec.frontier.length % self._ring_unit == 0
+        ):
+            return ()
+        return self._ring_group_ids
 
     def update_state_after_alloc(
         self,
@@ -300,6 +544,12 @@ class MooncakeStoreScheduler:
         )
 
         self.load_specs[request.request_id].can_load = True
+        frontier = self.load_specs[request.request_id].frontier
+        if frontier is not None and (rings := self.frontier_ring_groups(request)):
+            all_block_ids = blocks.get_block_ids()
+            frontier.rings = tuple(
+                (group_id, all_block_ids[group_id][0]) for group_id in rings
+            )
 
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput
@@ -314,6 +564,14 @@ class MooncakeStoreScheduler:
             self._request_trackers.pop(finished_req_id, None)
             self._unfinished_requests.pop(finished_req_id, None)
             self._unfinished_request_ids.discard(finished_req_id)
+            self._resumed_frontiers.pop(finished_req_id, None)
+            self._boundary_tokens.pop(finished_req_id, None)
+            self._unit_frontier.pop(finished_req_id, None)
+            self._unit_lookups.pop(finished_req_id, None)
+            self._frontier_waiters.discard(finished_req_id)
+            if self._frontiers is not None:
+                self._frontiers.forget(finished_req_id)
+                self._frontiers.paths.pop(finished_req_id, None)
 
         preempted_ids = scheduler_output.preempted_req_ids or set()
         for req_id in preempted_ids:
@@ -321,11 +579,14 @@ class MooncakeStoreScheduler:
             if request_tracker := self._request_trackers.get(req_id):
                 request_tracker.reset()
             self._unfinished_requests.pop(req_id, None)
+            self._unit_frontier.pop(req_id, None)
 
         meta = MooncakeStoreConnectorMetadata(
             self._unfinished_request_ids,
             preempted_ids,
         )
+        if self._unit_touches:
+            meta.unit_touches, self._unit_touches = self._unit_touches, []
 
         # Handle new requests
         for request in scheduler_output.scheduled_new_reqs:
@@ -337,6 +598,8 @@ class MooncakeStoreScheduler:
             assert request.req_id in self._unfinished_requests
             request_tuple = self._unfinished_requests.get(request.req_id)
             request_real = request_tuple[0]  # type: ignore[index]
+            if self._store_units:
+                self._note_resume_unit(request_real, request.num_computed_tokens)
 
             unfolded_block_ids = tuple(
                 request.block_ids[group_id].copy() for group_id in self._store_group_ids
@@ -390,6 +653,10 @@ class MooncakeStoreScheduler:
                     load_spec = self.load_specs.pop(req_id, None)
                     request_tuple = self._unfinished_requests.get(req_id)
                     request_real = request_tuple[0]  # type: ignore[index]
+                    if self._store_units:
+                        self._note_resume_unit(
+                            request_real, request_real.num_computed_tokens
+                        )
                     num_tokens_to_compute = (
                         request_real.num_computed_tokens
                         + scheduler_output.num_scheduled_tokens[req_id]
@@ -519,10 +786,34 @@ class MooncakeStoreScheduler:
         for req_meta in self._finished_partial_tail_metas.values():
             meta.add_request(req_meta)
         self._finished_partial_tail_metas.clear()
+        self._emit_finished_frontiers(meta, scheduler_output)
 
         if not self._capacity_only:
             self._reference_save_blocks(meta)
         return meta
+
+    def _emit_finished_frontiers(
+        self,
+        meta: MooncakeStoreConnectorMetadata,
+        scheduler_output: SchedulerOutput,
+    ) -> None:
+        """Queued frontier jobs go out with this step. A job whose state waits
+        for a draft-column gather needs this step to run it: a step runs its
+        state gathers before any store job reads."""
+        gathers = scheduler_output.mamba_state_gathers or ()
+        gathered = {block_id for g in gathers for block_id in g.dst_block_ids}
+        sources = {block_id for g in gathers for block_id in g.src_block_ids}
+        for req_meta in self._finished_frontier_metas:
+            frontier = req_meta.frontier
+            assert frontier is not None
+            assert gathered.issuperset(frontier.gathered_block_ids), (
+                f"frontier job of {req_meta.req_id} without its state gather"
+            )
+            assert not sources.intersection(b for _, b in frontier.blocks), (
+                f"frontier job of {req_meta.req_id} reads a draft column"
+            )
+            meta.add_request(req_meta)
+        self._finished_frontier_metas.clear()
 
     def _apply_current_save_block_ids(
         self,
@@ -639,6 +930,15 @@ class MooncakeStoreScheduler:
             boundary_puts=mamba_puts,
             completed_token_len=request.num_computed_tokens,
         )
+        if self._store_units:
+            key = bytes(
+                request.block_hashes[boundary_tokens // self._hash_block_size - 1]
+            )
+            req_meta.store_units = (
+                self._next_unit(
+                    request.request_id, key, boundary_tokens, frontier=False
+                ),
+            )
         coord = self._store_coord
         assert coord is not None
         req_meta.boundary_puts = [
@@ -667,6 +967,300 @@ class MooncakeStoreScheduler:
         self._finished_partial_tail_metas[request.request_id] = req_meta
         tracker.has_pending_offload = True
         # The store job owns exact block refs, so request cleanup need not wait.
+        return False
+
+    def register_finished_frontier(
+        self, request: Request, frontier: FrontierCheckpoint
+    ) -> None:
+        """``frontier_write_through``: queue and pin a finished request's
+        frontier checkpoint for the next connector step: its full pages from
+        the first block its normal saves did not cover, under their block
+        hashes, then the frontier's blocks under its key. A frontier shorter
+        than ``FRONTIER_LOCATOR_TOKENS`` has no locator and is not stored."""
+        if self._frontiers is None or frontier.num_tokens < FRONTIER_LOCATOR_TOKENS:
+            return
+        length = frontier.num_tokens
+        tracker = self._request_trackers.get(request.request_id)
+        first = tracker.num_saved_tokens // self._block_size if tracker else 0
+        k = length // self._block_size
+        store_group = self._store_group_id_by_kv_cache_group_id
+        pages = [
+            BoundaryPut(store_group[group_id], block_ids[i], (i + 1) * self._block_size)
+            for group_id, block_ids in frontier.pages.items()
+            for i in range(first, k)
+        ]
+        blocks = tuple(
+            (store_group[group_id], block_id)
+            for group_id, block_id in frontier.blocks.items()
+            if group_id in store_group
+        )
+        rings = tuple(
+            (group_id, block_id)
+            for group_id, block_id in frontier.blocks.items()
+            if group_id not in store_group
+        )
+        gathered: tuple[int, ...] = ()
+        if frontier.gathered:
+            assert self._store_coord is not None
+            mamba_groups = self._store_coord.mamba_group_ids
+            gathered = tuple(
+                block_id for group_id, block_id in blocks if group_id in mamba_groups
+            )
+        # frontier_supersede_remove: everything the request stored past the
+        # frontier it resumed from follows the session's own frontier.
+        supersedes: tuple[tuple[bytes, int], ...] = ()
+        states: tuple[tuple[int, int], ...] = ()
+        resumed = (
+            self._resumed_frontiers.get(request.request_id) if self._supersede else None
+        )
+        if resumed is not None and resumed[1] < length:
+            supersedes = (resumed,)
+        if supersedes and self._supersede_states:
+            assert resumed is not None
+            states = tuple(
+                sorted(
+                    (group_id, tokens)
+                    for group_id, tokens in self._boundary_tokens.get(
+                        request.request_id, ()
+                    )
+                    if resumed[1] < tokens <= length
+                )
+            )
+        if self._supersede_lag:
+            supersedes, states = self._lag_supersede(
+                resumed, bytes(frontier.key), supersedes, states
+            )
+        if self._keep_states:
+            supersedes, states = self._keep_newest(request, bytes(frontier.key), length)
+        locator = frontier_locator_key(
+            self._frontiers.hash_fn,
+            request,
+            frontier_locator_unit(length, self._hash_block_size),
+            self._hash_block_size,
+        )
+        req_meta = ReqMeta(
+            req_id=request.request_id,
+            token_len_chunk=0,
+            block_ids=tuple([] for _ in self._store_group_ids),
+            block_hashes=list(request.block_hashes),
+            can_save=True,
+            num_prompt_tokens=request.num_prompt_tokens,
+            boundary_puts=pages,
+            completed_token_len=length,
+            frontier=FrontierPut(
+                key=bytes(frontier.key),
+                length=length,
+                locator=bytes(locator),
+                blocks=blocks,
+                rings=rings,
+                supersedes=supersedes,
+                superseded_states=states,
+                gathered_block_ids=gathered,
+            ),
+        )
+        if self._store_units:
+            req_meta.store_units = (
+                self._next_unit(
+                    request.request_id, bytes(frontier.key), length, frontier=True
+                ),
+            )
+        pinned = list(
+            dict.fromkeys(
+                [put.block_id for put in pages]
+                + [block_id for _, block_id in blocks + rings]
+            )
+        )
+        pool = self._gpu_block_pool
+        assert pool is not None, (
+            "GPU block pool must be bound before a finish-time handoff"
+        )
+        req_meta.store_job_id = store_job_id = self._next_store_job_id
+        self._next_store_job_id += 1
+        self._pinned_saves[store_job_id] = (pinned, self._num_workers)
+        pool.touch([pool.blocks[block_id] for block_id in pinned])
+        self._finished_frontier_metas.append(req_meta)
+        if self._write_wait_s:
+            anchor_unit = length // self._hash_block_size
+            anchor = (
+                bytes(request.block_hashes[anchor_unit - 1]) if anchor_unit else None
+            )
+            key = bytes(frontier.key)
+            self._writing_frontiers[key] = (length, anchor, time.monotonic())
+            self._frontier_jobs[store_job_id] = key
+
+    def _lag_supersede(
+        self,
+        resumed: tuple[bytes, int] | None,
+        key: bytes,
+        supersedes: tuple[tuple[bytes, int], ...],
+        states: tuple[tuple[int, int], ...],
+    ) -> tuple[tuple[tuple[bytes, int], ...], tuple[tuple[int, int], ...]]:
+        """``frontier_supersede_lag``: what this finish supersedes, the list
+        the finish ``lag`` turns earlier on its chain would have (none while
+        the chain is shorter). The chain continues from the frontier the
+        request resumed from (its queue moves to the new frontier ``key``); a
+        request that resumed from none starts a chain. The positions of the
+        older lists lie on the request's own prefix, so its block hashes key
+        them. At most ``_SUPERSEDE_CHAINS`` chains are kept, the oldest
+        dropped."""
+        queue = self._supersede_queue.pop(resumed[0], []) if resumed is not None else []
+        queue.append((supersedes, states))
+        emitted: tuple[tuple[tuple[bytes, int], ...], tuple[tuple[int, int], ...]] = (
+            (),
+            (),
+        )
+        if len(queue) > self._supersede_lag:
+            emitted = queue.pop(0)
+        self._supersede_queue[key] = queue
+        while len(self._supersede_queue) > _SUPERSEDE_CHAINS:
+            del self._supersede_queue[next(iter(self._supersede_queue))]
+        return emitted
+
+    def _keep_newest(
+        self, request: Request, key: bytes, length: int
+    ) -> tuple[tuple[tuple[bytes, int], ...], tuple[tuple[int, int], ...]]:
+        """``frontier_keep_states``: the request's frontier ``key`` at
+        ``length`` and the boundary states it stored join the chain whose
+        newest frontier the request extends (none: they start a chain); the
+        chain keeps its newest checkpoint and the ``keep_states`` - 1 deepest
+        others at least ``keep_margin_tokens`` below the request's prompt end,
+        and this returns the frontiers and boundary states of the rest for
+        removal. Every
+        checkpoint of the chain lies on the request's own prefix, so its block
+        hashes key the states. The boundary states within the prompt of the
+        chain's first request are not the chain's: other sessions' first
+        prompts may share them (sub-agents given the same instructions), so
+        they are left to the store's eviction."""
+        taken = self._take_chain(request, length)
+        base, checkpoints = taken if taken else (request.num_prompt_tokens, [])
+        merged: dict[int, tuple[bytes | None, set[int]]] = {
+            position: (frontier, set(groups))
+            for position, frontier, groups in checkpoints
+        }
+        for group_id, tokens in self._boundary_tokens.get(request.request_id, ()):
+            if tokens > base:
+                merged.setdefault(tokens, (None, set()))[1].add(group_id)
+        merged[length] = (key, merged.get(length, (None, set()))[1])
+        positions = sorted(merged)
+        limit = request.num_prompt_tokens - self._keep_margin
+        below = [position for position in positions[:-1] if position <= limit]
+        kept = set(below[max(len(below) - self._keep_states + 1, 0) :])
+        kept.add(positions[-1])
+        dropped = [position for position in positions if position not in kept]
+        supersedes = tuple(
+            (frontier, position)
+            for position in dropped
+            if (frontier := merged[position][0]) is not None
+        )
+        states = tuple(
+            sorted(
+                (group_id, position)
+                for position in dropped
+                for group_id in merged[position][1]
+            )
+        )
+        anchor_unit = length // self._hash_block_size
+        anchor = bytes(request.block_hashes[anchor_unit - 1]) if anchor_unit else b""
+        if key in self._chains:
+            self._drop_chain(key)
+        self._chains[key] = (
+            anchor,
+            base,
+            [
+                (position, merged[position][0], tuple(sorted(merged[position][1])))
+                for position in sorted(kept)
+            ],
+        )
+        self._chain_heads.setdefault(anchor, []).append(key)
+        while len(self._chains) > _SUPERSEDE_CHAINS:
+            self._drop_chain(next(iter(self._chains)))
+        return supersedes, states
+
+    def _take_chain(
+        self, request: Request, length: int
+    ) -> tuple[int, list[_Checkpoint]] | None:
+        """``frontier_keep_states``: the first prompt's length and the
+        checkpoints of the chain whose newest frontier the request's tokens
+        extend, the deepest such frontier's, taken off the chains; None when
+        they extend none (a session's first turn, a rewrite of its last turn,
+        or a chain dropped as the oldest)."""
+        assert self._frontiers is not None
+        hashes = request.block_hashes
+        last_unit = min(len(hashes), (length - 1) // self._hash_block_size)
+        for anchor_unit in range(last_unit, -1, -1):
+            anchor = bytes(hashes[anchor_unit - 1]) if anchor_unit else b""
+            for head in self._chain_heads.get(anchor, ()):
+                _, base, checkpoints = self._chains[head]
+                head_length = checkpoints[-1][0]
+                if (
+                    head_length < length
+                    and self._frontiers.key_at(request, head_length) == head
+                ):
+                    self._drop_chain(head)
+                    return base, checkpoints
+        return None
+
+    def _drop_chain(self, head: bytes) -> None:
+        anchor, _, _ = self._chains.pop(head)
+        heads = self._chain_heads[anchor]
+        heads.remove(head)
+        if not heads:
+            del self._chain_heads[anchor]
+
+    def defer_lookup(self, request: Request, num_computed_tokens: int) -> bool:
+        """``frontier_write_wait_s``: True while ``request`` extends past
+        ``num_computed_tokens`` (its whole local hit) a frontier of its own
+        session whose write job has not completed on every rank, finished
+        less than the wait ago: the scheduler tries it again at its next step
+        rather than resume it short of the frontier. Its lookup memo is
+        dropped, so its next lookup probes afresh."""
+        if not self._writing_frontiers:
+            return False
+        assert self._frontiers is not None
+        unit = self._hash_block_size
+        hashes = request.block_hashes
+        req_id = request.request_id
+        counts = self._frontiers.counts
+        now = time.monotonic()
+        expired = []
+        found = False
+        for key, (length, anchor, finished) in self._writing_frontiers.items():
+            late = now - finished >= self._write_wait_s
+            if late:
+                # Waited for long enough: it defers no lookup any more.
+                expired.append(key)
+                if req_id not in self._frontier_waiters:
+                    continue
+            if not num_computed_tokens < length < request.num_tokens:
+                continue
+            anchor_unit = length // unit
+            if anchor_unit > len(hashes):
+                continue
+            if (bytes(hashes[anchor_unit - 1]) if anchor_unit else None) != anchor:
+                continue
+            if self._frontiers.key_at(request, length) != key:
+                continue
+            if late:
+                counts["wait_timeouts"] += 1
+                continue
+            found = True
+            break
+        for key in expired:
+            del self._writing_frontiers[key]
+        if found:
+            if req_id not in self._frontier_waiters:
+                self._frontier_waiters.add(req_id)
+                counts["waited"] += 1
+            counts["wait_steps"] += 1
+            logger.debug(
+                "Mooncake frontier lookup deferred: req=%s local=%d frontier=%d "
+                "(being written)",
+                req_id,
+                num_computed_tokens,
+                length,
+            )
+            self._frontiers.forget(req_id)
+            return True
         return False
 
     def _handle_boundary_state_offloads(
@@ -708,9 +1302,26 @@ class MooncakeStoreScheduler:
                 accepted.append(BoundaryPut(store_group_id, block_id, boundary_tokens))
             if not accepted:
                 continue
+            if self._supersede or self._keep_states:
+                self._boundary_tokens.setdefault(req_id, set()).update(
+                    (put.group_id, put.num_tokens) for put in accepted
+                )
+            units: tuple[StoreUnit, ...] = ()
+            if self._store_units:
+                block_hashes = req_tuple[0].block_hashes
+                units = tuple(
+                    self._next_unit(
+                        req_id,
+                        bytes(block_hashes[tokens // self._hash_block_size - 1]),
+                        tokens,
+                        frontier=False,
+                    )
+                    for tokens in sorted({put.num_tokens for put in accepted})
+                )
             tracker.has_pending_offload = True
             if (req_meta := save_metas.get(req_id)) is not None:
                 req_meta.boundary_puts = accepted
+                req_meta.store_units = units
                 continue
             meta.add_request(
                 ReqMeta(
@@ -723,16 +1334,32 @@ class MooncakeStoreScheduler:
                     prefill_end_tokens=tracker.prefill_end_tokens,
                     boundary_puts=accepted,
                     completed_token_len=tracker.token_len,
+                    store_units=units,
                 )
             )
 
     def update_connector_output(self, connector_output: KVConnectorOutput) -> None:
-        """Drop the block references of store jobs every rank has finished."""
+        """Drop the block references of store jobs every rank has finished,
+        or (``staging_buffer_mib``) every rank has copied out."""
         meta = connector_output.kv_connector_worker_meta
         if not isinstance(meta, MooncakeStoreWorkerMetadata):
             return
         pool = self._gpu_block_pool
         assert pool is not None
+        for store_job_id, count in meta.released_saves.items():
+            pinned = self._pinned_saves.get(store_job_id)
+            if pinned is None or store_job_id in self._released_jobs:
+                continue
+            remaining = self._unreleased.get(store_job_id, self._num_workers) - count
+            assert remaining >= 0, (
+                f"store job {store_job_id} released by too many ranks"
+            )
+            if remaining > 0:
+                self._unreleased[store_job_id] = remaining
+                continue
+            self._unreleased.pop(store_job_id, None)
+            self._released_jobs.add(store_job_id)
+            pool.free_blocks(pool.blocks[bid] for bid in reversed(pinned[0]))
         for store_job_id, count in meta.completed_saves.items():
             pinned = self._pinned_saves.get(store_job_id)
             if pinned is None:
@@ -747,6 +1374,12 @@ class MooncakeStoreScheduler:
                 f"store job {store_job_id} reported by too many ranks"
             )
             del self._pinned_saves[store_job_id]
+            self._unreleased.pop(store_job_id, None)
+            if (key := self._frontier_jobs.pop(store_job_id, None)) is not None:
+                self._writing_frontiers.pop(key, None)
+            if store_job_id in self._released_jobs:
+                self._released_jobs.discard(store_job_id)
+                continue
             # Tail-first, as elsewhere, so the shared prefix is evicted last.
             pool.free_blocks(pool.blocks[bid] for bid in reversed(block_ids))
 

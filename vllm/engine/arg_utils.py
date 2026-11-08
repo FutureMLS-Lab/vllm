@@ -77,6 +77,8 @@ from vllm.config.cache import (
     KVOffloadingBackend,
     MambaCacheMode,
     MambaDType,
+    MambaSpecStateLayout,
+    PrefixCacheEviction,
     PrefixCachingHashAlgo,
 )
 from vllm.config.device import Device
@@ -822,6 +824,17 @@ class EngineArgs:
     enable_mamba_shared_prefix_checkpoint: bool = (
         CacheConfig.enable_mamba_shared_prefix_checkpoint
     )
+    mamba_frontier_checkpoint: bool = CacheConfig.mamba_frontier_checkpoint
+    mamba_prefill_export: bool = CacheConfig.mamba_prefill_export
+    prefix_cache_eviction: PrefixCacheEviction = CacheConfig.prefix_cache_eviction
+    prefix_cache_leaf_last: bool = CacheConfig.prefix_cache_leaf_last
+    prefix_cache_leaf_idle_seconds: float | None = (
+        CacheConfig.prefix_cache_leaf_idle_seconds
+    )
+    prefill_cost_coefficients: tuple[float, float] | None = (
+        CacheConfig.prefill_cost_coefficients
+    )
+    mamba_spec_state_layout: MambaSpecStateLayout = CacheConfig.mamba_spec_state_layout
     replayssm_buffer_len: int = CacheConfig.replayssm_buffer_len
     use_replayssm: bool = CacheConfig.use_replayssm
 
@@ -1449,6 +1462,30 @@ class EngineArgs:
         cache_group.add_argument(
             "--enable-mamba-shared-prefix-checkpoint",
             **cache_kwargs["enable_mamba_shared_prefix_checkpoint"],
+        )
+        cache_group.add_argument(
+            "--mamba-frontier-checkpoint",
+            **cache_kwargs["mamba_frontier_checkpoint"],
+        )
+        cache_group.add_argument(
+            "--mamba-prefill-export", **cache_kwargs["mamba_prefill_export"]
+        )
+        cache_group.add_argument(
+            "--prefix-cache-eviction", **cache_kwargs["prefix_cache_eviction"]
+        )
+        cache_group.add_argument(
+            "--prefill-cost-coefficients",
+            **cache_kwargs["prefill_cost_coefficients"],
+        )
+        cache_group.add_argument(
+            "--prefix-cache-leaf-last", **cache_kwargs["prefix_cache_leaf_last"]
+        )
+        cache_group.add_argument(
+            "--prefix-cache-leaf-idle-seconds",
+            **cache_kwargs["prefix_cache_leaf_idle_seconds"],
+        )
+        cache_group.add_argument(
+            "--mamba-spec-state-layout", **cache_kwargs["mamba_spec_state_layout"]
         )
         cache_group.add_argument(
             "--replayssm-buffer-len", **cache_kwargs["replayssm_buffer_len"]
@@ -2331,6 +2368,13 @@ class EngineArgs:
             enable_mamba_shared_prefix_checkpoint=(
                 self.enable_mamba_shared_prefix_checkpoint
             ),
+            mamba_frontier_checkpoint=self.mamba_frontier_checkpoint,
+            mamba_prefill_export=self.mamba_prefill_export,
+            prefix_cache_eviction=self.prefix_cache_eviction,
+            prefill_cost_coefficients=self.prefill_cost_coefficients,
+            prefix_cache_leaf_last=self.prefix_cache_leaf_last,
+            prefix_cache_leaf_idle_seconds=self.prefix_cache_leaf_idle_seconds,
+            mamba_spec_state_layout=self.mamba_spec_state_layout,
             replayssm_buffer_len=self.replayssm_buffer_len,
             use_replayssm=self.use_replayssm,
             kv_offloading_size=self.kv_offloading_size,

@@ -32,11 +32,24 @@ from vllm.multimodal.encoder_budget import MultiModalBudget
 from vllm.multimodal.inputs import MultiModalKwargsItem
 from vllm.multimodal.utils import get_mm_features_in_window
 from vllm.outputs import RequestError
+from vllm.utils.hashing import get_hash_fn_by_name
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.encoder_cache_manager import (
     EncoderCacheManager,
     EncoderDecoderCacheManager,
 )
+from vllm.v1.core.hybrid_checkpoint.cost import PrefillCostModel
+from vllm.v1.core.hybrid_checkpoint.export import (
+    check_prefill_export_config,
+    plan_export,
+    plan_filler,
+)
+from vllm.v1.core.hybrid_checkpoint.frontier import FrontierCheckpoint
+from vllm.v1.core.hybrid_checkpoint.manager import (
+    HybridCheckpointManager,
+    check_frontier_checkpoint_config,
+)
+from vllm.v1.core.hybrid_checkpoint.speculative import commit_waits_for_next_verify
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
@@ -55,6 +68,7 @@ from vllm.v1.core.sched.request_queue import (
     create_request_queue,
 )
 from vllm.v1.core.sched.utils import check_stop, remove_all
+from vllm.v1.core.single_type_kv_cache_manager import MambaManager
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
@@ -519,6 +533,60 @@ class Scheduler(SchedulerInterface):
         )
         self._kv_fetch_counts: dict[str, int] = dict.fromkeys(KV_FETCH_STAGES, 0)
 
+        # Resumable Mamba states beyond the block grid.
+        self.mamba_checkpoints: HybridCheckpointManager | None = None
+        if self.cache_config.mamba_frontier_checkpoint:
+            check_frontier_checkpoint_config(
+                vllm_config,
+                block_size=self.block_size,
+                hash_block_size=self.hash_block_size,
+                use_v2_model_runner=self.use_v2_model_runner,
+                enable_kv_cache_events=self.enable_kv_cache_events,
+            )
+            eviction_cost = None
+            if self.cache_config.prefix_cache_eviction == "gds":
+                coefficients = self.cache_config.prefill_cost_coefficients
+                assert coefficients is not None
+                eviction_cost = PrefillCostModel(*coefficients)
+            self.mamba_checkpoints = HybridCheckpointManager(
+                self.kv_cache_manager.coordinator,
+                get_hash_fn_by_name(self.cache_config.prefix_caching_hash_algo),
+                waiting=lambda: self.waiting,
+                eviction_cost=eviction_cost,
+                eviction_leaf_last=self.cache_config.prefix_cache_leaf_last,
+                eviction_leaf_idle_s=self.cache_config.prefix_cache_leaf_idle_seconds,
+                speculative_decoding=vllm_config.speculative_config is not None,
+                length_finishes_only=commit_waits_for_next_verify(vllm_config),
+            )
+            self.kv_cache_manager.checkpoints = self.mamba_checkpoints
+            if self.connector is not None:
+                self.mamba_checkpoints.describe_frontiers = (
+                    self.connector.stores_frontier_checkpoints
+                )
+        # Request -> the one Mamba state position its non-final chunk exports
+        # this step. Shared with the Mamba managers, which reserve the block.
+        self.mamba_prefill_export = self.cache_config.mamba_prefill_export
+        self._prefill_export_positions: dict[str, int] = {}
+        if self.mamba_prefill_export:
+            check_prefill_export_config(
+                vllm_config,
+                use_v2_model_runner=self.use_v2_model_runner,
+                checkpoint_alignment=self.mamba_prefill_checkpoint_alignment,
+                has_checkpoint_blocks=self.mamba_has_prefill_checkpoint_blocks,
+            )
+            for manager in self.kv_cache_manager.coordinator.single_type_managers:
+                if isinstance(manager, MambaManager):
+                    manager.prefill_export_positions = self._prefill_export_positions
+
+    def _finalize_prefill_export(
+        self, request: Request, start: int, num_new_tokens: int
+    ) -> None:
+        """Drop the export when a later cap moved its position out of the
+        chunk."""
+        position = self._prefill_export_positions.get(request.request_id)
+        if position is not None and not start < position < start + num_new_tokens:
+            del self._prefill_export_positions[request.request_id]
+
     def _drafts_unused(
         self, request: Request, num_computed_tokens: int, num_new_tokens: int
     ) -> bool:
@@ -588,6 +656,11 @@ class Scheduler(SchedulerInterface):
         prefill_end = max(request.num_prompt_tokens, request.num_tokens - 1)
         if start >= prefill_end:
             return num_new_tokens
+        checkpoints = self.mamba_checkpoints
+        if checkpoints is not None and start % checkpoints.catchup_pool_size:
+            # Resumed at a frontier inside an open indexer group: one token per
+            # step until the group closes, through the decode path.
+            return min(num_new_tokens, 1)
 
         block_size = self.cache_config.block_size
         # The last block-aligned position whose state can be cached. With
@@ -677,9 +750,36 @@ class Scheduler(SchedulerInterface):
             # requests sharing the prefix can reuse it.
             junction_stop if start < junction < end else 0,
         )
-        # Stop at the earliest mandatory position strictly inside the chunk.
-        end = min((s for s in stops if start < s < end), default=end)
-        return max(end - start, 0)
+        if (
+            self.mamba_prefill_export
+            and end < prefill_end
+            and not use_internal_checkpoint
+        ):
+            # Run past one of the positions and export the state there.
+            end, exported = plan_export(
+                start,
+                end,
+                stops,
+                alignment=self.mamba_prefill_checkpoint_alignment,
+                hash_block_size=self.hash_block_size,
+                block_size=block_size,
+            )
+            if exported is None:
+                self._prefill_export_positions.pop(request.request_id, None)
+            else:
+                self._prefill_export_positions[request.request_id] = exported
+        else:
+            # Stop at the earliest mandatory position strictly inside the chunk.
+            end = min((s for s in stops if start < s < end), default=end)
+        taken = max(end - start, 0)
+        if taken or not self.mamba_prefill_export:
+            return taken
+        return plan_filler(
+            start,
+            num_new_tokens,
+            prefill_end=prefill_end,
+            stops=(*stops, junction_stop if start < junction else 0),
+        )
 
     def _get_local_prefix_cache_hit(
         self, request: Request, max_cache_hit_length: int | None = None
@@ -780,6 +880,7 @@ class Scheduler(SchedulerInterface):
         scheduled_timestamp = time.monotonic()
 
         self.kv_cache_manager.new_step_starts()
+        self._prefill_export_positions.clear()
 
         # DP prefill balancing: on a throttled (non-cadence-aligned) step, defer
         # all prefill compute unless saturated.
@@ -828,6 +929,10 @@ class Scheduler(SchedulerInterface):
 
         # First, schedule the RUNNING requests.
         req_index = 0
+        # Running requests whose running state sits on a block boundary their
+        # output crossed, with the blocks holding it before this step's
+        # allocation.
+        decode_boundaries: list[tuple[Request, list[KVCacheBlock]]] = []
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
             if input_budget <= draft_slots:
@@ -879,6 +984,15 @@ class Scheduler(SchedulerInterface):
             )
             if 0 < long_prefill_token_threshold < num_new_tokens:
                 num_new_tokens = long_prefill_token_threshold
+            if (
+                self.mamba_checkpoints is not None
+                and self.mamba_checkpoints.speculative is None
+                and request.num_computed_tokens > request.num_prompt_tokens
+                and request.num_computed_tokens % self.mamba_checkpoints.page_size == 0
+            ):
+                sources = self.mamba_checkpoints.decode_boundary_sources(request)
+                if sources is not None:
+                    decode_boundaries.append((request, sources))
             num_new_tokens = min(
                 num_new_tokens, token_budget, input_budget - draft_slots
             )
@@ -954,9 +1068,14 @@ class Scheduler(SchedulerInterface):
                 > self.max_prefill_context_pages
             ):
                 # The DCP ShardQ workspace cannot hold this row's context too.
+                self._prefill_export_positions.pop(request.request_id, None)
                 req_index += 1
                 continue
 
+            if self.mamba_prefill_export:
+                self._finalize_prefill_export(
+                    request, request.num_computed_tokens, num_new_tokens
+                )
             # Schedule newly needed KV blocks for the request.
             with record_function_or_nullcontext("schedule: allocate_slots"):
                 while True:
@@ -975,6 +1094,12 @@ class Scheduler(SchedulerInterface):
                         and self.connector.has_pending_block_frees()
                     ):
                         break
+
+                    if (
+                        self.mamba_checkpoints is not None
+                        and self._drop_decode_boundary_scratch()
+                    ):
+                        continue
 
                     # The request cannot be scheduled.
                     # Preempt the lowest-priority request.
@@ -1085,6 +1210,15 @@ class Scheduler(SchedulerInterface):
                     duplicate_encoder_inputs,
                 )
 
+        if decode_boundaries:
+            # The scratch blocks come out of what the scheduled running
+            # requests left free, so a snapshot never preempts a request.
+            assert self.mamba_checkpoints is not None
+            scheduled_ids = {r.request_id for r in scheduled_running_reqs}
+            for request, sources in decode_boundaries:
+                if request.request_id in scheduled_ids:
+                    self.mamba_checkpoints.snapshot_decode_boundary(request, sources)
+
         # Record the LoRAs of all running requests, including those not
         # scheduled in this step, which can join a later batch.
         scheduled_loras: set[int] = set()
@@ -1178,6 +1312,16 @@ class Scheduler(SchedulerInterface):
 
                     # Get externally-cached tokens if using a KVConnector.
                     if self.connector is not None:
+                        if (
+                            self.mamba_checkpoints is not None
+                            and self.connector.defer_lookup(
+                                request, num_new_local_computed_tokens
+                            )
+                        ):
+                            # A write that would extend the hit is in flight;
+                            # look the request up at a later step.
+                            skip_request(request_queue)
+                            continue
                         # Present a block-aligned local hit to the connector so
                         # a strictly longer remote hit can supersede a local
                         # sub-block tail without racing its copy-on-write.
@@ -1235,6 +1379,17 @@ class Scheduler(SchedulerInterface):
                             load_kv_async = False
                         else:
                             num_external_computed_tokens = ext_tokens
+                            if ext_tokens and self.mamba_checkpoints is not None:
+                                (
+                                    new_computed_blocks,
+                                    num_new_local_computed_tokens,
+                                    num_external_computed_tokens,
+                                ) = self._load_frontier_over_cached_pages(
+                                    request,
+                                    new_computed_blocks,
+                                    num_new_local_computed_tokens,
+                                    ext_tokens,
+                                )
 
                         if self.aux_output_connector is not None:
                             num_external_computed_tokens = (
@@ -1268,6 +1423,13 @@ class Scheduler(SchedulerInterface):
                         num_new_local_computed_tokens + num_external_computed_tokens
                     )
                     assert num_computed_tokens <= request.num_tokens
+                    if self.mamba_checkpoints is not None:
+                        self.mamba_checkpoints.admitted(
+                            request,
+                            num_computed_tokens,
+                            new_computed_blocks,
+                            num_external_computed_tokens,
+                        )
                     # DSV41 SWA bounded replay: a KV load that carries the
                     # window is taken as is; any other hit no longer than the
                     # replayed window would be recomputed in full and save
@@ -1458,6 +1620,7 @@ class Scheduler(SchedulerInterface):
                 ):
                     # The DCP ShardQ workspace cannot hold this row's context
                     # too; requeue it for a later step.
+                    self._prefill_export_positions.pop(request.request_id, None)
                     skip_request(request_queue)
                     continue
 
@@ -1481,6 +1644,14 @@ class Scheduler(SchedulerInterface):
                         for i in encoder_inputs_to_schedule
                     )
 
+                if self.mamba_prefill_export:
+                    self._finalize_prefill_export(
+                        request,
+                        request.num_computed_tokens
+                        + num_new_local_computed_tokens
+                        + num_external_computed_tokens,
+                        num_new_tokens,
+                    )
                 reserved_blocks = 0
                 if load_kv_async:
                     # An async load holds its blocks for the whole transfer with
@@ -1573,6 +1744,13 @@ class Scheduler(SchedulerInterface):
                 if did_prefix_cache_lookup:
                     self.kv_cache_manager.record_prefix_cache_stats(
                         request, num_new_local_computed_tokens
+                    )
+                if self.mamba_checkpoints is not None:
+                    self.mamba_checkpoints.allocated(
+                        request,
+                        num_new_local_computed_tokens
+                        if did_prefix_cache_lookup
+                        else request.num_computed_tokens,
                     )
 
                 if load_kv_async:
@@ -1770,6 +1948,17 @@ class Scheduler(SchedulerInterface):
             # have run.
             self._free_cow_retained_blocks(cow_retained_blocks, self.sched_step_seq + 1)
         pending_kv_cache_block_copies = kv_cache_block_copies or None
+        mamba_state_gathers = None
+        if self.mamba_checkpoints is not None:
+            gathers, gather_retained_blocks = (
+                self.mamba_checkpoints.take_state_gathers()
+            )
+            if gathers:
+                # They run first in this step's execution, as the copies do.
+                self._free_cow_retained_blocks(
+                    gather_retained_blocks, self.sched_step_seq + 1
+                )
+                mamba_state_gathers = gathers
 
         # Dynamic speculative decoding: compute optimal K
         num_spec_tokens_to_schedule = self.num_spec_tokens
@@ -1808,10 +1997,17 @@ class Scheduler(SchedulerInterface):
             new_block_ids_to_zero=self._get_new_block_ids_to_zero(),
             has_sync_kv_loads=has_sync_kv_loads,
             kv_cache_block_copies=pending_kv_cache_block_copies,
+            mamba_state_gathers=mamba_state_gathers,
             kv_connector_block_state=kv_connector_block_state,
             num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
             skip_drafts=not drafts_needed,
             ec_manager_metadata=self.encoder_cache_manager.get_manager_metadata(),
+            prefill_checkpoint_positions={
+                req_id: position
+                for req_id, position in self._prefill_export_positions.items()
+                if req_id in num_scheduled_tokens
+            }
+            or None,
         )
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
@@ -1839,10 +2035,18 @@ class Scheduler(SchedulerInterface):
         # Connector-only block state must not be dispatched to workers.
         scheduler_output.kv_connector_block_state = None
 
-        # Advance the fence only for non-empty steps (those that actually
-        # write KV and have their output processed later in update_from_output).
-        if self.defer_block_free and total_num_scheduled_tokens > 0:
+        # Advance the fence for steps that write KV: steps with tokens and,
+        # under Model Runner V2, steps without tokens that run state gathers or
+        # block copies, whose retained blocks are fenced on this step.
+        if self.defer_block_free and (
+            total_num_scheduled_tokens > 0
+            or (
+                self.use_v2_model_runner
+                and bool(mamba_state_gathers or pending_kv_cache_block_copies)
+            )
+        ):
             self.sched_step_seq += 1
+            scheduler_output.fence_seq = self.sched_step_seq
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
@@ -2342,8 +2546,8 @@ class Scheduler(SchedulerInterface):
 
         # Every GPU write enqueued by this and earlier steps has completed, so it is
         # safe to return deferred-free blocks to the pool.
-        if self.defer_block_free and scheduler_output.total_num_scheduled_tokens > 0:
-            self.processed_step_seq += 1
+        if scheduler_output.fence_seq is not None:
+            self.processed_step_seq = scheduler_output.fence_seq
             self._drain_deferred_frees()
             self._drain_deferred_loads()
 
@@ -2376,11 +2580,26 @@ class Scheduler(SchedulerInterface):
         stopped_preempted_reqs: set[Request] = set()
         # Stopped resumable requests to re-enqueue, in output order.
         continuing_reqs: list[Request] = []
+        # Mamba frontier checkpoints under speculative decoding follow every
+        # completed step.
+        track_steps = (
+            self.mamba_checkpoints is not None
+            and self.mamba_checkpoints.speculative is not None
+        )
         for req_id, num_tokens_scheduled in num_scheduled_tokens.items():
             assert num_tokens_scheduled > 0
             request = self.requests.get(req_id)
             output_is_stale = False
+            step_start = 0
             if request is not None:
+                if track_steps:
+                    # The step's device start: the tokens computed before
+                    # every step of the request still in flight. A request's
+                    # steps complete in the order they were scheduled, so this
+                    # one is the oldest of them.
+                    step_start = (
+                        request.num_computed_tokens - request.num_in_flight_tokens
+                    )
                 request.num_in_flight_tokens -= num_tokens_scheduled
                 # Drain any stale share (see _preempt_request) in lockstep.
                 if request.num_stale_output_tokens > 0:
@@ -2467,9 +2686,20 @@ class Scheduler(SchedulerInterface):
             # Check for stop and update request status.
             if new_token_ids:
                 has_output_placeholders = request.num_output_placeholders > 0
+                num_sampled_tokens = len(new_token_ids)
                 new_token_ids, stopped = self._update_request_with_output(
                     request, new_token_ids, is_stale=output_is_stale
                 )
+                if track_steps and not output_is_stale:
+                    assert self.mamba_checkpoints is not None
+                    self.mamba_checkpoints.step_completed(
+                        request,
+                        step_start,
+                        num_tokens_scheduled,
+                        bool(scheduled_spec_token_ids),
+                        num_sampled_tokens,
+                        len(new_token_ids),
+                    )
                 if (
                     not output_is_stale
                     and status_before_stop == RequestStatus.RUNNING
@@ -3024,6 +3254,20 @@ class Scheduler(SchedulerInterface):
             if self.log_stats:
                 request.record_event(EngineCoreEventType.QUEUED)
 
+    def _drop_decode_boundary_scratch(self) -> bool:
+        """Free one running request's decode-boundary scratch, lowest priority
+        first: a scratch only saves a later request some prefill, while a
+        preemption recomputes the victim's whole context."""
+        assert self.mamba_checkpoints is not None
+        if self.policy == SchedulingPolicy.PRIORITY:
+            order: Iterable[Request] = sorted(
+                self.running, key=lambda r: (r.priority, r.arrival_time), reverse=True
+            )
+        else:
+            order = reversed(self.running)
+        drop = self.mamba_checkpoints.drop_decode_boundary_scratch
+        return any(drop(r.request_id) for r in order)
+
     def finish_requests(
         self, request_ids: str | Iterable[str] | None, finished_status: RequestStatus
     ) -> list[Request]:
@@ -3096,11 +3340,16 @@ class Scheduler(SchedulerInterface):
     ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
         assert request.is_finished()
 
+        frontier = None
+        if self.mamba_checkpoints is not None:
+            frontier = self.mamba_checkpoints.request_finished(request)
         if self.aux_output_connector is not None:
             self.aux_output_connector.request_finished(request)
         self._inflight_prefills.discard(request)
         self._set_kv_fetch_stage(request, None)
-        connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
+        connector_delay_free_blocks, kv_xfer_params = self._connector_finished(
+            request, frontier
+        )
 
         # EC Connector: mirror the KV hook. The contract requires firing
         # before the encoder cache is freed so the connector can inspect
@@ -3272,7 +3521,30 @@ class Scheduler(SchedulerInterface):
             # persistent batch in the model runner.
             self.prev_step_scheduled_req_ids.clear()
 
+        if (
+            self.mamba_checkpoints is not None
+            and not self.mamba_checkpoints.describe_frontiers
+        ):
+            # No step runs the pending state gathers before the reset. A
+            # connector's queued frontier job reads the state a gather
+            # completes, so with described frontiers the gathers hold their
+            # blocks and the reset fails until the next step has run them.
+            self.mamba_checkpoints.drop_state_gathers()
         reset_successful = self.kv_cache_manager.reset_prefix_cache()
+        if not reset_successful:
+            logger.warning(
+                "Prefix cache reset failed: %d pending state gathers, %d deferred "
+                "frees (first fence %s, processed step %d), connector push work %s",
+                len(self.mamba_checkpoints.frontiers.pending_gathers)
+                if self.mamba_checkpoints is not None
+                else 0,
+                len(self.deferred_frees),
+                self.deferred_frees[0][0] if self.deferred_frees else None,
+                self.processed_step_seq,
+                self.connector is not None and self.connector.has_pending_push_work(),
+            )
+        if reset_successful and self.mamba_checkpoints is not None:
+            self.mamba_checkpoints.reset()
         if reset_running_requests and not reset_successful:
             raise RuntimeError(
                 "Failed to reset KV cache even when all the running requests are "
@@ -3409,10 +3681,39 @@ class Scheduler(SchedulerInterface):
     def get_kv_event_publisher_config(self) -> KVEventsConfig | None:
         return self.kv_event_publisher.get_publisher_config()
 
+    def _load_frontier_over_cached_pages(
+        self,
+        request: Request,
+        blocks: KVCacheBlocks,
+        num_local: int,
+        num_external: int,
+    ) -> tuple[KVCacheBlocks, int, int]:
+        """A KV connector load that resumes ``request`` at a stored Mamba
+        frontier checkpoint (``frontier_load_length``) reads only what the
+        GPU does not hold: the request also takes, as local hits, the full
+        pages the GPU caches after its block-aligned local hit, up to the
+        frontier's block, and the load starts at the first page it does not
+        take. Returns the local blocks, local tokens and external tokens."""
+        assert self.connector is not None
+        end = self.connector.frontier_load_length(request)
+        if end is None:
+            return blocks, num_local, num_external
+        assert end == num_local + num_external, (end, num_local, num_external)
+        extended, pages_end = self.kv_cache_manager.extend_with_cached_pages(
+            request, blocks, num_local, end // self.block_size
+        )
+        if pages_end == num_local:
+            return blocks, num_local, num_external
+        self.connector.move_frontier_load_start(request, pages_end)
+        return extended, pages_end, end - pages_end
+
     def _connector_finished(
-        self, request: Request
+        self, request: Request, frontier: FrontierCheckpoint | None = None
     ) -> tuple[bool, dict[str, Any] | None]:
         """Invoke the KV connector request_finished() method if applicable.
+
+        ``frontier``: the request's Mamba frontier checkpoint, for a connector
+        that stores frontier checkpoints.
 
         Returns optional kv transfer parameters to be included with the
         request outputs.
@@ -3448,6 +3749,10 @@ class Scheduler(SchedulerInterface):
                 block_ids,
                 finished_partial_tails,
             )
+        if frontier is not None:
+            # The connector references the checkpoint's blocks before they
+            # return to the pool.
+            self.connector.register_finished_frontier(request, frontier)
 
         if not isinstance(self.connector, SupportsHMA):
             # NOTE(Kuntai): We should deprecate this code path after we enforce

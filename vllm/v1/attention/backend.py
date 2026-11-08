@@ -462,6 +462,11 @@ class CommonAttentionMetadata:
     decode rows (assumes every draft was accepted). Not safe for kernels
     that need exact per-row context lengths on decode rows."""
 
+    prefill_checkpoint_positions: list[int] | None = None
+    """(batch_size,) absolute position of the Mamba state a non-final
+    prefill chunk exports, 0 for rows without one; None when no row has
+    one."""
+
     req_idx: np.ndarray | None = None
     """(batch_size,) index of each row's request in the runner's request
     table. Rows of one request are adjacent, so equal neighbours are PCP
@@ -564,6 +569,9 @@ class CommonAttentionMetadata:
                 self.dcp_local_seq_lens_cpu_upper_bound
             ),
             seq_lens_cpu_upper_bound=maybe_slice_reqs(self.seq_lens_cpu_upper_bound),
+            prefill_checkpoint_positions=maybe_slice_reqs(
+                self.prefill_checkpoint_positions
+            ),
             is_prefilling=maybe_slice_reqs(self.is_prefilling),
             req_idx=maybe_slice_reqs(self.req_idx),
             rswa_prefix_lens=maybe_slice_reqs(self.rswa_prefix_lens),

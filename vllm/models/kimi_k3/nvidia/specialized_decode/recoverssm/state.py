@@ -8,13 +8,15 @@ objects, without changing their classes:
   flushes the pending replays and writes the records to each request's record slot;
 - the model runner state (``install_model_state``): the per-request pending replay
   counts (``DeferredRecoverSSMState``), reset per new request and bound, with the
-  step's request slots, to the KDA metadata builders before their build;
+  step's request slots (and, with frontier checkpoints, the requests' length
+  limits), to the KDA metadata builders before their build;
 - the KDA metadata builders (``install_builder``, on first bind): the
   ``fp32_deferred`` commit context, and each step's ``recoverssm_deferred``."""
 
 from types import MethodType
 from typing import Any
 
+import numpy as np
 import torch
 from einops import rearrange
 
@@ -39,24 +41,52 @@ class DeferredRecoverSSMState(RecoverSSMState):
     """``pending`` [max_num_reqs]: per request-state slot, the accepted tokens of its
     last verify not yet folded into its checkpoint, for the KDA metadata builders
     that defer the commit to the next verify (those ``install_builder`` set up);
-    other builders never see it."""
+    other builders never see it.
 
-    def __init__(self, max_num_reqs: int, device: torch.device) -> None:
+    ``max_len`` [max_num_reqs] (frontier checkpoints only, given ``max_model_len``;
+    else None): per slot, the request's total length at its length limit, the
+    device's stop condition ``min(prompt_len + max_tokens, max_model_len)``."""
+
+    def __init__(
+        self,
+        max_num_reqs: int,
+        device: torch.device,
+        max_model_len: int | None = None,
+    ) -> None:
         super().__init__()
         self.pending = torch.zeros(max_num_reqs, dtype=torch.int32, device=device)
+        self.max_model_len = max_model_len
+        self.max_len = (
+            None
+            if max_model_len is None
+            else np.full(max_num_reqs, max_model_len, dtype=np.int64)
+        )
 
-    def add_request(self, req_index: int) -> None:
+    def add_request(self, req_index: int, new_req_data: Any = None) -> None:
         # A new or resumed request starts from a committed (prefilled) state.
         self.pending[req_index].fill_(0)
+        if self.max_len is not None:
+            assert self.max_model_len is not None
+            max_len = self.max_model_len
+            params = getattr(new_req_data, "sampling_params", None)
+            if params is not None and params.max_tokens is not None:
+                max_len = min(max_len, new_req_data.prompt_len + params.max_tokens)
+            self.max_len[req_index] = max_len
 
     def bind(
         self,
         attn_groups: list[list[AttentionGroup]],
         idx_mapping: torch.Tensor | None,
+        idx_mapping_np: np.ndarray | None = None,
     ) -> None:
         """Hand deferring builders the step's request slots (None: capture or
-        dummy batches, whose rows own no request) and, once, the pending counts.
-        Only ubatch 0's builders: the hybrid state does not support DBO."""
+        dummy batches, whose rows own no request), the batch rows' length limits
+        (with ``max_len`` and ``idx_mapping_np``, else None) and, once, the
+        pending counts. Only ubatch 0's builders: the hybrid state does not
+        support DBO."""
+        limits = None
+        if self.max_len is not None and idx_mapping_np is not None:
+            limits = torch.from_numpy(self.max_len[idx_mapping_np])
         for group_list in attn_groups:
             for group in group_list:
                 builder = group.get_metadata_builder(0)
@@ -67,23 +97,29 @@ class DeferredRecoverSSMState(RecoverSSMState):
                 if getattr(builder, "recoverssm_pending", None) is not self.pending:
                     install_builder(builder, self.pending)
                 builder.recoverssm_request_slots = idx_mapping
+                builder.recoverssm_length_limits = limits
 
 
 def install_model_state(state: Any) -> None:
     """Install the deferred RecoverSSM on a ``KimiK3ModelState`` (no-op without
     RecoverSSM): its ``recoverssm`` becomes a ``DeferredRecoverSSMState``, and its
     ``add_request`` / ``prepare_attn`` reset a new request's pending count after the
-    base and bind the KDA builders before the metadata build."""
+    base and bind the KDA builders before the metadata build. With frontier
+    checkpoints it also keeps each request's length limit."""
     if state.recoverssm is None:
         return
-    deferred = DeferredRecoverSSMState(state.max_num_reqs, state.device)
+    config = state.vllm_config
+    max_model_len = None
+    if config.cache_config.mamba_frontier_checkpoint:
+        max_model_len = config.model_config.max_model_len
+    deferred = DeferredRecoverSSMState(state.max_num_reqs, state.device, max_model_len)
     state.recoverssm = deferred
     base_add_request = state.add_request
     base_prepare_attn = state.prepare_attn
 
     def add_request(req_index, new_req_data) -> None:
         base_add_request(req_index, new_req_data)
-        deferred.add_request(req_index)
+        deferred.add_request(req_index, new_req_data)
 
     def prepare_attn(
         input_batch,
@@ -96,7 +132,12 @@ def install_model_state(state: Any) -> None:
         ubatch_idx=0,
         model_specific_attn_metadata=None,
     ) -> dict[str, Any]:
-        deferred.bind(attn_groups, None if for_capture else input_batch.idx_mapping)
+        if for_capture:
+            deferred.bind(attn_groups, None)
+        else:
+            deferred.bind(
+                attn_groups, input_batch.idx_mapping, input_batch.idx_mapping_np
+            )
         return base_prepare_attn(
             input_batch,
             cudagraph_mode,
@@ -237,7 +278,11 @@ def _build_deferred(
     mark the rows to commit after sampling: those whose window, up to the next
     step's, may reach a mamba block boundary (the boundary state and the next
     block's checkpoint must hold committed states), from the host's upper
-    bound of each sequence length with a margin for rejected drafts."""
+    bound of each sequence length with a margin for rejected drafts. With
+    frontier checkpoints (``recoverssm_length_limits``) also those that may
+    reach their length limit by then: a request's last steps on the device (the
+    one that reaches the limit, and one in flight after it) leave the exact
+    state a frontier publishes, and no later verify folds them in."""
     pending = builder.recoverssm_pending
     assert pending is not None
     rows = builder.recoverssm_record_rows
@@ -265,6 +310,9 @@ def _build_deferred(
             low = end - query_lens[spec_rows].to(torch.int64) - margin
             high = end + margin
             near = (low < 0) | (low.clamp(min=0) // block != high // block)
+            limits = getattr(builder, "recoverssm_length_limits", None)
+            if limits is not None:
+                near |= high >= limits[spec_rows]
         if bool(near.any()):
             eager = async_tensor_h2d(near.to(torch.int32), device=state_indices.device)
     return KDARecoverSSMDeferred(

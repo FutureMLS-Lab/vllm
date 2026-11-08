@@ -2484,6 +2484,54 @@ def test_worker_init_excludes_nonprefix_cache_groups(monkeypatch):
     assert [db.block_size for db in store_worker.token_dbs] == [800, 800]
 
 
+@pytest.mark.parametrize("enabled", [False, True])
+def test_frontier_write_through_keys_and_registers_indexer_rings(monkeypatch, enabled):
+    """With frontier_write_through the worker keys an indexer ring, which is
+    no store group, in a ring namespace of its own, and registers the ring's
+    buffers, so a frontier's ring block can be put and loaded."""
+    store = MagicMock()
+    store.setup.return_value = 0
+    store.register_buffer.return_value = 0
+    _install_fake_mooncake(monkeypatch, store)
+    _patch_worker_runtime(monkeypatch)
+    monkeypatch.setattr(
+        worker.MooncakeStoreConfig,
+        "load_from_config",
+        staticmethod(lambda: _make_config()),
+    )
+    vllm_config = _make_vllm_config(extra_config={"frontier_write_through": enabled})
+    vllm_config.cache_config.block_size = 800
+    vllm_config.cache_config.enable_prefix_caching = True
+    vllm_config.cache_config.prefix_match_unit = None
+    vllm_config.cache_config.mamba_frontier_checkpoint = True
+    store_worker = worker.MooncakeStoreWorker(
+        vllm_config, _make_qsa_hybrid_kv_cache_config()
+    )
+    if not enabled:
+        assert store_worker.frontiers is None
+        return
+    frontiers = store_worker.frontiers
+    assert frontiers is not None and list(frontiers.ring_dbs) == [1]
+    assert frontiers.writes_locators
+    caches = {
+        "full": torch.zeros(10, 4, dtype=torch.float16),
+        "qsa": torch.zeros(10, 4, dtype=torch.float16),
+        "mamba": torch.zeros(10, 4, dtype=torch.float32),
+    }
+    _register_with_mocked_threads(store_worker, caches)
+
+    ring = frontiers.ring_dbs[1]
+    qsa = caches["qsa"]
+    addrs, sizes = ring.prepare_value_for_block(3)
+    assert addrs == [qsa.data_ptr() + 3 * qsa.stride(0) * qsa.element_size()]
+    assert sizes == [qsa.stride(0) * qsa.element_size()]
+    store.register_buffer.assert_any_call(
+        qsa.data_ptr(), qsa.untyped_storage().nbytes()
+    )
+    key = ring.key_for(BlockHash(b"\x01" * 4))
+    assert "@ring" in key and "@group:1@" in key
+
+
 def _make_two_full_attention_groups_kv_cache_config():
     """Two full-attention groups with different block sizes: no hybrid
     layers, but block-level failure reporting is still unsupported."""
@@ -3772,6 +3820,15 @@ def _make_bare_worker(
     worker.store_replicate_config = SimpleNamespace()
     worker.enable_group_semantics = False
     worker._supports_group_ids = False
+    worker._newest_state_lookup = False
+    worker.frontiers = None
+    worker._locator_replicate_config = None
+    worker.store_units = None
+    worker.unit_client = None
+    worker._unit_replicate_config = None
+    worker._frontier_replicate_config = None
+    worker._staging_mib = 0
+    worker._staging = None
     worker._kv_connector_stats_lock = threading.Lock()
     worker.kv_connector_stats = MooncakeStoreConnectorStats()
 
@@ -5336,3 +5393,173 @@ def test_blob_block_hashes_empty():
     view = BlobBlockHashes(memoryview(b""), 0)
     assert len(view) == 0
     assert list(view) == []
+
+
+# lookup_newest_state: a hybrid model's lookup with 4-token hash units inside
+# 16-token blocks, one full-attention group and two Mamba state groups. The
+# store answers existence checks from a set of keys and records every key it
+# is asked about (in Mooncake each check grants a lease, and leases order
+# eviction).
+
+_NEWEST_PREFIXES = (("attn",), ("s0r0", "s0r1"), ("s1r0", "s1r1"))
+
+
+class _RecordingStore:
+    def __init__(self, present: set[str]) -> None:
+        self.present = present
+        self.asked: list[str] = []
+
+    def batch_is_exist(self, keys: list[str]) -> list[int]:
+        self.asked.extend(keys)
+        return [1 if key in self.present else 0 for key in keys]
+
+
+def _newest_state_worker(newest: bool, store) -> worker.MooncakeStoreWorker:
+    w = _make_bare_worker(block_size=16)
+    attn = FullAttentionSpec(
+        block_size=16, num_kv_heads=1, head_size=8, dtype=torch.float16
+    )
+    state = MambaSpec(
+        block_size=16,
+        shapes=((4,),),
+        dtypes=(torch.float32,),
+        mamba_cache_mode="align",
+    )
+    w._kv_cache_groups = [
+        KVCacheGroupSpec(["attn.0"], attn),
+        KVCacheGroupSpec(["state.0"], state),
+        KVCacheGroupSpec(["state.1"], state),
+    ]
+    w.coord = mooncake_store_worker.MooncakeStoreCoordinator(
+        w._kv_cache_groups,
+        scheduler_block_size=16,
+        hash_block_size=4,
+        enable_partial_hash_hits=True,
+    )
+    w.token_dbs = [
+        ChunkedTokenDatabase(
+            KeyMetadata("test-model", 0, 0, 0, 0, group_id=group_id),
+            block_size=16,
+            hash_block_size=4,
+        )
+        for group_id in range(3)
+    ]
+    w._lookup_key_prefixes = _NEWEST_PREFIXES
+    w.hash_block_size = 4
+    w.store = store
+    w._newest_state_lookup = newest
+    return w
+
+
+def _unit_hashes(n: int) -> list[BlockHash]:
+    return [BlockHash(f"unit {i}".encode().ljust(32, b".")) for i in range(n)]
+
+
+def _present(hashes, attn_units, state_units) -> set[str]:
+    keys = set()
+    for group_id, units in ((0, attn_units), (1, state_units), (2, state_units)):
+        for u in units:
+            keys |= {
+                PoolKey.build_key_string(prefix, hashes[u].hex())
+                for prefix in _NEWEST_PREFIXES[group_id]
+            }
+    return keys
+
+
+def _newest_lookup(newest: bool, hashes, present: set[str], num_tokens: int):
+    store = _RecordingStore(present)
+    result = _newest_state_worker(newest, store).lookup(num_tokens, hashes)
+    unit_of = {h.hex(): u for u, h in enumerate(hashes)}
+    probed_states = sorted(
+        {
+            unit_of[key.rsplit("@", 1)[-1]]
+            for key in store.asked
+            if not key.startswith("attn@")
+        }
+    )
+    return result, probed_states, store.asked
+
+
+@pytest.mark.parametrize(
+    "attn_units,state_units,num_tokens,hit,probed_states",
+    [
+        pytest.param(
+            range(45), (9, 19, 29, 39), 182, 160, list(range(37, 45)),
+            id="newest_state_in_first_batch",
+        ),
+        pytest.param(
+            range(45), (9, 19), 182, 80, list(range(45)),
+            id="newest_states_evicted_falls_back_deeper",
+        ),
+        pytest.param(
+            range(4, 45), (9, 19, 39), 182, 0, [],
+            id="no_first_page_probes_no_state",
+        ),
+        pytest.param(
+            range(40), (19, 29, 39), 160, 120, list(range(16, 40)),
+            id="state_at_request_end_is_skipped",
+        ),
+    ],
+)  # fmt: skip
+def test_lookup_newest_state_matches_the_default_hit(
+    attn_units, state_units, num_tokens, hit, probed_states
+):
+    hashes = _unit_hashes(60)
+    present = _present(hashes, attn_units, state_units)
+    default, default_probed, _ = _newest_lookup(False, hashes, present, num_tokens)
+    newest, newest_probed, _ = _newest_lookup(True, hashes, present, num_tokens)
+    assert default.hit_length == hit
+    assert newest == default
+    # The default checks the state at every unit; the option probes from the
+    # deepest unit down to the hit.
+    assert default_probed == list(range(min(len(hashes), num_tokens // 4)))
+    assert newest_probed == probed_states
+
+
+def test_lookup_newest_state_option_is_a_bool():
+    assert worker._lookup_newest_state({}) is False
+    assert worker._lookup_newest_state({"lookup_newest_state": True})
+    for bad in ("true", 1, None):
+        with pytest.raises(ValueError, match="must be a bool"):
+            worker._lookup_newest_state({"lookup_newest_state": bad})
+
+
+def test_lookup_newest_state_probes_only_below_the_attention_hit():
+    hashes = _unit_hashes(60)
+    present = _present(hashes, range(25), (9, 19, 39))
+    default, _, _ = _newest_lookup(False, hashes, present, 182)
+    newest, probed, _ = _newest_lookup(True, hashes, present, 182)
+    assert default.hit_length == newest.hit_length == 80
+    assert 19 in probed and 9 not in probed and max(probed) < 25
+
+
+def test_lookup_newest_state_random_stores_same_hit_fewer_keys():
+    import random
+
+    rng = random.Random(7)
+    for _ in range(400):
+        n = rng.randint(1, 60)
+        hashes = _unit_hashes(n)
+        cut = rng.randint(0, n)
+        attn = [u for u in range(n) if u < cut or rng.random() < 0.3]
+        density = rng.choice((0.05, 0.2, 0.6))
+        states = [u for u in range(n) if rng.random() < density]
+        present = _present(hashes, attn, states)
+        num_tokens = rng.randint(1, 4 * n + 3)
+        default, _, default_asked = _newest_lookup(False, hashes, present, num_tokens)
+        newest, _, newest_asked = _newest_lookup(True, hashes, present, num_tokens)
+        assert newest == default, (n, attn, states, num_tokens)
+        assert set(newest_asked) <= set(default_asked)
+        assert len(newest_asked) <= len(default_asked)
+
+
+def test_lookup_newest_state_store_error_is_a_miss():
+    class BrokenStateKeys(_RecordingStore):
+        def batch_is_exist(self, keys):
+            if any(not key.startswith("attn@") for key in keys):
+                raise RuntimeError("store down")
+            return super().batch_is_exist(keys)
+
+    hashes = _unit_hashes(20)
+    store = BrokenStateKeys(_present(hashes, range(20), (9,)))
+    assert _newest_state_worker(True, store).lookup(70, hashes).hit_length == 0

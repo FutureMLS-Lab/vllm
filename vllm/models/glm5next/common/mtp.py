@@ -13,6 +13,7 @@ from vllm.model_executor.layers.fused_moe import (
 )
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
@@ -30,6 +31,7 @@ from vllm.model_executor.models.utils import (
 from vllm.models.glm5next.nvidia.ops.fused_eh_norm import fused_eh_norm
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
+from vllm.transformers_utils.repo_utils import get_hf_file_to_dict
 
 from .model import (
     Glm5NextDecoderLayer,
@@ -43,12 +45,39 @@ from .model import (
     get_spec_layer_idx_from_weight_name,
 )
 
+# Tensors a ModelOpt NVFP4 checkpoint stores beside each quantized weight.
+_NVFP4_SCALE_SUFFIXES = ("weight_scale", "weight_scale_2", "input_scale")
+
+
+def checkpoint_stores_layer_unquantized(
+    quant_config: QuantizationConfig | None,
+    model: str,
+    revision: str | None,
+    layer_idx: int,
+) -> bool:
+    """Whether a ModelOpt NVFP4 checkpoint stores decoder layer ``layer_idx``
+    without any quantization scale. NVIDIA's GLM-5.3-Flash NVFP4 checkpoint
+    keeps its MTP layer in BF16 although its quantization config does not
+    exclude it. A checkpoint of another quantization method is taken to store
+    the layer as its config says."""
+    if quant_config is None or quant_config.get_name() != "modelopt_fp4":
+        return False
+    index = get_hf_file_to_dict("model.safetensors.index.json", model, revision)
+    if index is None:
+        return False
+    marker = f".layers.{layer_idx}."
+    names = [name for name in index.get("weight_map", {}) if marker in name]
+    return bool(names) and not any(
+        name.endswith(_NVFP4_SCALE_SUFFIXES) for name in names
+    )
+
 
 class Glm5NextMultiTokenPredictorLayer(nn.Module):
     def __init__(self, vllm_config: VllmConfig, prefix: str) -> None:
         super().__init__()
         assert vllm_config.speculative_config is not None
-        config = vllm_config.speculative_config.draft_model_config.hf_text_config
+        draft_model_config = vllm_config.speculative_config.draft_model_config
+        config = draft_model_config.hf_text_config
         self.config = config
 
         self.enorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -70,6 +99,14 @@ class Glm5NextMultiTokenPredictorLayer(nn.Module):
         # from the prefix (e.g. "...layers.32") so the decoder builds an MLA
         # (DSA) layer rather than KDA for the MTP path.
         layer_idx = int(prefix.rsplit(".", 1)[-1])
+        quantized = vllm_config.quant_config is not None and (
+            not checkpoint_stores_layer_unquantized(
+                vllm_config.quant_config,
+                draft_model_config.model,
+                draft_model_config.revision,
+                layer_idx,
+            )
+        )
         self.mtp_block = Glm5NextDecoderLayer(
             vllm_config=vllm_config,
             config=config,
@@ -77,6 +114,7 @@ class Glm5NextMultiTokenPredictorLayer(nn.Module):
             prefix=prefix,
             topk_indices_buffer=topk_indices_buffer,
             is_mtp_layer=True,
+            quantized=quantized,
         )
 
     def forward(

@@ -44,6 +44,7 @@ from vllm.forward_context import ForwardContext
 from vllm.logger import init_logger
 from vllm.v1.attention.backend import AttentionMetadata
 from vllm.v1.core.block_pool import BlockPool
+from vllm.v1.core.hybrid_checkpoint.frontier import FrontierCheckpoint
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -128,6 +129,18 @@ class MooncakeStoreKVEvents(KVConnectorKVEvents):
 
 class MooncakeStoreConnector(KVConnectorBase_V1, SupportsHMA):
     """KV connector using MooncakeDistributedStore as shared KV pool."""
+
+    @classmethod
+    def supports_per_position_spec_states(
+        cls, kv_transfer_config: KVTransferConfig
+    ) -> bool:
+        # Saves by position leave the Mamba groups out, so the states saved
+        # are the boundary-state hand-offs, which prefill writes, and with
+        # frontier write-through each finished request's frontier, whose job
+        # goes out with the step that gathers its state. The decode cache is
+        # untested with draft columns.
+        extra_config = kv_transfer_config.kv_connector_extra_config
+        return not extra_config.get("save_decode_cache", False)
 
     @classmethod
     def supports_sleep_mode(cls, kv_transfer_config: KVTransferConfig) -> bool:
@@ -298,6 +311,50 @@ class MooncakeStoreConnector(KVConnectorBase_V1, SupportsHMA):
         return self.connector_scheduler.register_finished_partial_tail(
             request, block_ids, partial_tail_offloads
         )
+
+    @property
+    def stores_frontier_checkpoints(self) -> bool:
+        """With ``frontier_write_through``, finished requests' Mamba frontier
+        checkpoints go to the store."""
+        return (
+            self.connector_scheduler is not None
+            and self.connector_scheduler.stores_frontiers
+        )
+
+    def register_finished_frontier(
+        self, request: Request, frontier: FrontierCheckpoint
+    ) -> None:
+        """``frontier_write_through``: write a finished request's Mamba
+        frontier checkpoint to the store; its blocks stay referenced until
+        every rank has written them."""
+        assert self.connector_scheduler is not None
+        self.connector_scheduler.register_finished_frontier(request, frontier)
+
+    def frontier_load_length(self, request: Request) -> int | None:
+        """``frontier_load_local_pages``: the length of the stored frontier the
+        request's pending load resumes at, or None."""
+        assert self.connector_scheduler is not None
+        return self.connector_scheduler.frontier_load_length(request)
+
+    def move_frontier_load_start(self, request: Request, num_tokens: int) -> None:
+        """``frontier_load_local_pages``: the request's pending frontier load
+        starts at ``num_tokens``; the GPU caches the pages before."""
+        assert self.connector_scheduler is not None
+        self.connector_scheduler.move_frontier_load_start(request, num_tokens)
+
+    def defer_lookup(self, request: Request, num_computed_tokens: int) -> bool:
+        """``frontier_write_wait_s``: True while the request extends past its
+        local hit a frontier of its own session that is still being
+        written."""
+        assert self.connector_scheduler is not None
+        return self.connector_scheduler.defer_lookup(request, num_computed_tokens)
+
+    def get_loaded_kv_cache_group_ids(self, request: Request) -> tuple[int, ...]:
+        """The prefix-cacheable groups and, for a load resuming at a stored
+        frontier checkpoint, the indexer rings it writes."""
+        groups = super().get_loaded_kv_cache_group_ids(request)
+        assert self.connector_scheduler is not None
+        return groups + self.connector_scheduler.frontier_ring_groups(request)
 
     def reset_cache(self) -> bool | None:
         """Reset the external Mooncake store on prefix-cache reset.

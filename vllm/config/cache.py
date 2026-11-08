@@ -175,6 +175,8 @@ def is_known_kv_cache_dtype(name: str) -> bool:
 MambaDType = Literal["auto", "float32", "float16", "bfloat16"]
 MambaCacheMode = Literal["align", "none"]
 PrefixCachingHashAlgo = Literal["sha256", "sha256_cbor", "xxhash", "xxhash_cbor"]
+PrefixCacheEviction = Literal["lru", "gds"]
+MambaSpecStateLayout = Literal["per_position", "compact"]
 KVOffloadingBackend = Literal["native", "lmcache"]
 
 
@@ -315,6 +317,71 @@ class CacheConfig:
     prompt tail. Off by default; only takes effect with prefix caching enabled,
     EAGLE on the Mamba group, and a prefix match unit smaller than the Mamba
     block size."""
+    mamba_frontier_checkpoint: bool = False
+    """Keep a finished request's recurrent state at its exact end, which may
+    lie inside a block, and at the last block boundary its output crossed, so
+    a later request extending that prefix resumes there instead of at the last
+    block boundary of its prompt. A resumed state's partial attention page and
+    recurrent state are copied, and the frontier checkpoint is dropped whole
+    when any of its blocks is evicted. Requires prefix caching with Mamba
+    "align" mode, Model Runner V2 and `prefix_cache_retention_interval` 0; a
+    `prefix_match_unit` may be smaller than the block size. A KV connector
+    needs `kv_role` "kv_both" and `kv_load_failure_policy` "recompute".
+    Speculative decoding needs `speculative_config.truncate_acceptance_at_stop`,
+    no EAGLE block drop, pipeline parallel size 1 and, with one state column
+    per draft position, a KV connector (if any) that reads Mamba blocks only as
+    the boundary states and frontier checkpoints handed to it, with a hash unit
+    of at least the Mamba block size
+    (`KVConnectorBase_V1.supports_per_position_spec_states`). Not
+    supported with prefill context parallelism or KV cache events. Under
+    decode context parallelism a full-attention page holds several Mamba
+    blocks; a frontier may then end on a Mamba block boundary inside a page,
+    and decode-boundary states are kept on page boundaries only."""
+    mamba_prefill_export: bool = False
+    """Let a non-final prefill chunk run past one position where a Mamba state
+    must be cached (a shared-prefix junction, the last cacheable block
+    boundary) and have the backend write the state there with its prefill
+    checkpoint, instead of ending the chunk early; a chunk the block-aligned
+    split cannot schedule at all ends on a 64-token boundary instead
+    (at least 1024 tokens). Requires prefix caching with Mamba "align" mode,
+    Model Runner V2 and a backend that writes prefill checkpoints in every
+    Mamba group; not supported with speculative decoding, ubatching or context
+    parallelism."""
+    prefix_cache_eviction: PrefixCacheEviction = "lru"
+    """Which cached free blocks an allocation evicts first:
+
+    - "lru": the least recently freed.
+    - "gds": GreedyDual-Size over the resumable Mamba states that
+      `mamba_frontier_checkpoint` keeps, each evicted whole with the attention
+      pages only it needs. A state's score is `L + prefill seconds it saves /
+      blocks it frees`, `L` being the score of the last eviction before the
+      state's last use; the lowest score goes first. Requires
+      `mamba_frontier_checkpoint` and `prefill_cost_coefficients`."""
+    prefill_cost_coefficients: tuple[float, float] | None = None
+    """The prefill cost model of "gds" eviction, `(d, e)`: prefilling
+    positions `[a, b)` takes `d * (b - a) + e * (b^2 - a^2) / 200000`
+    seconds, i.e. `d` seconds per token plus `e` seconds per token per
+    100,000 tokens of context. Only the ratio `e / d` changes the order."""
+    prefix_cache_leaf_last: bool = False
+    """With "gds" eviction, evict every inner state before any leaf. A state
+    with a deeper cached state on its path (the block-boundary state under a
+    frontier, an earlier turn's state) is inner unless it is a branch point;
+    GreedyDual-Size orders each tier, and `L` rises only when a leaf goes."""
+    prefix_cache_leaf_idle_seconds: float | None = Field(default=None, gt=0)
+    """With `prefix_cache_leaf_last`, a leaf that is not a branch point and
+    was not used for this many seconds ranks as an inner state."""
+    mamba_spec_state_layout: MambaSpecStateLayout = "per_position"
+    """How Mamba layers keep their state through a speculative verify step:
+
+    - "per_position": the verify step writes the state after every draft
+      position, so a running request holds one more state block per draft
+      token in every Mamba group.
+    - "compact": the verify step writes no state; it records each position's
+      update in per-layer buffers outside the KV cache, and the accepted ones
+      are folded in after sampling, so a running request holds one state block
+      per Mamba group.
+      Requires speculative decoding, the Triton Mamba backend, Model Runner V2
+      with prefix caching, and a model that supports it (KDA layers)."""
     replayssm_buffer_len: int = Field(default=16, gt=0)
     """ReplaySSM logical history length B for Mamba2. Triton uses B physical
     rows and FlashInfer uses B+T, where T is the target verification length.
@@ -327,7 +394,9 @@ class CacheConfig:
     prefix caching, flushes are most efficient when mamba_block_size is a
     multiple of replayssm_buffer_len, but this is not required."""
     use_kda_recoverssm: bool = field(default=False, init=False)
-    """Whether Kimi-K3 KDA uses RecoverSSM speculative decode."""
+    """Whether KDA layers verify drafts with RecoverSSM, writing no state per
+    draft position: Kimi-K3 under `use_replayssm`, or any supporting model
+    with `mamba_spec_state_layout` "compact"."""
 
     # Will be set after profiling.
     num_gpu_blocks: int | None = field(default=None, init=False)
@@ -414,6 +483,12 @@ class CacheConfig:
             # Prefix-caching implementation detail (doesn't affect compiled graph).
             "prefix_match_unit",
             "enable_mamba_shared_prefix_checkpoint",
+            "mamba_frontier_checkpoint",
+            "mamba_prefill_export",
+            "prefix_cache_eviction",
+            "prefill_cost_coefficients",
+            "prefix_cache_leaf_last",
+            "prefix_cache_leaf_idle_seconds",
             "mamba_page_size_padded",
             "skip_page_size_padded",
             "user_specified_block_size",
@@ -463,6 +538,37 @@ class CacheConfig:
             self.block_size = self.DEFAULT_BLOCK_SIZE
         else:
             self.user_specified_block_size = True
+        return self
+
+    @model_validator(mode="after")
+    def _validate_prefix_cache_eviction(self) -> "CacheConfig":
+        if self.prefix_cache_eviction == "gds":
+            if not self.mamba_frontier_checkpoint:
+                raise ValueError(
+                    'prefix_cache_eviction="gds" requires mamba_frontier_checkpoint'
+                )
+            if self.prefill_cost_coefficients is None:
+                raise ValueError(
+                    'prefix_cache_eviction="gds" requires prefill_cost_coefficients'
+                )
+        elif self.prefix_cache_leaf_last:
+            raise ValueError(
+                'prefix_cache_leaf_last requires prefix_cache_eviction="gds"'
+            )
+        if (
+            self.prefix_cache_leaf_idle_seconds is not None
+            and not self.prefix_cache_leaf_last
+        ):
+            raise ValueError(
+                "prefix_cache_leaf_idle_seconds requires prefix_cache_leaf_last"
+            )
+        if self.prefill_cost_coefficients is not None:
+            per_token, per_token_per_100k = self.prefill_cost_coefficients
+            if not (per_token > 0 and per_token_per_100k >= 0):
+                raise ValueError(
+                    "prefill_cost_coefficients (d, e) need d > 0 and e >= 0, "
+                    f"got {self.prefill_cost_coefficients}"
+                )
         return self
 
     @field_validator("cache_dtype", mode="after")

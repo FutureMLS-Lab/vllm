@@ -1354,6 +1354,18 @@ class VllmConfig:
         if not self.use_v2_model_runner:
             raise ValueError("trace replay requires Model Runner V2")
 
+    def _verify_truncate_acceptance_at_stop(self) -> None:
+        speculative_config = self.speculative_config
+        if (
+            speculative_config is not None
+            and speculative_config.truncate_acceptance_at_stop
+            and speculative_config.enable_adaptive_verification
+        ):
+            raise ValueError(
+                "speculative_config.truncate_acceptance_at_stop does not "
+                "support adaptive verification"
+            )
+
     def _check_supports_watermarking(
         self,
         config: "SamplingParams | BeamSearchParams | None" = None,
@@ -1584,6 +1596,7 @@ class VllmConfig:
 
         self._verify_sampling_replay_config()
         self._verify_trace_replay_config()
+        self._verify_truncate_acceptance_at_stop()
 
         # A NIXL side is either fully replicated or fully DCP-sharded; MLA only.
         if (
@@ -3489,6 +3502,8 @@ class VllmConfig:
 
     @model_validator(mode="after")
     def validate_mamba_cached_kernel(self) -> "VllmConfig":
+        if self.cache_config.mamba_spec_state_layout == "compact":
+            return self._validate_compact_spec_state()
         if not self.cache_config.use_replayssm:
             self.cache_config.use_kda_recoverssm = False
             return self
@@ -3522,25 +3537,7 @@ class VllmConfig:
                 "FlashInfer ReplaySSM requires --replayssm-buffer-len <= 16"
             )
         if self.cache_config.use_kda_recoverssm:
-            if self.mamba_config.enable_stochastic_rounding:
-                raise ValueError(
-                    "RecoverSSM supports bfloat16/float32 "
-                    "SSM state caches, not --enable-mamba-cache-stochastic-"
-                    "rounding, which requires an explicit float16 cache"
-                )
-            if (
-                self.cache_config.mamba_cache_mode == "align"
-                and not self.use_v2_model_runner
-            ):
-                raise ValueError(
-                    "RecoverSSM with prefix caching requires VLLM_USE_V2_MODEL_RUNNER=1"
-                )
-            if self.parallel_config.pipeline_parallel_size > 1:
-                raise ValueError(
-                    "RecoverSSM currently requires pipeline_parallel_size=1"
-                )
-            if self.mamba_config.backend != MambaBackendEnum.TRITON:
-                raise ValueError("RecoverSSM requires --mamba-backend triton")
+            self._verify_kda_recoverssm()
         elif use_mamba_replayssm_spec:
             if self.cache_config.mamba_cache_mode != "none":
                 raise ValueError(
@@ -3588,6 +3585,55 @@ class VllmConfig:
                 "(P/D disaggregation, KV cache offload)"
             )
         return self
+
+    def _validate_compact_spec_state(self) -> "VllmConfig":
+        """``mamba_spec_state_layout`` "compact": KDA layers verify drafts with
+        RecoverSSM, which writes no state per draft position."""
+        layout = 'mamba_spec_state_layout "compact"'
+        if self.num_speculative_tokens == 0:
+            raise ValueError(f"{layout} requires speculative decoding")
+        if self.cache_config.use_replayssm:
+            raise ValueError(f"{layout} excludes --use-replayssm")
+        if (
+            self.model_config is not None
+            and not self.model_config.supports_compact_spec_state
+        ):
+            raise ValueError(
+                f"{layout} is not supported for architecture "
+                f"{self.model_config.architecture!r}"
+            )
+        if not current_platform.is_cuda():
+            raise ValueError(f"{layout} requires CUDA (RecoverSSM's kernels)")
+        if (
+            self.kv_transfer_config is not None
+            and self.kv_transfer_config.kv_connector != "MooncakeStoreConnector"
+        ):
+            raise ValueError(
+                f"{layout} does not support KV connectors other than "
+                "MooncakeStoreConnector yet"
+            )
+        self.cache_config.use_kda_recoverssm = True
+        self._verify_kda_recoverssm()
+        return self
+
+    def _verify_kda_recoverssm(self) -> None:
+        if self.mamba_config.enable_stochastic_rounding:
+            raise ValueError(
+                "RecoverSSM supports bfloat16/float32 "
+                "SSM state caches, not --enable-mamba-cache-stochastic-"
+                "rounding, which requires an explicit float16 cache"
+            )
+        if (
+            self.cache_config.mamba_cache_mode == "align"
+            and not self.use_v2_model_runner
+        ):
+            raise ValueError(
+                "RecoverSSM with prefix caching requires VLLM_USE_V2_MODEL_RUNNER=1"
+            )
+        if self.parallel_config.pipeline_parallel_size > 1:
+            raise ValueError("RecoverSSM currently requires pipeline_parallel_size=1")
+        if self.mamba_config.backend != MambaBackendEnum.TRITON:
+            raise ValueError("RecoverSSM requires --mamba-backend triton")
 
 
 _current_vllm_config: VllmConfig | None = None

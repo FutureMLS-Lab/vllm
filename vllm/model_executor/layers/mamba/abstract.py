@@ -24,6 +24,10 @@ class MambaBase(AttentionLayerBase):
     # in the shape specified by `self.get_state_shape`.
     kv_cache: tuple[torch.Tensor, ...]
     supports_dcp: bool = False
+    # Verifies draft tokens without a state per draft position
+    # (mamba_spec_state_layout "compact"): its model may declare
+    # SupportsCompactSpecState only if all its Mamba layers do.
+    supports_compact_spec_state: bool = False
 
     def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
         """Unpack a raw ``[B, 1, 1, C]`` int8 page view into per-state views.
@@ -70,9 +74,17 @@ class MambaBase(AttentionLayerBase):
         return None
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
-        mamba_block_size = vllm_config.cache_config.mamba_block_size
+        cache_config = vllm_config.cache_config
+        # mamba_spec_state_layout "compact": RecoverSSM without ReplaySSM.
+        compact = cache_config.use_kda_recoverssm and not cache_config.use_replayssm
+        if compact and not self.supports_compact_spec_state:
+            raise ValueError(
+                f"{type(self).__name__} does not support "
+                'mamba_spec_state_layout "compact"'
+            )
+        mamba_block_size = cache_config.mamba_block_size
         assert mamba_block_size is not None
-        page_size_padded = vllm_config.cache_config.mamba_page_size_padded
+        page_size_padded = cache_config.mamba_page_size_padded
         return MambaSpec(
             shapes=tuple(self.get_state_shape()),
             dtypes=self.get_state_dtype(),
@@ -80,12 +92,13 @@ class MambaBase(AttentionLayerBase):
             page_size_padded=page_size_padded,
             mamba_type=self.mamba_type,
             tp_replicated=self.is_kv_cache_tp_replicated,
-            mamba_cache_mode=vllm_config.cache_config.mamba_cache_mode,
-            # ReplaySSM verifies the whole window off one checkpoint, so it
-            # never writes the baseline's per-draft-token state slots.
+            mamba_cache_mode=cache_config.mamba_cache_mode,
+            # ReplaySSM and RecoverSSM verify the whole window off one
+            # checkpoint, so they never write the baseline's per-draft-token
+            # state slots.
             num_speculative_blocks=(
                 0
-                if vllm_config.cache_config.use_replayssm
+                if cache_config.use_replayssm or compact
                 else vllm_config.num_speculative_tokens
             ),
         )

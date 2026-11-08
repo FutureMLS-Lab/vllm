@@ -2,7 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """GLM-5.3-Flash KDA layer with separate convolutions and a bounded safe gate."""
 
-from dataclasses import replace
+import functools
+from collections.abc import Sequence
+from dataclasses import dataclass, replace
+from typing import TYPE_CHECKING
 
 import torch
 from torch import nn
@@ -48,9 +51,13 @@ from vllm.model_executor.utils import (
 )
 from vllm.platforms import current_platform
 from vllm.third_party.flash_linear_attention.ops.kda import FusedRMSNormGated
+from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 from vllm.v1.kv_cache_interface import MambaSpec
 from vllm.v1.worker.workspace import current_workspace_manager
+
+if TYPE_CHECKING:
+    from vllm.models.kimi_k3.nvidia.ops.recoverssm import KDARecoverSSMRecords
 
 if current_platform.is_rocm():
     from vllm.models.glm5next.amd.ops.third_party.kda import (
@@ -193,10 +200,70 @@ def _fused_qkv_conv1d(
     return conv1d
 
 
+@dataclass(frozen=True)
+class _RecoverSSMLayerView:
+    """What the RecoverSSM commit context reads from a KDA layer. ``A_log``
+    holds one value per local head here; the layer keeps it broadcast-shaped
+    for its own kernels."""
+
+    kv_cache: Sequence[torch.Tensor]
+    recoverssm_records: "KDARecoverSSMRecords"
+    A_log: torch.Tensor  # noqa: N815
+    dt_bias: torch.Tensor
+    local_num_heads: int
+    head_dim: int
+    gate_lower_bound: float
+
+
+def _recoverssm_view(layer: "Glm5NextLinearAttention") -> _RecoverSSMLayerView:
+    assert layer.recoverssm_records is not None
+    return _RecoverSSMLayerView(
+        kv_cache=layer.kv_cache,
+        recoverssm_records=layer.recoverssm_records,
+        A_log=layer.A_log.view(-1),
+        dt_bias=layer.dt_bias,
+        local_num_heads=layer.local_num_heads,
+        head_dim=layer.head_dim,
+        gate_lower_bound=layer.kda_lower_bound,
+    )
+
+
+@functools.cache
+def _recoverssm_backend() -> type[AttentionBackend]:
+    """Upstream's RecoverSSM KDA backend, its commit context built over
+    ``_RecoverSSMLayerView`` of this model's layers."""
+    from vllm.models.kimi_k3.nvidia.kda_metadata import (
+        KimiK3KDAAttentionBackend,
+        KimiK3KDAMetadataBuilder,
+    )
+    from vllm.models.kimi_k3.nvidia.ops.recoverssm import (
+        KDARecoverSSMCommitContext,
+    )
+
+    class Builder(KimiK3KDAMetadataBuilder):
+        def _get_recoverssm_context(self) -> KDARecoverSSMCommitContext:
+            if self.recoverssm_context is None:
+                ctx = self.vllm_config.compilation_config.static_forward_context
+                self.recoverssm_context = KDARecoverSSMCommitContext.create(
+                    [_recoverssm_view(ctx[n]) for n in self.layer_names],
+                    spec_query_len=1 + self.vllm_config.num_speculative_tokens,
+                    max_num_reqs=self.vllm_config.scheduler_config.max_num_seqs,
+                )
+            return self.recoverssm_context
+
+    class Backend(KimiK3KDAAttentionBackend):
+        @staticmethod
+        def get_builder_cls() -> type[KimiK3KDAMetadataBuilder]:
+            return Builder
+
+    return Backend
+
+
 class Glm5NextLinearAttention(GatedDeltaNetAttention):
     head_dim: int
     num_heads: int
     conv_size: int
+    supports_compact_spec_state = True
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> MambaSpec:
         spec = super().get_kv_cache_spec(vllm_config)
@@ -233,6 +300,11 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             conv_kernel_size=self.conv_size,
             num_spec=self.num_spec,
         )
+
+    def get_attn_backend(self) -> type[AttentionBackend]:
+        if self.cache_config.use_kda_recoverssm:
+            return _recoverssm_backend()
+        return super().get_attn_backend()
 
     def __init__(
         self,
@@ -345,6 +417,20 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         # unbounded softplus gate.
         self.kda_safe_gate = True
         self.kda_lower_bound = config.linear_lower_bound
+        # RecoverSSM: this layer's verify records of a speculative step, kept
+        # outside the KV cache.
+        self.recoverssm_records: KDARecoverSSMRecords | None = None
+        if self.cache_config.use_kda_recoverssm:
+            from vllm.models.kimi_k3.nvidia.ops import recoverssm
+
+            self.recoverssm_records = recoverssm.KDARecoverSSMRecords.allocate(
+                vllm_config.scheduler_config.max_num_seqs,
+                self.local_num_heads,
+                1 + self.num_spec,
+                self.head_dim,
+                vllm_config.model_config.dtype,
+                self.dt_bias.device,
+            )
         # Process-global conv-state layout, resolved once here instead of on
         # every _forward call (it reads an env-derived flag each time).
         self._conv_state_dim_first = is_conv_state_dim_first()
@@ -534,14 +620,15 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         )  # noqa: E501
         num_actual_tokens = attn_metadata_narrowed.num_actual_tokens
         # Spec-decode metadata (all None when speculative decoding is disabled).
-        spec_sequence_masks = attn_metadata_narrowed.spec_sequence_masks
         spec_query_start_loc = attn_metadata_narrowed.spec_query_start_loc
         spec_state_indices_tensor = attn_metadata_narrowed.spec_state_indices_tensor
         spec_token_indx = attn_metadata_narrowed.spec_token_indx
         non_spec_token_indx = attn_metadata_narrowed.non_spec_token_indx
         num_accepted_tokens = attn_metadata_narrowed.num_accepted_tokens
         num_spec_decodes = attn_metadata_narrowed.num_spec_decodes
-        use_spec = spec_sequence_masks is not None and num_spec_decodes > 0
+        # RecoverSSM's metadata leaves spec_sequence_masks unset; the count
+        # alone says whether the step has verify rows.
+        use_spec = num_spec_decodes > 0 and spec_query_start_loc is not None
         # Safe-gate checkpoints use the bounded sigmoid variant.
         safe_gate = self.kda_safe_gate
         lower_bound = self.kda_lower_bound
@@ -603,7 +690,12 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             assert spec_state_indices_tensor is not None
             assert num_accepted_tokens is not None
             conv_idx = spec_state_indices_tensor[:, 0][:num_spec_decodes]
-            conv_mql = spec_state_indices_tensor.size(-1)
+            # RecoverSSM keeps one state column; the window still spans the step.
+            conv_mql = (
+                1 + self.num_spec
+                if self.recoverssm_records is not None
+                else spec_state_indices_tensor.size(-1)
+            )
             qkv_spec = causal_conv1d_update(
                 qkv_spec,
                 conv_state,
@@ -667,27 +759,52 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             assert spec_state_indices_tensor is not None
             assert num_accepted_tokens is not None
             assert spec_query_start_loc is not None
-            # Gate computed inside the recurrent kernel (COMPUTE_GATE) from
-            # raw g1 — replicates fused_kda_gate's arithmetic bit-for-bit and
-            # skips its launch + fp32 [n, H, D] intermediate per layer.
-            core_attn_out_spec, _ = fused_recurrent_kda(
-                q=_rearr(q_spec),
-                k=_rearr(k_spec),
-                v=_rearr(v_spec),
-                g=g1_spec,
-                beta=beta_spec,
-                initial_state=recurrent_state,
-                use_qk_l2norm_in_kernel=True,
-                cu_seqlens=spec_query_start_loc[: num_spec_decodes + 1],
-                ssm_state_indices=spec_state_indices_tensor,
-                num_accepted_tokens=num_accepted_tokens,
-                out=spec_out,
-                sigmoid_beta=True,
-                a_log=self.A_log,
-                g_bias=self.dt_bias,
-                compute_gate=True,
-                lower_bound=lower_bound,
-            )
+            if self.recoverssm_records is not None:
+                from vllm.models.kimi_k3.nvidia.ops.recoverssm import (
+                    kda_recoverssm_verify,
+                )
+
+                # Reads the state, writes nothing to it: the per-position
+                # corrections and keys go to the records, and the accepted
+                # ones are folded into the state after sampling.
+                core_attn_out_spec = kda_recoverssm_verify(
+                    q=_rearr(q_spec),
+                    k=_rearr(k_spec),
+                    v=_rearr(v_spec),
+                    raw_g=g1_spec,
+                    raw_beta=beta_spec,
+                    A_log=self.A_log.view(-1),
+                    dt_bias=self.dt_bias,
+                    lower_bound=lower_bound,
+                    checkpoint_state=recurrent_state,
+                    records=self.recoverssm_records,
+                    query_start_loc=spec_query_start_loc[: num_spec_decodes + 1],
+                    state_indices=spec_state_indices_tensor[:num_spec_decodes, 0],
+                    spec_query_len=1 + self.num_spec,
+                    out=spec_out,
+                )
+            else:
+                # Gate computed inside the recurrent kernel (COMPUTE_GATE) from
+                # raw g1 — replicates fused_kda_gate's arithmetic bit-for-bit
+                # and skips its launch + fp32 [n, H, D] intermediate per layer.
+                core_attn_out_spec, _ = fused_recurrent_kda(
+                    q=_rearr(q_spec),
+                    k=_rearr(k_spec),
+                    v=_rearr(v_spec),
+                    g=g1_spec,
+                    beta=beta_spec,
+                    initial_state=recurrent_state,
+                    use_qk_l2norm_in_kernel=True,
+                    cu_seqlens=spec_query_start_loc[: num_spec_decodes + 1],
+                    ssm_state_indices=spec_state_indices_tensor,
+                    num_accepted_tokens=num_accepted_tokens,
+                    out=spec_out,
+                    sigmoid_beta=True,
+                    a_log=self.A_log,
+                    g_bias=self.dt_bias,
+                    compute_gate=True,
+                    lower_bound=lower_bound,
+                )
 
         # --- core attention: non-spec path (prefill or plain decode) ---
         core_attn_out_non_spec = None

@@ -38,6 +38,7 @@ if TYPE_CHECKING:
     from vllm.distributed.kv_events import KVCacheEvent
     from vllm.forward_context import ForwardContext
     from vllm.v1.core.block_pool import BlockPool
+    from vllm.v1.core.hybrid_checkpoint.frontier import FrontierCheckpoint
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
     from vllm.v1.kv_cache_interface import KVCacheConfig
     from vllm.v1.request import Request
@@ -220,6 +221,10 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
     def requires_kv_delivery(self) -> bool:
         return any(c.requires_kv_delivery for c in self._connectors)
 
+    @property
+    def stores_frontier_checkpoints(self) -> bool:
+        return any(c.stores_frontier_checkpoints for c in self._connectors)
+
     @classmethod
     def supports_sleep_mode(cls, kv_transfer_config: "KVTransferConfig") -> bool:
         children = [
@@ -228,6 +233,21 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
         ]
         return bool(children) and all(
             KVConnectorFactory.get_connector_class(c).supports_sleep_mode(c)
+            for c in children
+        )
+
+    @classmethod
+    def supports_per_position_spec_states(
+        cls, kv_transfer_config: "KVTransferConfig"
+    ) -> bool:
+        children = [
+            KVTransferConfig(**{"engine_id": kv_transfer_config.engine_id, **c})
+            for c in kv_transfer_config.kv_connector_extra_config.get("connectors", [])
+        ]
+        return bool(children) and all(
+            KVConnectorFactory.get_connector_class(c).supports_per_position_spec_states(
+                c
+            )
             for c in children
         )
 
@@ -469,6 +489,21 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
                 to_return = (toks, load_async)
         return to_return
 
+    def defer_lookup(self, request: "Request", num_computed_tokens: int) -> bool:
+        return any(
+            c.defer_lookup(request, num_computed_tokens) for c in self._connectors
+        )
+
+    def frontier_load_length(self, request: "Request") -> int | None:
+        chosen_connector = self._requests_to_connector.get(request.request_id)
+        if chosen_connector is None:
+            return None
+        return self._connectors[chosen_connector].frontier_load_length(request)
+
+    def move_frontier_load_start(self, request: "Request", num_tokens: int) -> None:
+        connector = self._connectors[self._requests_to_connector[request.request_id]]
+        connector.move_frontier_load_start(request, num_tokens)
+
     def get_external_cache_hit_sources(
         self,
         request: "Request",
@@ -608,6 +643,13 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
             for c in self._connectors
         ]
         return any(accepted)
+
+    def register_finished_frontier(
+        self, request: "Request", frontier: "FrontierCheckpoint"
+    ) -> None:
+        for c in self._connectors:
+            if c.stores_frontier_checkpoints:
+                c.register_finished_frontier(request, frontier)
 
     def request_finished_all_groups(
         self,
