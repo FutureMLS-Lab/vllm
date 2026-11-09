@@ -7,9 +7,12 @@ attention KV it depends on) that save the most prefill per unit of cache. On Kim
 parallelism, DSpark speculative decoding and the specialized decode path, and keeps the states in a Mooncake store.
 
 **Results, the benchmark setups and installation: [FutureMLS-Lab/FlashStates](https://github.com/FutureMLS-Lab/FlashStates).**
-The GB300 image is `ghcr.io/futuremls-lab/flashstates-gb300:kimi-k31-cu134-266e88c-fs<commit>-mc<commit>-gb300`, built from
-this branch and the `flashstate-k31pro-gb300` branch of
-[FutureMLS-Lab/Mooncake](https://github.com/FutureMLS-Lab/Mooncake/tree/flashstate-k31pro-gb300). The design is described in
+The GB300 image is `ghcr.io/futuremls-lab/flashstates-gb300:kimi-k31-cu134-266e88c-fs88bad5a-mcf74d68c-gb300`, also
+tagged `v0.1.0-kimi-k31-gb300` (on Docker Hub `weili0234/flashstates:kimi-k31-cu134-266e88c-fs88bad5a-mcf74d68c-gb300`
+and `weili0234/flashstates-vllm:v0.1.0-kimi-k31-gb300`): the `vllm/vllm-openai:kimi-k31-cu134` image with the vLLM of this
+branch's commit 88bad5a and the Mooncake build of the `flashstate-k31pro-gb300` branch of
+[FutureMLS-Lab/Mooncake](https://github.com/FutureMLS-Lab/Mooncake/tree/flashstate-k31pro-gb300) (commit f74d68c). The design
+is described in
 [`docs/design/hybrid_state_checkpoints.md`](../docs/design/hybrid_state_checkpoints.md) and
 [`docs/design/mooncake_store_frontier_checkpoints.md`](../docs/design/mooncake_store_frontier_checkpoints.md).
 
